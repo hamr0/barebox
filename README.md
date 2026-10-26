@@ -97,7 +97,7 @@ Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 
 |---|---|---|
 | M0 | Walls + front door | **PASS** — 14/14, red-team 8/8 |
 | M1 | Proxy sees inside HTTPS (curl, node, python requests, git) | **PASS** — real-internet matrix + negatives, peak 63 MB |
-| M2 | Hold one `x` request, ask, keep everything else running | **PASS** — 6-scenario hold matrix, 120 s + never timeouts |
+| M2 | Hold one `x` request, ask, keep everything else running | **PASS** — 9-scenario hold matrix, 120 s + never timeouts |
 | M3 | Decide r/w/x deterministically (rwxmap + bareguard), audit log | |
 | M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging | |
 | M5 | Keys the agent never holds | |

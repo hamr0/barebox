@@ -304,7 +304,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Done when | One request is held for a long approval while other requests from the same agent complete. Approve forwards it. Deny and timeout return the 403 with the reason. Tested with the M1 client set. |
 | Estimate | 1 day. |
 
-**Result (Oct 26): PASS.** Local hold matrix (`poc/m2/`, placeholder path trigger): approve forwards with echo intact while a meanwhile GET completes; 2 concurrent holds (approve one, deny other with reason, queue empties); 1 MB cap denied loud at the door, never queued; 5 s timeout denies with reason and frees the queue; `never` holds until decided; 30 s hold survives and approves. Go/no-go (b) met. All three go/no-go modules pass — graduation rewrite unblocked.
+**Result (Oct 26): PASS.** Local hold matrix (`poc/m2/`, placeholder path trigger, 9 scenarios): approve forwards with echo intact while a meanwhile GET completes; depth 2 and 3 concurrent holds (approve rest, deny with reason, queue empties); double-decide and unknown ids answered, never applied twice; malformed input denied 400 with the proxy surviving; 1 MB cap denied loud at the door, never queued; 5 s timeout denies with reason and frees the queue; `never` holds until decided; 30 s hold survives and approves. Go/no-go (b) met. All three go/no-go modules pass — graduation rewrite unblocked.
 
 ### M3. Decide
 

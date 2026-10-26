@@ -104,6 +104,13 @@ blocks unix binds — M2 runs in a real terminal).
    or destroys the socket, so no path leaks.
 3. `deny()` wrote then destroyed, risking truncated reasons. Fix: flush+FIN
    with the reason as the body — every deny now arrives readable.
+4. Depth 3, double-decide, unknown ids, malformed input: all answered loud,
+   none applied twice, proxy survives garbage. The plain-HTTP path had the
+   same unguarded-target crash the CONNECT path once had; fixed the same way.
+5. Over-cap fate doctrine: denied at the door with the reason on a live
+   connection. The agent loses nothing — files, plan and state untouched —
+   and the reason tells it what to do instead (split the payload). Fail
+   closed, never silent; 1 MB is a POC value.
 
 ### Dropped, not decided
 
