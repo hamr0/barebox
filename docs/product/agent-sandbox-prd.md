@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Working name: TBD (see Open questions).
-> Status: M0 done + red-teamed Oct 26 (main 14/14, red-team 8/8 detections); M1 next. Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M1 done Oct 26 (real-internet matrix PASS, proxy RSS 56.7 MB); M2 next. Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 – Nov 4 2026 (10 days). Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -285,11 +285,13 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | | |
 |---|---|
 | Goal | The proxy can read method, URL, headers and body of HTTPS requests. |
-| We use | `node-forge` (must pass the dependency checklist), Node `tls`. |
+| We use | `openssl` subprocess for certificates (decided Oct 26: zero proxy RSS, binary present; node-forge dropped), Node `tls`. |
 | We build | A local CA that exists only inside the sandbox. Per-host certificates. Trust env vars: `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`. Non-HTTP and UDP denied. |
 | Riskiest assumption | This is the hardest piece. Common clients must work through it, and proxy memory with TLS must stay <= 80 MB. |
 | Done when | curl, node, python requests and git over https all work through the proxy and the proxy can see inside. Proxy RSS with TLS is measured and compared with the 80 MB target. |
 | Estimate | 2 days. |
+
+**Result (Oct 26): PASS.** Real-internet run on the netted Fedora box (`run-m1.sh real`): curl/node/python-requests GET+POST all 200 through the MITM with method, URL, headers and body visible in the proxy log; `git ls-remote` over https through the proxy; proxy RSS 56.7 MB (target ≤ 80 MB). Local self-test on the dev box also PASS (3 clients, RSS 60.2 MB). Go/no-go (a) part 2 and (c) met. POC stays throwaway; graduation rewrite after M2.
 
 ### M2. Hold and ask [go/no-go]
 
@@ -411,7 +413,7 @@ None of these block M0. Nothing here is silently assumed.
 | # | Question | Decides |
 |---|---|---|
 | 1 | What is the real proxy memory with TLS, rwxmap and bareguard loaded? M0: bare proxy 52.1 MB (22 sockets, no TLS). TLS still unmeasured. | The <= 80 MB target. Measured in M1 and M3. |
-| 2 | `node-forge` or shelling out to `openssl` for certificates? | Dependency checklist, decided in M1. |
+| 2 | ~~`node-forge` or shelling out to `openssl` for certificates?~~ Decided Oct 26: `openssl` subprocess (sandbox keeps proxy RSS clean; platform coupling accepted, see M1). | — |
 | 3 | How should the undo layer handle large untracked dirs (`node_modules`) and build output? | M4 design. |
 | 4 | Localhost sockets (Postgres, Docker daemon) are writes the overlay can't see. Decided Oct 26 for M0: block. | M3 revisits only if a demo needs a local DB. |
 | 5 | Server-side timeouts while a request is held. How long can a hold last in practice? | The approval timeout value in M2. The idea note's sketch used 120 s; that is not tested. |
