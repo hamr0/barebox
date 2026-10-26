@@ -28,4 +28,5 @@ for H in "$@"; do
     -extfile "$OUT/$H.ext" 2>/dev/null
   rm -f "$OUT/$H.csr"
 done
+chmod 600 "$OUT"/*.key
 echo "certs in $OUT for: $*"

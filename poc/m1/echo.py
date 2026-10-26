@@ -16,6 +16,23 @@ class H(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == '/chunked':
+            body = b'chunk-one-chunk-two'
+            self.send_response(200)
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            half = len(body) // 2
+            for part in (body[:half], body[half:]):
+                self.wfile.write(b'%X\r\n%s\r\n' % (len(part), part))
+            self.wfile.write(b'0\r\n\r\n')
+            return
+        if self.path == '/close':
+            body = b'close-delimited'
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+            return
         self._send(b'local-ok')
 
     def do_POST(self):
@@ -25,10 +42,14 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+class S(http.server.ThreadingHTTPServer):
+    def handle_error(self, *a):
+        pass  # dead-client resets are expected (proxy closes idle upstreams)
+
 
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(cert_pem, key_pem)
-srv = http.server.HTTPServer(('127.0.0.1', port), H)
+srv = S(('127.0.0.1', port), H)
 srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
 print(f'echo on {port}', flush=True)
 srv.serve_forever()

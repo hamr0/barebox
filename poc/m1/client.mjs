@@ -30,13 +30,13 @@ function viaProxy(url, method, body) {
         socket: s, ca, host: u.hostname,
         ...(isIP(u.hostname) ? {} : { servername: u.hostname }),
       }, () => {
-        let req = `${method} ${u.pathname}${u.search} HTTP/1.1\r\nHost: ${u.hostname}\r\nConnection: close\r\n`;
+        let req = `${method} ${u.pathname}${u.search} HTTP/1.1\r\nHost: ${u.hostname}\r\nConnection: close\r\nX-M1-Probe: HDRNODE\r\n`;
         if (body) req += `Content-Type: application/x-www-form-urlencoded\r\nContent-Length: ${Buffer.byteLength(body)}\r\n`;
         t.write(req + '\r\n' + (body || ''));
       });
       let resp = Buffer.alloc(0);
       t.on('data', (c) => { resp = Buffer.concat([resp, c]); });
-      t.on('end', () => resolve(resp.subarray(0, resp.indexOf('\r\n')).toString('latin1')));
+      t.on('end', () => resolve(resp.toString('latin1')));
       t.on('error', reject);
     });
     s.on('error', reject);

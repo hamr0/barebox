@@ -30,4 +30,9 @@ bash poc/m1/run-m1.sh real
 ## Done when
 
 curl, node, python requests, git-over-https work through the proxy; the
-proxy log shows method + URL + headers + body for each; proxy RSS ≤ 80 MB.
+proxy log shows method + URL + headers + body for each; proxy peak RSS ≤ 80 MB.
+
+Local mode is the self-test (git needs a real remote, so it runs in real
+mode only). Tunnels stay open for sequential reuse (git does this); upstream
+is fresh per request. Pipelining is denied loud. Close-delimited responses
+are denied loud (500) — a graduation-rewrite item, not silent.

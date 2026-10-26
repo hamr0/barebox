@@ -10,6 +10,7 @@ const PORT = parseInt(process.argv[2] || '3128', 10);
 const CERTDIR = process.argv[3] || './certs';
 const LOG = process.argv[4] || './mitm.log';
 const UP_CA = process.argv[5] || null; // self-signed upstream (local self-test)
+const UP_CA_PEM = UP_CA ? fs.readFileSync(UP_CA) : null;
 const log = (o) => fs.appendFileSync(LOG, JSON.stringify(o) + '\n');
 
 const creds = (host) => ({
@@ -54,12 +55,15 @@ function respLen(buf) {
 
 function deny(sock, code, note) {
   log({ ev: 'deny', code, note });
+  if (sock.destroyed) return; // second denier stays silent, log keeps one line
   sock.write(`HTTP/1.1 ${code} ${note}\r\nConnection: close\r\n\r\n`);
   sock.destroy();
 }
 
-// One decrypted request -> raw forward -> framed response -> raw back.
-function exchange(serverTls, up, buf, host, client) {
+// One decrypted request -> fresh upstream -> framed response -> raw back.
+// Upstream is per-request (POC): the client tunnel stays open for reuse.
+const isIP = (h) => /^\d+\.\d+\.\d+\.\d+$/.test(h || '');
+function exchange(serverTls, buf, host, port, client, setCur) {
   const req = parseReq(buf);
   if (!req) return buf; // need more data
   const rest = buf.subarray(req.total);
@@ -67,47 +71,55 @@ function exchange(serverTls, up, buf, host, client) {
   const url = req.target.startsWith('http') ? req.target : `https://${host}${req.target}`;
   log({ ev: 'req', client, method: req.method, url, headers: req.headers,
     body: req.body.toString('utf8') });
-  up.write(buf.subarray(0, req.total)); // forward RAW
+  const raw = buf.subarray(0, req.total);
+  const up = tls.connect({ host, port,
+    ...(isIP(host) ? {} : { servername: host }),
+    ...(UP_CA_PEM ? { ca: UP_CA_PEM } : {}) }, () => { up.write(raw); });
+  setCur(up);
+  let done = false;
   let rbuf = Buffer.alloc(0);
-  const onUp = (chunk) => {
+  up.on('data', (chunk) => {
     rbuf = Buffer.concat([rbuf, chunk]);
     const n = respLen(rbuf);
     if (n === null || rbuf.length < n) return; // need more
-    up.off('data', onUp);
-    if (n === -1) { deny(serverTls, 500, 'unframed response'); up.destroy(); return; }
+    done = true;
+    setCur(null);
+    if (n === -1) { deny(serverTls, 500, 'unframed response'); up.destroy(); return null; }
     const status = rbuf.subarray(0, rbuf.indexOf('\r\n')).toString('latin1');
     log({ ev: 'resp', client, url, status });
     const tail = rbuf.subarray(n);
     up.destroy();
-    if (tail.length > 0) { deny(serverTls, 500, 'response tail'); return; }
-    serverTls.end(rbuf.subarray(0, n)); // flush + FIN; single exchange (POC)
-  };
-  up.on('data', onUp);
+    if (tail.length > 0) { deny(serverTls, 500, 'response tail'); return null; }
+    serverTls.write(rbuf.subarray(0, n)); // tunnel stays open for reuse
+    return null;
+  });
+  up.on('error', () => { if (!done) deny(serverTls, 502, `upstream ${host} failed`); });
+  up.on('close', () => { if (!done) deny(serverTls, 502, `upstream ${host} closed early`); });
   return null;
 }
 
 function handleConnect(sock, head, client) {
   const req = parseReq(head);
+  if (!req || !req.target) { deny(sock, 400, 'bad connect line'); return; }
   const [host, port = '443'] = req.target.split(':');
+  if (!/^[A-Za-z0-9.-]+$/.test(host || '')) { deny(sock, 400, `bad host`); return; }
   let c;
   try { c = creds(host); }
   catch { deny(sock, 502, `no cert for ${host}`); return; }
-  const up = tls.connect({ host, port: parseInt(port, 10), servername: host,
-    ...(UP_CA ? { ca: fs.readFileSync(UP_CA) } : {}) },
-    () => {
-      sock.write('HTTP/1.1 200 Connection established\r\n\r\n');
-      const st = new tls.TLSSocket(sock, { isServer: true, ...c });
-      let buf = Buffer.alloc(0);
-      st.on('data', (ch) => {
-        buf = Buffer.concat([buf, ch]);
-        const r = exchange(st, up, buf, host, client);
-        if (r !== undefined) buf = r || Buffer.alloc(0);
-      });
-      st.on('error', () => { up.destroy(); });
-      up.on('error', () => deny(sock, 502, `upstream ${host} failed`));
-      st.setTimeout(10000, () => { st.destroy(); up.destroy(); });
-    });
-  up.on('error', () => deny(sock, 502, `upstream ${host} unreachable`));
+  // 200 now: per-request upstream errors surface on their own request
+  sock.write('HTTP/1.1 200 Connection established\r\n\r\n');
+  const st = new tls.TLSSocket(sock, { isServer: true, ...c });
+  let buf = Buffer.alloc(0);
+  let cur = null;
+  st.on('data', (ch) => {
+    buf = Buffer.concat([buf, ch]);
+    const r = exchange(st, buf, host, parseInt(port, 10), client, (u) => { cur = u; });
+    if (r !== undefined) buf = r || Buffer.alloc(0);
+  });
+  const killCur = () => { if (cur) { cur.destroy(); cur = null; } };
+  st.on('error', killCur);
+  st.on('close', killCur);
+  st.setTimeout(10000, () => st.destroy());
 }
 
 function handlePlain(sock, first, client) {
@@ -117,7 +129,11 @@ function handlePlain(sock, first, client) {
   const up = net.connect(parseInt(u.port || '80', 10), u.hostname, () => {
     log({ ev: 'req', client, method: req.method, url: u.toString(),
       headers: req.headers, body: req.body.toString('utf8') });
-    up.write(first.subarray(0, req.total));
+    // origin servers vary on absolute-form; normalize to origin-form
+    const lines = first.subarray(0, req.headEnd).toString('latin1').split('\r\n');
+    lines[0] = `${req.method} ${u.pathname}${u.search} ${req.ver}`;
+    up.write(Buffer.concat([Buffer.from(lines.join('\r\n') + '\r\n\r\n', 'latin1'),
+      first.subarray(req.headEnd, req.total)]));
     up.pipe(sock);
   });
   up.on('error', () => deny(sock, 502, `plain upstream ${u.hostname} failed`));

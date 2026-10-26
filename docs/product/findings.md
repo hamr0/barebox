@@ -68,6 +68,6 @@ inspectable before pasting; no credentials involved.
 
 ### Dropped, not decided
 
-- Bareguard-style branch protection for the repo: user said forget the rules.
-- Full GitHub About description: short text live, long text still to paste.
+- Branch protection: first dropped, then applied Oct 26 mirroring bareguard.
+- GitHub About description + topics: set Oct 26 via `gh`.
 - npm trusted-publisher: needed before the first Actions dispatch.
