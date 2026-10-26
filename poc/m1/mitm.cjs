@@ -57,8 +57,21 @@ function respLen(buf) {
 function deny(sock, code, note) {
   log({ ev: 'deny', code, note });
   if (sock.destroyed) return; // second denier stays silent, log keeps one line
-  sock.write(`HTTP/1.1 ${code} ${note}\r\nConnection: close\r\n\r\n`);
-  sock.destroy();
+  const msg = `HTTP/1.1 ${code} ${note}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n${note}\n`;
+  sock.end(msg); // flush + FIN so the reason always arrives
+}
+
+// ---- M2 hold queue (active only when HOLD_MATCH is set) ----
+const HOLD_MATCH = process.env.HOLD_MATCH || null; // path substring placeholder
+const HOLD_TIMEOUT = process.env.HOLD_TIMEOUT_MS || '120000'; // ms, or 'never'
+const HOLD_MAX_BODY = parseInt(process.env.HOLD_MAX_BODY || '1048576', 10);
+const CTL_SOCK = process.argv[6] || null;
+let holdN = 0;
+const holds = new Map(); // id -> {client, method, url, headers, raw, host, port, st, timer}
+function holdTimeoutMs() {
+  if (HOLD_TIMEOUT === 'never') return null;
+  const ms = parseInt(HOLD_TIMEOUT, 10);
+  return Number.isFinite(ms) && ms >= 0 ? ms : 120000;
 }
 
 // One decrypted request -> fresh upstream -> framed response -> raw back.
@@ -73,6 +86,22 @@ function exchange(serverTls, buf, host, port, client, setCur) {
   log({ ev: 'req', client, method: req.method, url, headers: req.headers,
     body: req.body.toString('utf8') });
   const raw = buf.subarray(0, req.total);
+  if (HOLD_MATCH && new URL(url).pathname.includes(HOLD_MATCH)) {
+    if (req.body.length > HOLD_MAX_BODY) {
+      deny(serverTls, 403, 'body too large to hold'); return null;
+    }
+    const id = `h${++holdN}`;
+    const ms = holdTimeoutMs();
+    const entry = { id, client, method: req.method, url,
+      headers: req.headers, body: req.body.toString('utf8'),
+      raw: Buffer.from(raw), host, port, st: serverTls, timer: null, t0: Date.now() };
+    if (ms !== null) entry.timer = setTimeout(() => settleHold(id, false, 'hold timeout'), ms);
+    serverTls.setTimeout(0); // parked tunnel must outlive the M1 idle timer
+    holds.set(id, entry);
+    log({ ev: 'hold', id, client, method: req.method, url,
+      timeoutMs: ms, waiting: holds.size });
+    return null; // tunnel stays open; the human decides
+  }
   const up = tls.connect({ host, port,
     ...(isIP(host) ? {} : { servername: host }),
     ...(UP_CA_PEM ? { ca: UP_CA_PEM } : {}) }, () => { up.write(raw); });
@@ -139,6 +168,60 @@ function handlePlain(sock, first, client) {
     up.pipe(sock);
   });
   up.on('error', () => deny(sock, 502, `plain upstream ${u.hostname} failed`));
+}
+
+function settleHold(id, approve, reason) {
+  const h = holds.get(id);
+  if (!h) return `unknown ${id}`;
+  holds.delete(id);
+  if (h.timer) clearTimeout(h.timer);
+  if (!approve) {
+    log({ ev: 'decide', id, decision: 'deny', reason });
+    deny(h.st, 403, `denied: ${reason}`);
+    return `denied ${id}`;
+  }
+  const up = tls.connect({ host: h.host, port: h.port,
+    ...(isIP(h.host) ? {} : { servername: h.host }),
+    ...(UP_CA_PEM ? { ca: UP_CA_PEM } : {}) }, () => { up.write(h.raw); });
+  let done = false;
+  let rbuf = Buffer.alloc(0);
+  up.on('data', (chunk) => {
+    rbuf = Buffer.concat([rbuf, chunk]);
+    const n = respLen(rbuf);
+    if (n === null || rbuf.length < n) return;
+    done = true;
+    log({ ev: 'decide', id, decision: 'approve', status: rbuf.subarray(0, rbuf.indexOf('\r\n')).toString('latin1') });
+    up.destroy();
+    h.st.end(rbuf); // approved answer ends this exchange
+  });
+  const fail = (note) => { if (!done) { done = true; log({ ev: 'decide', id, decision: 'approve-failed', note }); deny(h.st, 502, note); } };
+  up.on('error', (e) => fail(`upstream failed on approve: ${e.message || e.code}`));
+  up.on('close', () => fail('upstream closed on approve'));
+  return `approved ${id}`;
+}
+
+if (CTL_SOCK) {
+  try { fs.unlinkSync(CTL_SOCK); } catch {}
+  net.createServer((sock) => {
+    let line = '';
+    sock.on('data', (ch) => {
+      line += ch.toString('latin1');
+      const i = line.indexOf('\n');
+      if (i < 0) return;
+      const [cmd, arg, ...rest] = line.slice(0, i).trim().split(' ');
+      let out = '';
+      if (cmd === 'pending') {
+        out = JSON.stringify([...holds.values()].map((h) => ({
+          id: h.id, client: h.client, method: h.method, url: h.url,
+          body: h.body, waitingSec: Math.round((Date.now() - h.t0) / 1000),
+        })));
+      } else if (cmd === 'approve' && arg) out = settleHold(arg, true, '');
+      else if (cmd === 'deny' && arg) out = settleHold(arg, false, rest.join(' ') || 'denied by user');
+      else out = 'usage: pending | approve <id> | deny <id> [reason]';
+      sock.end(out + '\n');
+    });
+    sock.on('error', () => {});
+  }).listen(CTL_SOCK, () => console.log(`ctl on ${CTL_SOCK}`));
 }
 
 let n = 0;

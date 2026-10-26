@@ -86,6 +86,25 @@ inspectable before pasting; no credentials involved.
     the test CA together. M1 real PASS Oct 26 ~21:05: full matrix + peak
     RSS 63.1 MB. Go/no-go (a)2 + (c) met.
 
+## M2 — hold and ask (PASS Oct 26, local only)
+
+Harness `poc/m2/` + hold mode in the M1 proxy + `sbx.mjs` CLI. Holds park
+before upstream contact, so real internet adds zero evidence; echo doubles
+as upstream everywhere. Decisions (all signed in scoping): path-substring
+placeholder trigger (M3 replaces it, no sibling imports in M2); 120 s
+default with `never` supported; 2 concurrent holds proven; 1 MB cap denied
+loud at the door, never queued (approving unseen bytes breaks the doorman's
+promise); log line + `sbx pending/approve/deny` over unix socket (my sandbox
+blocks unix binds — M2 runs in a real terminal).
+
+1. 2 MB bodies don't fit argv (`Argument list too long`). Fix: bodies travel
+   over the wire from a file — the only path the product ever sees.
+2. The M1 10 s tunnel idle timer reaped a 30 s hold (queue fine, tunnel
+   dead). Fix: a parked tunnel disables the idle timer; settle always ends
+   or destroys the socket, so no path leaks.
+3. `deny()` wrote then destroyed, risking truncated reasons. Fix: flush+FIN
+   with the reason as the body — every deny now arrives readable.
+
 ### Dropped, not decided
 
 - Branch protection: first dropped, then applied Oct 26 mirroring bareguard.

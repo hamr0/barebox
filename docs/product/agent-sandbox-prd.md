@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Working name: TBD (see Open questions).
-> Status: M1 PASS Oct 26 (local + real-internet, peak RSS ≤ 65 MB); M2 next. Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M2 PASS Oct 26 (local hold matrix, all six scenarios); M3 next. Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 – Nov 4 2026 (10 days). Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -303,6 +303,8 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Riskiest assumption | Held requests don't break clients or servers on slow approvals. |
 | Done when | One request is held for a long approval while other requests from the same agent complete. Approve forwards it. Deny and timeout return the 403 with the reason. Tested with the M1 client set. |
 | Estimate | 1 day. |
+
+**Result (Oct 26): PASS.** Local hold matrix (`poc/m2/`, placeholder path trigger): approve forwards with echo intact while a meanwhile GET completes; 2 concurrent holds (approve one, deny other with reason, queue empties); 1 MB cap denied loud at the door, never queued; 5 s timeout denies with reason and frees the queue; `never` holds until decided; 30 s hold survives and approves. Go/no-go (b) met. All three go/no-go modules pass — graduation rewrite unblocked.
 
 ### M3. Decide
 
