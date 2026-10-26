@@ -65,6 +65,26 @@ inspectable before pasting; no credentials involved.
    race) tested red — rejected. Real cause: response framing never checked
    `buffer.length >= needed`, so split arrivals truncated. The log looked
    complete while the client starved. Fix: the length guard.
+9. Keep-alive reuse broken (adversarial review + live git log agreed): a
+   second request on one tunnel was forwarded into an already-destroyed
+   upstream — logged, never answered. Fix: upstream is now per-request,
+   tunnel stays open; python client uses a Session so the reuse is covered.
+10. `requests.Session` honors sandbox proxy env over explicit config, so the
+    python leg hit the wrong proxy (502 "Bad Gateway" from elsewhere).
+    Fix: `trust_env = False`. The hostile env stays as a precedence test.
+11. Stale test servers made negatives fail spuriously — and no-CA "PASSED"
+    for the wrong reason (dead echo also refuses). Fix: echo-liveness gate
+    aborts the round when the fixture is down; plaintext moved to :18080;
+    runtime dir is pid-suffixed.
+12. Single-threaded echo blocked on an idle aborted upstream, wedging later
+    tunnels (reproduced deterministically). Fix: threaded echo; proxy frees
+    the upstream the moment the client goes away.
+13. Real mode never passed the test CA to the proxy (it was wired for local
+    only), so every echo leg failed with "unable to verify the first
+    certificate" — while positives stayed green and masked it. The
+    echo-liveness gate caught the rot. Fix: proxy trusts system roots AND
+    the test CA together. M1 real PASS Oct 26 ~21:05: full matrix + peak
+    RSS 63.1 MB. Go/no-go (a)2 + (c) met.
 
 ### Dropped, not decided
 

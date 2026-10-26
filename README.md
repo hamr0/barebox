@@ -96,7 +96,7 @@ Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 
 | Module | What | Status |
 |---|---|---|
 | M0 | Walls + front door | **PASS** — 14/14, red-team 8/8 |
-| M1 | Proxy sees inside HTTPS (curl, node, python requests, git) | positives pass; negatives pending |
+| M1 | Proxy sees inside HTTPS (curl, node, python requests, git) | **PASS** — real-internet matrix + negatives, peak 63 MB |
 | M2 | Hold one `x` request, ask, keep everything else running | next |
 | M3 | Decide r/w/x deterministically (rwxmap + bareguard), audit log | |
 | M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging | |

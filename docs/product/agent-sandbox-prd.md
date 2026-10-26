@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Working name: TBD (see Open questions).
-> Status: M1 local FULL PASS Oct 26 incl. negatives (peak RSS 59.9 MB); real-internet negatives pending re-run; verdict open; M2 next. Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M1 PASS Oct 26 (local + real-internet, peak RSS ≤ 65 MB); M2 next. Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 – Nov 4 2026 (10 days). Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -291,7 +291,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Done when | curl, node, python requests and git over https all work through the proxy and the proxy can see inside. Proxy RSS with TLS is measured and compared with the 80 MB target. |
 | Estimate | 2 days. |
 
-**Result (Oct 26, verdict open):** positives PASS everywhere (dev self-test + real internet: 4 clients 200, full visibility, git ls-remote). Local negatives also PASS (unknown host, dead upstream, no-CA, plain HTTP, chunked, close-delimited loud, echo-liveness gate; reusable tunnels after the keep-alive fix). Real-internet negatives pending re-run. Go/no-go (a)2 + (c) unmet until then. POC stays throwaway; graduation rewrite after M2.
+**Result (Oct 26): PASS.** Positives everywhere (dev self-test + real internet: 4 clients 200 with wire bodies, per-client headers, git ls-remote). Negatives everywhere (unknown host, dead upstream 502, no-CA, plain HTTP, chunked intact, close-delimited loud 500, echo-liveness gate). Peak proxy RSS 59.9 MB local, 63.1 MB real (target ≤ 80). Go/no-go (a)2 + (c) met. POC stays throwaway; graduation rewrite after M2.
 
 ### M2. Hold and ask [go/no-go]
 

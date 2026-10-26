@@ -9,8 +9,9 @@ const path = require('path');
 const PORT = parseInt(process.argv[2] || '3128', 10);
 const CERTDIR = process.argv[3] || './certs';
 const LOG = process.argv[4] || './mitm.log';
-const UP_CA = process.argv[5] || null; // self-signed upstream (local self-test)
-const UP_CA_PEM = UP_CA ? fs.readFileSync(UP_CA) : null;
+const UP_CA = process.argv[5] || null; // test-only local CA (echo server)
+// System roots AND the test CA: real hosts verify as usual, echo verifies too.
+const UP_CA_PEM = UP_CA ? [...tls.rootCertificates, fs.readFileSync(UP_CA).toString()] : null;
 const log = (o) => fs.appendFileSync(LOG, JSON.stringify(o) + '\n');
 
 const creds = (host) => ({
@@ -93,8 +94,9 @@ function exchange(serverTls, buf, host, port, client, setCur) {
     serverTls.write(rbuf.subarray(0, n)); // tunnel stays open for reuse
     return null;
   });
-  up.on('error', () => { if (!done) deny(serverTls, 502, `upstream ${host} failed`); });
-  up.on('close', () => { if (!done) deny(serverTls, 502, `upstream ${host} closed early`); });
+  const failOnce = (note) => { if (!done) { done = true; deny(serverTls, 502, note); } };
+  up.on('error', (e) => failOnce(`upstream ${host} failed: ${e.message || e.code}`));
+  up.on('close', () => failOnce(`upstream ${host} closed early`));
   return null;
 }
 

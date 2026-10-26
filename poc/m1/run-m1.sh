@@ -26,8 +26,7 @@ PLAIN_PID=$!
 sleep 0.5
 export ECHO="https://127.0.0.1:8443" PLAIN="http://127.0.0.1:18080"
 
-UPCA=""
-[ "$MODE" = local ] && UPCA="$RT/certs/ca.pem"
+UPCA="$RT/certs/ca.pem" # always: echo upstream needs it in every mode
 node "$M1/mitm.cjs" "$PORT" "$RT/certs" "$LOG" "$UPCA" &
 PROXY_PID=$!
 sleep 0.5
