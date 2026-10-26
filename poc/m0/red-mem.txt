@@ -1,0 +1,4 @@
+sandbox root=3995975 procs=4 total=69.5MB no-sleep=69.5MB [bwrap=2.2MB bwrap=1.4MB python3=61.7MB socat=4.1MB]
+count=1 sum-total=69.5MB mean-total=69.5MB
+sum-no-sleep=69.5MB mean-no-sleep=69.5MB max-no-sleep=69.5MB
+proxy pid=3995835 rss=53.6MB

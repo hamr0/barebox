@@ -1,0 +1,9 @@
+node_modules/
+/types/
+poc/m0/socks/
+poc/m0/idle-*.log
+*.sock
+# Agent / IDE scratch — never commit
+.claude/
+.litectx/
+.idea/

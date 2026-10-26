@@ -1,0 +1,15 @@
+bridge=up
+T1_through_proxy_http=200
+T2_connect_exit=2026/10/26 19:32:15 socat[11] E read(6, 0x55c593ced000, 8192): Connection reset by peer
+35
+T3_ssh_visible_entries=0
+/usr/bin/bash: line 11: /tmp/sbx-m0/proj/nope: Read-only file system
+T4a_write_proj=BLOCKED
+/usr/bin/bash: line 12: /home/hamr/nope-m0: Read-only file system
+T4b_write_home=BLOCKED
+B1_noproxy_exit=6
+B2_noenv_exit=6
+B3_localhost_isolated_exit=7
+B3b_directip_exit=7
+B4_default_route_lines=0
+T5_identity_probe=404

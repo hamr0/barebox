@@ -1,0 +1,13 @@
+2026-10-26T18:49:09.198Z net1 listening on /tmp/sbx-m0/socks/net1.sock
+2026-10-26T18:49:09.200Z lock1 listening on /tmp/sbx-m0/socks/lock1.sock
+2026-10-26T18:49:09.200Z rw1 listening on /tmp/sbx-m0/socks/rw1.sock
+2026-10-26T18:49:09.200Z bravo listening on /tmp/sbx-m0/socks/bravo.sock
+2026-10-26T18:49:09.200Z mem1 listening on /tmp/sbx-m0/socks/mem1.sock
+2026-10-26T18:49:09.475Z net1 GET http://127.0.0.1:18080/ -> 200
+2026-10-26T18:49:09.510Z net1 GET http://127.0.0.1:18080/net1-probe -> 404
+2026-10-26T18:49:09.552Z lock1 GET http://127.0.0.1:18080/ -> 200
+2026-10-26T18:49:09.578Z lock1 GET http://127.0.0.1:18080/lock1-probe -> 404
+2026-10-26T18:49:09.610Z rw1 GET http://127.0.0.1:18080/ -> 200
+2026-10-26T18:49:09.635Z rw1 GET http://127.0.0.1:18080/rw1-probe -> 404
+2026-10-26T18:49:09.664Z bravo GET http://127.0.0.1:18080/ -> 200
+2026-10-26T18:49:09.688Z bravo GET http://127.0.0.1:18080/alpha-probe -> 404

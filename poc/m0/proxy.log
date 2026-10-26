@@ -1,0 +1,28 @@
+2026-10-26T18:32:13.151Z a01 listening on /tmp/sbx-m0/socks/a01.sock
+2026-10-26T18:32:13.153Z a02 listening on /tmp/sbx-m0/socks/a02.sock
+2026-10-26T18:32:13.153Z a03 listening on /tmp/sbx-m0/socks/a03.sock
+2026-10-26T18:32:13.153Z a04 listening on /tmp/sbx-m0/socks/a04.sock
+2026-10-26T18:32:13.153Z a05 listening on /tmp/sbx-m0/socks/a05.sock
+2026-10-26T18:32:13.153Z a06 listening on /tmp/sbx-m0/socks/a06.sock
+2026-10-26T18:32:13.154Z a07 listening on /tmp/sbx-m0/socks/a07.sock
+2026-10-26T18:32:13.154Z a08 listening on /tmp/sbx-m0/socks/a08.sock
+2026-10-26T18:32:13.154Z a09 listening on /tmp/sbx-m0/socks/a09.sock
+2026-10-26T18:32:13.154Z a10 listening on /tmp/sbx-m0/socks/a10.sock
+2026-10-26T18:32:13.154Z a11 listening on /tmp/sbx-m0/socks/a11.sock
+2026-10-26T18:32:13.154Z a12 listening on /tmp/sbx-m0/socks/a12.sock
+2026-10-26T18:32:13.154Z a13 listening on /tmp/sbx-m0/socks/a13.sock
+2026-10-26T18:32:13.154Z a14 listening on /tmp/sbx-m0/socks/a14.sock
+2026-10-26T18:32:13.154Z a15 listening on /tmp/sbx-m0/socks/a15.sock
+2026-10-26T18:32:13.154Z a16 listening on /tmp/sbx-m0/socks/a16.sock
+2026-10-26T18:32:13.154Z a17 listening on /tmp/sbx-m0/socks/a17.sock
+2026-10-26T18:32:13.154Z a18 listening on /tmp/sbx-m0/socks/a18.sock
+2026-10-26T18:32:13.154Z a19 listening on /tmp/sbx-m0/socks/a19.sock
+2026-10-26T18:32:13.154Z a20 listening on /tmp/sbx-m0/socks/a20.sock
+2026-10-26T18:32:13.154Z fx listening on /tmp/sbx-m0/socks/fx.sock
+2026-10-26T18:32:13.154Z fy listening on /tmp/sbx-m0/socks/fy.sock
+2026-10-26T18:32:15.602Z fx GET http://127.0.0.1:18080/ -> 200
+2026-10-26T18:32:15.610Z fx CONNECT 127.0.0.1:18080 -> tunnel
+2026-10-26T18:32:15.650Z fx GET http://127.0.0.1:18080/fx-probe -> 404
+2026-10-26T18:32:15.677Z fy GET http://127.0.0.1:18080/ -> 200
+2026-10-26T18:32:15.685Z fy CONNECT 127.0.0.1:18080 -> tunnel
+2026-10-26T18:32:15.720Z fy GET http://127.0.0.1:18080/fy-probe -> 404

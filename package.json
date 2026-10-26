@@ -1,0 +1,17 @@
+{
+  "name": "barebox",
+  "version": "0.1.0",
+  "description": "Lightweight local sandbox for AI agents: every write undoable, nothing leaves the machine without passing the doorman.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "poc:m0": "bash poc/m0/run-m0.sh",
+    "redteam:m0": "bash poc/m0/redteam.sh",
+    "typecheck": "tsc --noEmit",
+    "build:types": "tsc",
+    "prepack": "npm run build:types"
+  }
+}

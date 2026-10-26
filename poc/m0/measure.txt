@@ -1,0 +1,23 @@
+sandbox root=3948118 procs=4 total=9.9MB no-sleep=7.7MB [bwrap=2.2MB bwrap=1.4MB sleep=2.2MB socat=4.1MB]
+sandbox root=3948119 procs=4 total=10.0MB no-sleep=7.9MB [bwrap=2.3MB bwrap=1.5MB sleep=2.1MB socat=4.1MB]
+sandbox root=3948120 procs=4 total=9.9MB no-sleep=7.8MB [bwrap=2.3MB bwrap=1.4MB sleep=2.1MB socat=4.1MB]
+sandbox root=3948121 procs=4 total=9.7MB no-sleep=7.6MB [bwrap=2.1MB bwrap=1.4MB sleep=2.1MB socat=4.0MB]
+sandbox root=3948122 procs=4 total=10.0MB no-sleep=7.8MB [bwrap=2.2MB bwrap=1.4MB sleep=2.2MB socat=4.1MB]
+sandbox root=3948123 procs=4 total=9.8MB no-sleep=7.7MB [bwrap=2.3MB bwrap=1.4MB sleep=2.1MB socat=4.1MB]
+sandbox root=3948124 procs=4 total=10.0MB no-sleep=7.8MB [bwrap=2.3MB bwrap=1.5MB sleep=2.2MB socat=4.0MB]
+sandbox root=3948125 procs=4 total=9.9MB no-sleep=7.7MB [bwrap=2.3MB bwrap=1.4MB sleep=2.2MB socat=4.1MB]
+sandbox root=3948126 procs=4 total=10.0MB no-sleep=7.8MB [bwrap=2.2MB bwrap=1.4MB sleep=2.2MB socat=4.1MB]
+sandbox root=3948127 procs=4 total=9.7MB no-sleep=7.5MB [bwrap=2.1MB bwrap=1.4MB sleep=2.2MB socat=4.1MB]
+sandbox root=3948128 procs=4 total=9.8MB no-sleep=7.7MB [bwrap=2.3MB bwrap=1.4MB sleep=2.1MB socat=4.1MB]
+sandbox root=3948129 procs=4 total=9.8MB no-sleep=7.6MB [bwrap=2.2MB bwrap=1.4MB sleep=2.2MB socat=4.1MB]
+sandbox root=3948130 procs=4 total=9.9MB no-sleep=7.7MB [bwrap=2.2MB bwrap=1.4MB sleep=2.2MB socat=4.1MB]
+sandbox root=3948131 procs=4 total=9.8MB no-sleep=7.7MB [bwrap=2.2MB bwrap=1.4MB sleep=2.1MB socat=4.1MB]
+sandbox root=3948135 procs=4 total=10.0MB no-sleep=7.8MB [bwrap=2.2MB bwrap=1.4MB sleep=2.2MB socat=4.1MB]
+sandbox root=3948136 procs=4 total=9.9MB no-sleep=7.8MB [bwrap=2.3MB bwrap=1.4MB sleep=2.1MB socat=4.0MB]
+sandbox root=3948138 procs=4 total=9.9MB no-sleep=7.7MB [bwrap=2.2MB bwrap=1.4MB sleep=2.2MB socat=4.1MB]
+sandbox root=3948139 procs=4 total=9.8MB no-sleep=7.7MB [bwrap=2.2MB bwrap=1.4MB sleep=2.1MB socat=4.1MB]
+sandbox root=3948141 procs=4 total=10.1MB no-sleep=7.9MB [bwrap=2.3MB bwrap=1.4MB sleep=2.2MB socat=4.1MB]
+sandbox root=3948143 procs=4 total=10.0MB no-sleep=7.8MB [bwrap=2.3MB bwrap=1.3MB sleep=2.2MB socat=4.1MB]
+count=20 sum-total=197.9MB mean-total=9.9MB
+sum-no-sleep=154.4MB mean-no-sleep=7.7MB max-no-sleep=7.9MB
+proxy pid=3948091 rss=52.1MB
