@@ -1190,6 +1190,20 @@ describe('rollback inexact reports why (needs bwrap)', { skip: BWRAP_OK ? false 
     assert.ok(!existsSync(join(rt, 'overlay', 'why-nonutf')), 'the overlay folder is gone');
   });
 
+  it('one shared failure is stated once, never doubled', () => {
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    setupOverlay({ runtime: rt, agent: 'why-once', proj });
+    writeFileSync(Buffer.concat([Buffer.from(`${rt}/overlay/why-once/upper/`), Buffer.from([0xff, 0xfe])]), 'bad\n');
+    const { discarded, exact, why } = rollbackOverlay({ runtime: rt, agent: 'why-once' });
+    assert.equal(exact, false);
+    assert.equal(discarded.length, 0);
+    const hits = why.match(/non-UTF-8/g) ?? [];
+    assert.equal(hits.length, 1, `one reason, stated once, got ${why}`);
+    assert.ok(!why.includes('raw listing also failed'), `no doubling note, got ${why}`);
+    assert.ok(!existsSync(join(rt, 'overlay', 'why-once')), 'the overlay folder is gone');
+  });
+
   it('a deleted project reports why with the raw paths', () => {
     const proj = mkproj(mkdtempSync(join(root, 'p-')));
     const rt = mkdtempSync(join(root, 'rt-'));

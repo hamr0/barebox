@@ -238,12 +238,6 @@ function refuseLeftover(proj, op) {
   }
 }
 
-/**
- * Make a tree listable and removable without changing what a report says:
- * add owner read (files) or rwx (dirs), keeping every other bit, so a diff
- * taken afterwards still reports the original modes on everything that was
- * already readable. Never follows symlinks.
- */
 /** True when the upper holds no visible entry: one shallow `readdir`, no recursion, no hashing. Any top-level name that is neither ignored nor a commit folder counts. Throws when the upper itself cannot be read, like the walk it replaces. */
 function upperIsEmpty(upper, ignore) {
   for (const name of readdirSync(upper)) {
@@ -253,6 +247,12 @@ function upperIsEmpty(upper, ignore) {
   return true;
 }
 
+/**
+ * Make a tree listable and removable without changing what a report says:
+ * add owner read (files) or rwx (dirs), keeping every other bit, so a diff
+ * taken afterwards still reports the original modes on everything that was
+ * already readable. Never follows symlinks.
+ */
 function chmodTree(p) {
   const st = lstatSync(p);
   if (st.isSymbolicLink()) return;
@@ -383,7 +383,7 @@ function bwrapWalk({ lower, upper, work, ignore, scratch, stageDir = null, upper
     // is finite (`lstat`, never following symlinks), and killing a commit's
     // extraction halfway helps nobody.
     const res = spawnSync('bwrap',
-      ['--die-with-parent', '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--new-session',
+      ['--die-with-parent', '--unshare-all', '--new-session',
         '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib64', '/lib64',
         '--overlay-src', lower, '--overlay', upper, work, merged,
         '--ro-bind', srcDir, srcDir,
@@ -904,38 +904,35 @@ export function rollbackOverlay({ runtime, agent }) {
       // Missing already: the rm below still runs.
     }
   }
-  /** List the upper raw; throws, so the caller can report both reasons. */
-  const listRaw = () => rawUpper(upper, ignore);
   /** @type {OverlayChange[]} */
-  let discarded;
+  let discarded = [];
   let exact = true;
   /** @type {string|null} */
   let why = null;
-  if (existsSync(m.proj)) {
+  /** @type {string|null} */
+  let primary = null;
+  if (!existsSync(m.proj)) {
+    primary = `project ${m.proj} is gone`;
+  } else {
     try {
       discarded = diffOverlay({ runtime, agent });
     } catch (e) {
-      const diffReason = e instanceof Error ? e.message : String(e);
-      try {
-        discarded = listRaw();
-      } catch (e2) {
-        const rawReason = e2 instanceof Error ? e2.message : String(e2);
-        discarded = [];
-        why = `${diffReason} (raw listing also failed: ${rawReason})`;
-      }
-      if (why === null) why = diffReason;
-      exact = false;
+      primary = e instanceof Error ? e.message : String(e);
     }
-  } else {
-    why = `project ${m.proj} is gone`;
-    try {
-      discarded = listRaw();
-    } catch (e) {
-      const rawReason = e instanceof Error ? e.message : String(e);
-      discarded = [];
-      why = `${why} (raw listing also failed: ${rawReason})`;
-    }
+  }
+  if (primary !== null) {
     exact = false;
+    /** @type {string|null} */
+    let rawReason = null;
+    try {
+      discarded = rawUpper(upper, ignore);
+    } catch (e) {
+      rawReason = e instanceof Error ? e.message : String(e);
+      discarded = [];
+    }
+    why = rawReason === null || rawReason === primary
+      ? primary
+      : `${primary} (raw listing also failed: ${rawReason})`;
   }
   // Removal depends on neither listing nor the first permission pass: a
   // partial chmodTree/rmSync failure retries removal once after a fresh
