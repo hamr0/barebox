@@ -117,7 +117,7 @@ Fix:
    - `appendFileSync` on every request blocks the proxy. Use one `fs.createWriteStream` with `flags: 'a'`.
    - Bodies are logged in plain text. That is fine until M5, but put the redaction hook in the same writer now, because real keys arrive in M5.
 6. **Tests depend on `poc/`.** `mkcerts.sh` and `echo.py` are throwaway by rule. Move what tests need into `test/fixtures/`. The upstream fixture can be a Node `https.createServer` in-process, which drops the Python dependency, the stale-process problem and the fixed ports at once.
-7. **`docs/product/primitives-manifest-spec.md`** (526 lines) is a generic suite spec, not barebox. Keep it in one shared place (bareguard or the profile repo's conventions) and link it.
+7. **`docs/wiki/primitives-manifest-spec.md`** (526 lines) is a generic suite spec, not barebox. Keep it in one shared place (bareguard or the profile repo's conventions) and link it.
 8. **Test gaps to add:**
    - `curl` without the CA asserts **exit 60** (certificate rejected), not just "throws". Today it also passes when the proxy is down.
    - HEAD; a slow upstream (> 10 s, using a fake-timer-free fixture with an `/slow?ms=` route); plain-HTTP keep-alive; plain-HTTP hold; body over `maxBody`; client disconnect while held; `close()` with an open tunnel and a parked hold, after which the process must exit.

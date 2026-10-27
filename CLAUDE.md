@@ -5,8 +5,8 @@ No MEMORY.md yet — the first `/remember` consolidation creates `.claude/rememb
 <!-- MEMORY:END -->
 
 <!-- DOCS_INDEX:START -->
-Docs: `docs/product/agent-sandbox-prd.md` (the PRD), `docs/product/agent-sandbox.md` (full story),
-`poc/m0/README.md` (M0 walls proof). No `docs/index.md` yet — search this corpus instead of reading it whole.
+Docs map: `docs/index.md` — every doc in this project, with line counts.
+Search this corpus instead of reading it whole: `/docs-builder search <query words>`
 <!-- DOCS_INDEX:END -->
 
 ## Dev Rules

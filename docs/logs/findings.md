@@ -1,6 +1,6 @@
 # Findings: experiments and why
 
-Contract: the [PRD](agent-sandbox-prd.md) is the spec — problem, goal, modules,
+Contract: the [PRD](../product/agent-sandbox-prd.md) is the spec — problem, goal, modules,
 verdicts. This file holds the experiments behind the verdicts: setup, numbers,
 dead ends, and why each decision went the way it did.
 
