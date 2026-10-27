@@ -3,6 +3,10 @@
   "version": "0.2.0",
   "description": "Lightweight local sandbox for AI agents: every write undoable, nothing leaves the machine without passing the doorman.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hamr0/barebox.git"
+  },
   "type": "module",
   "main": "./src/index.js",
   "exports": {
@@ -13,7 +17,7 @@
     "./primitives.json": "./primitives.json"
   },
   "bin": {
-    "sbx": "./src/cli.js"
+    "sbx": "src/cli.js"
   },
   "files": [
     "src",
