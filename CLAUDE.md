@@ -1,3 +1,14 @@
+# barebox
+
+<!-- MEMORY:START -->
+No MEMORY.md yet — the first `/remember` consolidation creates `.claude/remember/MEMORY.md`; link it here when it exists.
+<!-- MEMORY:END -->
+
+<!-- DOCS_INDEX:START -->
+Docs: `docs/product/agent-sandbox-prd.md` (the PRD), `docs/product/agent-sandbox.md` (full story),
+`poc/m0/README.md` (M0 walls proof). No `docs/index.md` yet — search this corpus instead of reading it whole.
+<!-- DOCS_INDEX:END -->
+
 ## Dev Rules
 
 **Spec first — quality of questions over quantity.** Interview to find the decision, not the task. Ask in batched rounds, only questions whose prerequisites are settled, each with your recommended answer under it; find facts yourself and ask me only the choices that are mine. Pin module 0 down to the decision, sketch later modules only enough to know they don't change it, and ask what's out of scope for the whole build. One round is not an interview; never build on an assumed prerequisite. Write a PRD with problem/goal, go/no-go, out-of-scope, modules, open questions. POCs refine it.
@@ -18,4 +29,4 @@
 
 **Responsive web UI is mandatory.** Any web UI must work on mobile by default — fluid layouts, viewport meta, breakpoints, no horizontal scroll. Verify in DevTools device emulation before claiming a UI task is done. POCs exempt; real projects are not.
 
-For full development and testing standards, see `.claude/remember/AGENT_RULES.md`.
+For full development and testing standards, see `.claude/remember/AGENT_RULES.md` (plus `LIBRARY_CONVENTIONS.md` — this is a zero-dependency library). Consult when building something new or adding a feature — a standards guide, not hot context.
