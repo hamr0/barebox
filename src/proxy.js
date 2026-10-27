@@ -182,6 +182,29 @@ export function assertAgentName(name) {
 }
 
 /**
+ * Resolve symlinks through the nearest existing ancestor: socket paths may
+ * not exist yet, so `realpathSync` on the full path would throw. Walks up
+ * to the first existing ancestor, resolves that, then re-attaches the rest.
+ *
+ * @param {string} p any path, existing or not
+ * @returns {string} the real (symlink-free) spelling of `p`
+ */
+export function realPathOf(p) {
+  const abs = path.resolve(p);
+  let cur = abs;
+  /** @type {string[]} */
+  const rest = [];
+  while (!fs.existsSync(cur)) {
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    rest.unshift(path.basename(cur));
+    cur = parent;
+  }
+  const real = fs.realpathSync(cur);
+  return rest.length ? path.join(real, ...rest) : real;
+}
+
+/**
  * The one path both sides agree on: the proxy listens here, the launcher
  * binds it into the sandbox. This function is the single writer of the shape.
  *
@@ -208,7 +231,10 @@ export function socketPathForAgent(runtime, name) {
  * @property {number} [port] opt-in TCP listener for tests, bound to 127.0.0.1 only (default: none)
  * @property {string} [upstreamCa] extra PEM the proxy trusts for upstream TLS, on top of system roots
  * @property {HoldOptions} [hold] hold queue config, or omit to forward everything
- * @property {string|null} [controlSocket] unix socket path for `pending | approve | deny`
+ * @property {string|null} [controlSocket] unix socket path for `pending | approve | deny`.
+ *   Must live inside `runtime` (compared via {@link realPathOf}, so symlinks
+ *   cannot smuggle it out): anything else throws before any side effect.
+ *   No default — omit it when no CLI decisions are needed.
  * @property {number} [upstreamTimeoutMs] give up on an upstream response after this (default 120000)
  * @property {boolean} [allowLoopback] TEST-ONLY opt-in: let loopback and unspecified
  *   destinations through (default false). Fixture servers listen on 127.0.0.1,
@@ -278,6 +304,20 @@ export function createProxy(opts) {
   const runtime = runtimeOpt ?? (certDirOpt ? path.dirname(path.resolve(certDirOpt)) : null);
   const dirOpt = certDirOpt ?? (runtime ? path.join(runtime, 'certs') : null);
   if (!dirOpt) throw new Error('createProxy: certDir or runtime is required');
+  // The control socket is the approve-payments capability: it must live
+  // inside the runtime dir (the launcher masks exactly that dir), compared
+  // on real paths so a symlink cannot smuggle it out. Fail closed here,
+  // before the log stream, CA read, or any listener exists.
+  if (controlSocket) {
+    if (!runtime) {
+      throw new Error(`createProxy: controlSocket must live inside the runtime, got ${controlSocket} with no runtime`);
+    }
+    const realRt = realPathOf(runtime);
+    const realCtl = realPathOf(controlSocket);
+    if (!realCtl.startsWith(realRt + path.sep)) {
+      throw new Error(`createProxy: controlSocket must live inside the runtime: ${realCtl} not under ${realRt}`);
+    }
+  }
   const certDir = dirOpt;
   const holdMaxBody = hold?.maxBody ?? 1048576;
 

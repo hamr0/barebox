@@ -4,7 +4,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, relative, isAbsolute } from 'node:path';
-import { socketPathForAgent, assertAgentName } from './proxy.js';
+import { socketPathForAgent, assertAgentName, realPathOf } from './proxy.js';
 
 // Locked drawers: masked with an empty tmpfs wherever they exist.
 const LOCKED_PATHS = [
@@ -119,6 +119,26 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
       return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
     };
     if (inside(hm) || inside(pr)) args.push('--tmpfs', rt);
+    // Real-tree mask as well: the sandbox shows the REAL tree (symlinks
+    // resolved), so a runtime passed as a symlink from outside $HOME/proj
+    // can still land inside it and stay visible through the ro-binds. The
+    // lexical mask above covers the spelling bwrap is given; this one covers
+    // the sandbox-visible spelling join(home, relative(realHome, realRt))
+    // (likewise proj). Both masks are cheap; keep both.
+    const realRt = realPathOf(rt);
+    const realHm = realPathOf(hm);
+    const realPr = realPathOf(pr);
+    if (realRt === realHm || realRt === realPr) {
+      throw new Error(`launch: runtime must not be ${realRt === realHm ? 'HOME' : 'the project dir'} itself (its sockets cannot be hidden there)`);
+    }
+    const realInside = (realBase, baseSpelling) => {
+      const rel = relative(realBase, realRt);
+      if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null;
+      return join(baseSpelling, rel);
+    };
+    for (const m of [realInside(realHm, hm), realInside(realPr, pr)]) {
+      if (m && !args.includes(m)) args.push('--tmpfs', m);
+    }
   }
   args.push(
     '--dir', '/run',

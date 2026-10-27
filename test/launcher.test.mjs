@@ -2,7 +2,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
@@ -239,6 +239,43 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     while (!/marker/.test(got.join(''))) {
       if (Date.now() - t0 > 10000) throw new Error('front door broke under a masked runtime');
       await new Promise((r) => setTimeout(r, 50));
+    }
+  });
+
+  it('hides a runtime reached through a symlink from outside $HOME, front door still works', async () => {
+    // Section 7 repro: the real runtime dir lives inside the fake home, but
+    // the runtime is passed as a symlink located OUTSIDE home pointing in.
+    // The sandbox shows the real tree, so the lexical mask misses and only
+    // the real-tree mask hides the sockets. The agent's own front door
+    // (/run/sbx/agent.sock bridge to 127.0.0.1:3128) must still deliver.
+    const realRt = join(home, 'real-rt');
+    mkdirSync(join(realRt, 'socks'), { recursive: true });
+    const sock = join(realRt, 'socks', 't9.sock');
+    try { rmSync(sock); } catch {}
+    const got = [];
+    const srv = net.createServer((s) => {
+      s.on('data', (c) => got.push(c.toString()));
+    });
+    await new Promise((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(sock, resolve);
+    });
+    servers.push(srv);
+    const lnk = join(root, 'lnk-t9');
+    try { rmSync(lnk); } catch {}
+    symlinkSync(realRt, lnk);
+    try {
+      const c = launch({ runtime: lnk, agent: 't9', proj,
+        command: ['bash', '-c',
+          'test ! -e "$HOME/real-rt/socks/t9.sock" && echo marker9 > /dev/tcp/127.0.0.1/3128'] });
+      assert.equal((await run(c)).code, 0);
+      const t0 = Date.now();
+      while (!/marker9/.test(got.join(''))) {
+        if (Date.now() - t0 > 10000) throw new Error('front door broke under a symlinked runtime');
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    } finally {
+      try { rmSync(lnk); } catch {}
     }
   });
 });
