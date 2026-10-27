@@ -216,3 +216,83 @@ A bypass test that takes 8–20 s is waiting on something else, and still passes
 - [ ] Proxy denies loopback, link-local and host addresses after resolution; test fixtures use the explicit opt-in.
 - [ ] Through-the-proxy loopback attempt returns 403 with a reason, and is logged.
 - [ ] No test waits more than ~2 s on a timer; `npm test` < ~30 s.
+
+---
+
+## 6. Test coverage review (2026-10-27)
+
+### Measured
+Full suite, working tree (includes uncommitted `src/proxy.js` + `test/proxy.test.mjs` changes):
+
+```
+node --test --experimental-test-coverage --test-coverage-include='src/**' "test/*.test.mjs"
+→ 70/70 pass, 0 skipped, ~7 s
+lines 97.0% · branches 72.5% · functions 84.5%   (proxy.js: lines 95.8%, branches 69.4%)
+```
+
+The suite is good: it tests behaviour, not lines. Sections 1 and 5 are covered:
+- exact curl exit codes
+- HEAD, 204/304, slow upstream
+- plain-HTTP holds, abandoned holds, `close()` with open tunnels
+- certificates minted on demand
+- pinned DNS that checks every answer and fails closed
+- LAN addresses denied
+- one end-to-end run: agent in bwrap → hold → approve
+
+The remaining uncovered lines are low-value branches (`clientError`, a throwing `allowUpstream`, a failing `networkInterfaces()`). Do not chase the percentage.
+
+The gaps below are **behaviours**, not lines. Items 1–3 must land before merging `rewrite` → main.
+
+### 1. HOLE: the agent can approve its own holds (proven)
+A read-only bind does **not** stop `connect()` to a unix socket. Measured: a socket listening on the host, `bwrap --ro-bind / /`, and the sandboxed process connected and the host received `approve h1`.
+
+The launcher ro-binds `$HOME` and the project. If `runtime` (holding `ctl.sock` and every agent's `socks/*.sock`) or `controlSocket` sits under either one, the agent can:
+- **self-approve** its own held payments via the control socket, which defeats the x-gate;
+- **impersonate another agent** by connecting to its socket, which defeats identity.
+
+The tests miss it because they put `runtime` in `/tmp`, and the sandbox replaces `/tmp` with an empty tmpfs.
+
+**Fix:**
+- In `launch()`, mask the runtime dir and the control-socket's dir with `--tmpfs` (after the `$HOME`/project binds), then bind only this agent's socket at `/run/sbx/agent.sock`.
+- Alternatively, refuse a runtime under `$HOME` or the project, loudly.
+- The same class covers any listening unix socket under `$HOME` (IDE IPC, rootless container sockets). State that in `barebox.context.md` gotchas.
+
+**Test:**
+- `runtime` and `controlSocket` under the fake HOME.
+- From inside the sandbox, `sbx approve <id>` must fail and the hold must stay pending.
+- Connecting to another agent's socket must fail.
+
+### 2. Go/no-go (b) is only half tested
+The PRD says one request is held "**while other requests from the same agent complete meanwhile**". The hold tests prove park → approve/deny only.
+
+**Test:** park one request, then send two more from the **same agent**, one on the same tunnel and one on a new connection. Both must get 200 while the hold is still pending. Then approve and assert the held one completes.
+
+### 3. Upstream certificate verification has no negative test
+The proxy decrypts the agent's TLS and re-encrypts it toward the real server, so the agent is only as safe as the proxy's upstream verification. Node verifies by default. Nothing catches a future `rejectUnauthorized: false` added "to make a fixture work".
+
+**Test:**
+- An upstream serving a cert from an unknown CA (not in `upstreamCa`, not in system roots) gets a 502 with a reason, and the request body never reaches it.
+- An upstream whose cert names the wrong host also gets a 502.
+
+### 4. Two agents at once
+M0 proved no cross-attribution (`fx`/`fy`). The rewrite tests one agent's identity.
+
+**Test:** two agents, interleaved requests, plus one hold each. Every log line and every `pending()` entry carries the right agent name; denying A's hold leaves B's untouched.
+
+### Worth adding (not blocking the merge)
+5. **The M1 client matrix isn't fully ported.**
+   - Python `requests` and git over https were part of the M1 proof; the suite now runs only curl and node.
+   - Add a python test (skip loudly if `requests` is missing).
+   - Add an opt-in `npm run test:real` (`git ls-remote` + real hosts), kept out of `npm test` and the merge gate.
+6. **Go/no-go (c) hasn't been re-measured.**
+   - No benchmark covers the rewritten code with on-demand certificates and holds. The POC numbers (7.7 MB per sandbox, 56.7 MB proxy) do not carry over to new code.
+   - Add `npm run bench`, not part of `npm test`: 20 agents, RSS per sandbox and for the proxy.
+   - Record the result in the PRD against ≤ 10 MB / ≤ 80 MB.
+7. **Malformed request target → 400.** This is uncovered at `src/proxy.js:332`, and the POC proved it in M2. One cheap test.
+
+### Done when (adds to section 4)
+- [ ] From inside a sandbox whose runtime lives under `$HOME`, `sbx approve` and other agents' sockets are unreachable; the hold stays pending.
+- [ ] A held request does not block other requests from the same agent (same tunnel and new connection).
+- [ ] Unknown-CA and wrong-host upstream certs are 502 and never forwarded.
+- [ ] Two concurrent agents: no cross-attribution in logs or holds.
+- [ ] RSS re-measured on the rewritten code and recorded in the PRD.
