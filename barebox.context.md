@@ -63,6 +63,9 @@ deny and timeout answer 403 with the reason.
   `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
   `GIT_SSL_CAINFO`. Without it every HTTPS call from inside fails
   verification. Only `ca.pem` enters the sandbox, never the key.
+- `createProxy` throws if `certDir` or `controlSocket` is not inside `runtime` (real paths, so symlinks don't help): the launcher masks only the runtime dir, and `ca.key` / the approve socket must stay behind it. The default `<runtime>/certs` always passes.
+- The upstream wall answers `403` for loopback, link-local (incl. `169.254.169.254`), the host's own addresses, private LAN ranges and unresolvable names. Every DNS answer is checked and the dial is pinned to the checked IP; `allowLoopback` is test-only.
+- The audit log (`logFile`) is created `0600`, but only when the file is new. `Authorization` and `Proxy-Authorization` values are logged as `[redacted]`; other headers (cookies, API-key headers) and bodies are logged as-is unless your `redact` hook shapes them (it runs after the built-in scrub).
 - `sbx` exits 0 ok, 1 unknown id / refused / socket failure, 2 usage.
 - Any listening unix socket under `$HOME` (IDE IPC, rootless-container sockets) is reachable from inside the sandbox: a read-only bind does not block `connect(2)`; the locked-paths list is the lever.
 
