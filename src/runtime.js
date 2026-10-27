@@ -5,6 +5,7 @@
 // log, and the overlay record. Import layout from here; no other module
 // names these paths. (The sandbox launcher used to import them from the
 // TLS proxy just to get a filename.)
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -89,6 +90,98 @@ export function runtimeTempDir(scratch, prefix) {
 }
 
 /**
+ * This process's start time: field 22 (`starttime`) of `/proc/<pid>/stat`,
+ * parsed after the last `)` (the command name may itself hold parens and
+ * spaces). Pid plus start time identifies a process even after its pid is
+ * reused. Linux-only, like the rest of the sandbox.
+ *
+ * @param {number} pid process id to read
+ * @returns {string|null} the start time, or null when the process is gone
+ */
+function procStart(pid) {
+  let stat;
+  try {
+    stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+  } catch {
+    return null;
+  }
+  const afterComm = stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/);
+  // Fields after the command run from field 3 (state): field 22 sits at 19.
+  return afterComm.length >= 20 ? afterComm[19] : null;
+}
+
+/**
+ * Claim one runtime for one live proxy: the single enforcer of "one proxy
+ * owns a runtime". The owner file holds `{"pid","start"}` 0600; pid plus
+ * start time survives pid reuse, and a second proxy in the same process is
+ * refused like any other second owner.
+ *
+ * @param {string} runtime runtime dir to claim
+ * @returns {() => void} `release()`: deletes the owner file only when it still holds our pid and start time, so another process's claim is never removed; idempotent
+ */
+export function claimRuntime(runtime) {
+  const owner = runtimePaths(runtime).owner;
+  fs.mkdirSync(runtime, { recursive: true });
+  const mine = { pid: process.pid, start: procStart(process.pid) };
+  const writeMine = () => {
+    const fd = fs.openSync(owner, 'wx', 0o600);
+    try {
+      fs.writeFileSync(fd, JSON.stringify(mine));
+    } finally {
+      fs.closeSync(fd);
+    }
+  };
+  const readClaim = () => {
+    try {
+      return JSON.parse(fs.readFileSync(owner, 'utf8'));
+    } catch {
+      return null;
+    }
+  };
+  const inUseError = (/** @type {unknown} */ pid) => new Error(
+    `runtime ${runtime} is in use by pid ${String(pid)} (one proxy per runtime: use another SBX_RUNTIME, or leave it unset for a fresh one)`);
+  const takeOver = () => {
+    try {
+      const stale = `${owner}.stale-${crypto.randomBytes(8).toString('hex')}`;
+      fs.renameSync(owner, stale);
+      try { fs.unlinkSync(stale); } catch {}
+    } catch (e) {
+      if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'ENOENT') throw e;
+      // Already gone: another takeover won; the retry below decides.
+    }
+    try {
+      writeMine();
+    } catch (e) {
+      if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EEXIST') throw e;
+      throw inUseError(readClaim()?.pid ?? 'unknown');
+    }
+  };
+  try {
+    writeMine();
+  } catch (e) {
+    if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EEXIST') throw e;
+    const cur = readClaim();
+    const pid = cur?.pid;
+    if (typeof pid === 'number' && cur?.start !== undefined
+      && procStart(pid) !== null && procStart(pid) === cur.start) {
+      throw inUseError(pid);
+    }
+    takeOver();
+  }
+  return () => {
+    let cur;
+    try {
+      cur = JSON.parse(fs.readFileSync(owner, 'utf8'));
+    } catch {
+      return;
+    }
+    if (cur?.pid === mine.pid && cur?.start === mine.start) {
+      try { fs.unlinkSync(owner); } catch {}
+    }
+  };
+}
+
+/**
  * Strip terminal control before printing agent-controlled bytes (ask URLs,
  * rules, body previews, overlay paths): an escape sequence smuggled into a
  * preview could otherwise rewrite the approver's terminal line before
@@ -108,12 +201,13 @@ export function safe(s) {
  * Every path in a runtime dir. The one place that names them.
  *
  * @param {string} runtime runtime dir
- * @returns {{ socket: (agent: string) => string, asksDir: string, answersDir: string, askFile: (id: string) => string, answerFile: (id: string) => string, certsDir: string, caBundle: string, audit: string, overlay: (agent: string) => { base: string, upper: string, work: string, manifest: string } }} layout
+ * @returns {{ socket: (agent: string) => string, asksDir: string, answersDir: string, askFile: (id: string) => string, answerFile: (id: string) => string, certsDir: string, caBundle: string, audit: string, owner: string, overlay: (agent: string) => { base: string, upper: string, work: string, manifest: string } }} layout
  */
 export function runtimePaths(runtime) {
   const asksDir = path.join(runtime, 'asks');
   const answersDir = path.join(runtime, 'answers');
   return {
+    owner: path.join(runtime, 'owner'),
     asksDir,
     answersDir,
     askFile: (id) => path.join(asksDir, `${id}.json`),

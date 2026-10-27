@@ -198,9 +198,11 @@ export function normalizeDecision(input, { approveAlias = false } = {}) {
 }
 
 /**
- * Create the hold queue. One queue per runtime: on the file channel the
- * queue owns `asks/` and `answers/` for its runtime, clearing both at
- * start and removing its asks on close, so no answer outlives its queue.
+ * Create the hold queue. One queue per runtime, enforced by `claimRuntime`
+ * in `createProxy` (a second live proxy on the same runtime never starts):
+ * on the file channel the queue owns `asks/` and `answers/` for its
+ * runtime, clearing both at start and removing its asks on close, so no
+ * answer outlives its queue.
  *
  * @param {object} opts
  * @param {(o: Record<string, unknown>) => void} opts.log audit-log writer

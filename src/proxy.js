@@ -18,7 +18,7 @@ import path from 'node:path';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { ensureCA, certFor, HOST_RE } from './certs.js';
 import { createHolds } from './holds.js';
-import { runtimePaths } from './runtime.js';
+import { claimRuntime, runtimePaths } from './runtime.js';
 
 const AGENT = Symbol('agent');
 const SECURE = Symbol('secure');
@@ -272,7 +272,7 @@ async function checkUpstream(host, gate) {
  * @param {ProxyOptions} opts
  * @returns live proxy: `ready` resolves when listeners + CA are up; the shape is inferred, see `Proxy`
  * @when Reach for this HARNESS-ONLY to run the front door: it terminates agent TLS, sees every request, and parks the ones a human must decide. It decides nothing itself; pair with the launcher for sandboxes and `sbx` for decisions.
- * @fails Throws synchronously on a missing `logFile` or `runtime`. At runtime, dead upstreams, malformed input, over-cap and timed-out holds all become loud logged HTTP errors, never silence and never a crash. A second proxy on the same port rejects `ready`, never crashes the process.
+ * @fails Throws synchronously on a missing `logFile` or `runtime`. Throws when another live proxy owns the runtime; a dead owner's claim is taken over. At runtime, dead upstreams, malformed input, over-cap and timed-out holds all become loud logged HTTP errors, never silence and never a crash. A second proxy on the same port rejects `ready`, never crashes the process.
  * @example
  * import { createProxy } from "barebox";
  * const proxy = createProxy({ port: 0, runtime: "./sbx-runtime", logFile: "./mitm.log" });
@@ -289,6 +289,10 @@ export function createProxy(opts) {
   const gate = { allowLoopback, resolveUpstream: resolveUpstream ?? undefined };
   if (!logFile) throw new Error('createProxy: logFile is required');
   if (typeof runtime !== 'string' || !runtime) throw new Error('createProxy: runtime is required');
+  // One live proxy per runtime, enforced here: claimed before the hold
+  // queue clears `asks/` and `answers/`, so that clearing can never wipe a
+  // live owner's files — only a dead owner's leftovers can be there.
+  const releaseClaim = claimRuntime(runtime);
   // Always `<runtime>/certs`: one layout, owned by runtime.js, so there is
   // nothing to contain and no check to fail.
   const certDir = runtimePaths(runtime).certsDir;
@@ -304,7 +308,10 @@ export function createProxy(opts) {
   if (upstreamCa) {
     let extra;
     try { extra = fs.readFileSync(upstreamCa, 'utf8'); }
-    catch (e) { throw new Error(`createProxy: cannot read upstreamCa: ${e.message}`); }
+    catch (e) {
+      releaseClaim();
+      throw new Error(`createProxy: cannot read upstreamCa: ${e.message}`);
+    }
     trust = [...tls.rootCertificates, extra];
   }
 
@@ -453,20 +460,29 @@ export function createProxy(opts) {
     else up.end();
   }
 
-  const holds = hold ? createHolds({
-    log,
-    shouldHold: hold.shouldHold,
-    match: hold.match,
-    timeoutMs: hold.timeoutMs,
-    maxBody: holdMaxBody,
-    runtime,
-    onAsk: hold.onAsk,
-    pollMs: hold.pollMs,
-    onEvent: hold.onEvent,
-    onApprove: (h) => forward({ agent: h.agent, method: h.method, url: h.url,
-      headers: h.headers, body: h.body, cres: h.cres }),
-    onDeny: (h, reason) => denyRes(h.cres, 403, `denied: ${reason}`),
-  }) : null;
+  // The rest of setup is infallible synchronously except this call, so a
+  // throw here releases the claim before it propagates (like upstreamCa
+  // above); async failures release through `ready` and `close()` below.
+  let holds = null;
+  try {
+    holds = hold ? createHolds({
+      log,
+      shouldHold: hold.shouldHold,
+      match: hold.match,
+      timeoutMs: hold.timeoutMs,
+      maxBody: holdMaxBody,
+      runtime,
+      onAsk: hold.onAsk,
+      pollMs: hold.pollMs,
+      onEvent: hold.onEvent,
+      onApprove: (h) => forward({ agent: h.agent, method: h.method, url: h.url,
+        headers: h.headers, body: h.body, cres: h.cres }),
+      onDeny: (h, reason) => denyRes(h.cres, 403, `denied: ${reason}`),
+    }) : null;
+  } catch (e) {
+    releaseClaim();
+    throw e;
+  }
 
   const server = http.createServer((creq, cres) => {
     // Async only for the wall's DNS lookup; no body listener is attached
@@ -650,8 +666,10 @@ export function createProxy(opts) {
     }
     return { port: bound };
   })();
-  // A rejected `ready` must never become an uncaught process crash.
-  ready.catch(() => {});
+  // A rejected `ready` must never become an uncaught process crash, and it
+  // releases the claim before the rejection reaches the caller (attached
+  // first, so this runs before any caller reaction).
+  ready.catch(() => { releaseClaim(); });
 
   function addAgent(name) {
     const sockPath = runtimePaths(runtime).socket(name);
@@ -698,6 +716,7 @@ export function createProxy(opts) {
       else logStream.once('finish', () => resolve());
     });
     await flushed;
+    releaseClaim();
   }
 
   return {

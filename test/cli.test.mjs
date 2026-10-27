@@ -287,7 +287,7 @@ describe('sbx run usage (no sandbox needed)', () => {
 });
 
 describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
-  let root, home, proj, rt, plainUp;
+  let root, home, proj, projB, rt, plainUp;
   let CAN_RUN = false;
   let SKIP_WHY = '';
 
@@ -309,11 +309,13 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
     else CAN_RUN = true;
     if (!CAN_RUN) return;
     root = mkdtempSync(join(tmpdir(), 'bb-cr-'));
-    home = join(root, 'home'); proj = join(root, 'proj'); rt = join(root, 'rt');
+    home = join(root, 'home'); proj = join(root, 'proj'); projB = join(root, 'projB'); rt = join(root, 'rt');
     mkdirSync(home, { recursive: true });
     mkdirSync(proj, { recursive: true });
+    mkdirSync(projB, { recursive: true });
     mkdirSync(rt, { recursive: true });
     writeFileSync(join(proj, 'agent.txt'), 'cli run project\n');
+    writeFileSync(join(projB, 'agent.txt'), 'cli run second project\n');
     plainUp = await startHttp();
   });
   after(async () => {
@@ -352,10 +354,12 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
     renameSync(tmp, join(dir, `${id}.json`));
   };
 
-  // Spawn `sbx run` against the fixture; the sandbox's project is `proj`.
-  function spawnRun(extraArgs, command) {
+  // Spawn `sbx run` against the fixture; the sandbox's project is `proj`
+  // unless the caller passes another cwd (the claim test runs the second
+  // `sbx run` from a different project on the same SBX_RUNTIME).
+  function spawnRun(extraArgs, command, cwd = proj) {
     const child = spawn('node', [CLI, 'run', ...extraArgs, '--', ...command], {
-      cwd: proj,
+      cwd,
       env: { ...process.env, HOME: home, SBX_RUNTIME: rt, SBX_UNSAFE_TEST_ALLOW_LOOPBACK: '1' },
     });
     let out = '', err = '';
@@ -431,6 +435,36 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
     assertClean(r.out() + r.err(), 'json');
     for (const line of r.out().trim().split('\n').filter(Boolean)) {
       JSON.parse(line); // stdout stays parseable JSON lines
+    }
+  });
+
+  it('a second sbx run on one SBX_RUNTIME is refused; the first hold stays approvable', { timeout: 120000 }, async (t) => {
+    if (skipIfBlocked(t)) return;
+    const sbx = (args) => execA('node', [CLI, ...args],
+      { encoding: 'latin1', env: { ...process.env, SBX_RUNTIME: rt } });
+    const a = spawnRun(['--mode', 'ask'],
+      ['bash', '-c', `curl -s --max-time 10 --data m=CLAIMCLI http://127.0.0.1:${plainUp.port}/hold`]);
+    try {
+      const id = await waitFor(() => {
+        const m = /ask (h\d+) /.exec(a.out());
+        return m && m[1];
+      }, 'first run to park its hold');
+      // A second run, from a different project on the same runtime, is refused.
+      const b = spawnRun(['--mode', 'ask'], ['bash', '-c', 'exit 0'], projB);
+      const bCode = await b.closed;
+      assert.equal(bCode, 1, `second run must exit 1: out=${b.out()} err=${b.err()}`);
+      assert.match(b.err(), new RegExp(`run failed: runtime .* is in use by pid ${a.child.pid}`),
+        'refusal names the first run on stderr');
+      // The first hold survived: still pending, still approvable through sbx.
+      const p = await sbx(['pending']);
+      assert.match(p.stdout, new RegExp(id), 'h1 still listed');
+      await sbx(['approve', id]);
+      const aCode = await a.closed;
+      assert.equal(aCode, 0, `first run settles after approve: out=${a.out()} err=${a.err()}`);
+      assert.match(a.out(), /done exit 0/);
+    } finally {
+      try { a.child.kill('SIGKILL'); } catch {}
+      await a.closed.catch(() => {});
     }
   });
 });
