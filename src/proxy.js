@@ -31,6 +31,32 @@ const HOP_REQ = new Set(['proxy-connection', 'proxy-authorization']);
 const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
   'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
 
+// Secrets never land in the audit log verbatim: Authorization-style header
+// values are replaced with a fixed marker before an entry is written. The
+// user's `redact` hook runs after this scrubbing, so it sees (and further
+// shapes) an already-safe entry. Bodies stay logged as-is.
+const REDACTED = '[redacted]';
+const SENSITIVE_HEADERS = new Set(['authorization', 'proxy-authorization']);
+
+/**
+ * Copy a log entry with sensitive header values replaced by `[redacted]`.
+ * The caller's headers object is never mutated.
+ *
+ * @param {Record<string, unknown>} entry log entry about to be written
+ * @returns {Record<string, unknown>} entry with secrets scrubbed
+ */
+function scrubSecrets(entry) {
+  const h = entry['headers'];
+  if (!h || typeof h !== 'object') return entry;
+  const src = /** @type {Record<string, unknown>} */ (h);
+  if (!Object.keys(src).some((k) => SENSITIVE_HEADERS.has(k.toLowerCase()))) return entry;
+  const headers = { ...src };
+  for (const k of Object.keys(headers)) {
+    if (SENSITIVE_HEADERS.has(k.toLowerCase())) headers[k] = REDACTED;
+  }
+  return { ...entry, headers };
+}
+
 // --- upstream wall ---------------------------------------------------------
  // Default-deny for loopback, link-local (incl. cloud metadata 169.254/16),
  // the host's own addresses, and private LAN ranges (RFC 1918, CGNAT
@@ -226,7 +252,11 @@ export function socketPathForAgent(runtime, name) {
  *
  * @typedef {object} ProxyOptions
  * @property {string} logFile JSON-lines log path (`req`, `resp`, `deny`, `hold`, `decide`, `hold-abandoned`)
- * @property {string} [certDir] dir for the CA + minted host certs (default `<runtime>/certs`)
+ * @property {string} [certDir] dir for the CA + minted host certs (default `<runtime>/certs`).
+ *   Must live inside `runtime` (compared via {@link realPathOf}, so symlinks
+ *   cannot smuggle it out): anything else throws before any side effect.
+ *   The CA private key lives here, and the sandbox bind-mounts only the
+ *   runtime dir — an outside certDir would expose `ca.key` through the binds.
  * @property {string} [runtime] runtime dir; required for `addAgent`, default parent of `certDir`
  * @property {number} [port] opt-in TCP listener for tests, bound to 127.0.0.1 only (default: none)
  * @property {string} [upstreamCa] extra PEM the proxy trusts for upstream TLS, on top of system roots
@@ -246,7 +276,7 @@ export function socketPathForAgent(runtime, name) {
  *   DNS stub: replaces the wall's resolver so rebinding is testable. Production omits it.
  * @property {number} [clientIdleMs] kill a client tunnel idle this long; never fires mid-request (default 60000)
  * @property {number} [maxLogBody] log at most this many request-body bytes, then `truncated: true` (default 1048576)
- * @property {(entry: Record<string, unknown>) => Record<string, unknown>} [redact] log redaction hook (default: identity)
+ * @property {(entry: Record<string, unknown>) => Record<string, unknown>} [redact] log redaction hook, applied after built-in secret scrubbing (default: identity)
  */
 
 /**
@@ -318,11 +348,26 @@ export function createProxy(opts) {
       throw new Error(`createProxy: controlSocket must live inside the runtime: ${realCtl} not under ${realRt}`);
     }
   }
+  // The CA private key lives in certDir, and the launcher masks exactly
+  // the runtime dir: a certDir outside it would expose ca.key through the
+  // read-only binds. Same containment rule as the control socket above —
+  // fail closed here, before the log stream, CA read, or any listener.
+  // The default `<runtime>/certs` passes trivially.
+  if (!runtime) {
+    throw new Error(`createProxy: certDir must live inside the runtime, got ${dirOpt} with no runtime`);
+  }
+  {
+    const realRt = realPathOf(runtime);
+    const realCerts = realPathOf(dirOpt);
+    if (!realCerts.startsWith(realRt + path.sep)) {
+      throw new Error(`createProxy: certDir must live inside the runtime: ${realCerts} not under ${realRt}`);
+    }
+  }
   const certDir = dirOpt;
   const holdMaxBody = hold?.maxBody ?? 1048576;
 
-  const logStream = fs.createWriteStream(logFile, { flags: 'a' });
-  const log = (o) => { logStream.write(JSON.stringify(redact(o)) + '\n'); };
+  const logStream = fs.createWriteStream(logFile, { flags: 'a', mode: 0o600 });
+  const log = (o) => { logStream.write(JSON.stringify(redact(scrubSecrets(o))) + '\n'); };
   let trust = null;
   if (upstreamCa) {
     let extra;

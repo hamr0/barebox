@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { execFile as execFileCb, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
@@ -623,6 +623,22 @@ describe('holds', () => {
     assert.ok(!existsSync(outside), 'refused socket must not be created');
   });
 
+  it('certDir outside the runtime throws, before any side effect', async () => {
+    // No sandbox needed: createProxy must refuse synchronously, before the
+    // log stream or any CA file (ca.key especially) is created.
+    const outsideBase = mkdtempSync(join(tmpdir(), 'bb-outside-cert-'));
+    const outsideCerts = join(outsideBase, 'certs');
+    const outsideLog = join(outsideBase, 'mitm.log');
+    try {
+      assert.throws(() => createProxy({ port: 0, certDir: outsideCerts,
+        logFile: outsideLog, upstreamCa: CA, runtime: RT }), /inside the runtime/);
+      assert.ok(!existsSync(outsideCerts), 'refused certDir must not be created');
+      assert.ok(!existsSync(outsideLog), 'refused log file must not be created');
+    } finally {
+      rmSync(outsideBase, { recursive: true, force: true });
+    }
+  });
+
   it('approve forwards, deny refuses with reason', { skip: NEED_UNIX }, async () => {
     const P2 = await holdProxy();
     try {
@@ -856,4 +872,54 @@ describe('two agents keep identity under interleave', () => {
         try { rmSync(ctl2Path(), { force: true }); } catch {}
       }
     });
+});
+
+describe('audit log secrets', () => {
+  it('fresh log file is created 0600', async () => {
+    // RT is a fresh mkdtemp per run, so mitm.log was created by this proxy.
+    const st = statSync(join(RT, 'mitm.log'));
+    assert.equal(st.mode & 0o777, 0o600);
+  });
+
+  it('authorization headers leave no secret in logged req lines', async () => {
+    const bearer = `Bearer probe-bearer-${process.pid}`;
+    const proxyCreds = 'Basic cHJvYmU6c2VjcmV0';
+    const r = await curl('-H', `Authorization: ${bearer}`,
+      '-H', `Proxy-Authorization: ${proxyCreds}`,
+      `${plainUp.url}?m=authz`);
+    assert.equal(r.stdout, 'local-ok');
+    await waitLog(/m=authz/, 'authz request');
+    const text = log();
+    assert.ok(!text.includes(bearer), 'bearer secret must not appear in the log');
+    assert.ok(!text.includes(proxyCreds), 'proxy credentials must not appear in the log');
+    const line = text.split('\n').find((l) => l.includes('m=authz'));
+    assert.ok(line, 'authz req line is logged');
+    assert.match(line, /\[redacted\]/);
+  });
+
+  it('user redact hook runs after built-in scrubbing', async () => {
+    const tp = createProxy({ port: 0, certDir: join(RT, 'certs'),
+      logFile: join(RT, 'mitm-hook.log'), runtime: RT,
+      clientIdleMs: 1000, allowLoopback: true,
+      redact: (e) => ({ ...e, hookRan: e.ev }) });
+    try {
+      const { port } = await tp.ready;
+      const secret = `Bearer hook-secret-${process.pid}`;
+      await execA('curl', ['-s', '--max-time', '8', '-x', `http://127.0.0.1:${port}`,
+        '-H', `Authorization: ${secret}`, `${plainUp.url}?m=hookredact`],
+        { encoding: 'latin1' });
+      const hookLog = () => {
+        try { return readFileSync(join(RT, 'mitm-hook.log'), 'latin1'); }
+        catch { return ''; }
+      };
+      await waitFor(() => /m=hookredact/.test(hookLog()), 'hook log line');
+      assert.equal(statSync(join(RT, 'mitm-hook.log')).mode & 0o777, 0o600);
+      const text = hookLog();
+      assert.match(text, /"hookRan":"req"/);
+      assert.match(text, /\[redacted\]/);
+      assert.ok(!text.includes(secret), 'secret must not survive the hook either');
+    } finally {
+      await tp.close();
+    }
+  });
 });
