@@ -296,3 +296,79 @@ M0 proved no cross-attribution (`fx`/`fy`). The rewrite tests one agent's identi
 - [ ] Unknown-CA and wrong-host upstream certs are 502 and never forwarded.
 - [ ] Two concurrent agents: no cross-attribution in logs or holds.
 - [ ] RSS re-measured on the rewritten code and recorded in the PRD.
+
+---
+
+## 7. Section 6 fixes review: the socket mask can still be bypassed (2026-10-27)
+
+### Verified
+Full suite on `rewrite` (11 commits ahead of main, tree clean), in a shell with bwrap + unix sockets:
+
+```
+node --test --test-timeout=60000 "test/*.test.mjs"  → exit 0, 81/81 pass, 0 skipped, 10 s
+```
+
+That includes everything the agent's sandbox skipped: the runtime-mask test, go/no-go (b) concurrency, two agents, the rogue upstream CA, the DNS wall and the malformed 400s. Those are all green.
+
+### 1. The socket mask can be bypassed through a symlink (proven)
+`launch()` decides whether `runtime` shows through the `$HOME`/project binds by comparing path strings (deliberately: the code comment calls it "lexical on purpose"). It doesn't resolve symlinks, but the sandbox shows the **real** tree. A runtime reached through a symlink from outside `$HOME` passes the check and is not masked; its real location under `$HOME` is visible inside.
+
+Repro (`/tmp/claude-1000/bbsl/t.mjs`):
+- fake `HOME=$B/home`; real runtime `$B/home/rt`; `runtime` passed as symlink `$B/lnk → $B/home/rt`.
+- Inside the sandbox:
+
+```
+sandbox> ctl.sock  socks
+sandbox> INSIDE: connected to ctl.sock via real path
+HOST ctl.sock received: approve h1
+```
+
+The agent can still approve its own holds and reach other agents' sockets.
+
+**Fix:**
+- Compare `fs.realpathSync(runtime)` against `realpathSync(home)` and `realpathSync(proj)`.
+- When it falls inside one, mask the path **as the sandbox shows it**: `join(home, relative(realpath(home), realpath(runtime)))` (and likewise for `proj`).
+- Keep the plain-string mask too (both are cheap).
+- Apply the same "runtime IS home/project" refusal on the real paths.
+
+**Test:** the repro above. `runtime` is a symlink into the fake HOME; inside the sandbox `ctl.sock` and `socks/` must be invisible and connecting must fail, while the agent's own front door (`/run/sbx/agent.sock` bridge) still works.
+
+### 2. The control socket can live anywhere (read)
+`controlSocket` is a separate `createProxy` option; the launcher only masks `runtime`. The CLI defaults to `./sbx-ctl.sock` (`src/cli.js:10`), a path relative to wherever you run the command. Run the proxy from the project folder with that default and the approval socket sits inside the project bind, visible and connectable from the sandbox.
+
+**Fix (pick one, first preferred):**
+- Remove the option: the control socket is always `<runtime>/ctl.sock`, so the mask from item 1 covers it by construction.
+- Or validate: `createProxy` throws when `realpath(dirname(controlSocket))` is not inside `realpath(runtime)`.
+
+**CLI:**
+- No cwd-relative default.
+- Resolve from `SBX_RUNTIME` (`<runtime>/ctl.sock`) or a required `SBX_SOCK`.
+- Missing both → usage error, exit 2.
+
+**Test:** `controlSocket` under the fake HOME, outside runtime → refused (or impossible to express).
+
+### 3. Re-measure go/no-go (c) on the rewritten code
+The 20-agent benchmark was skipped because the agent's sandbox can't bind unix sockets; a shell with bwrap + unix sockets can (above). The rewrite changed the proxy wholesale (stdlib `http`, on-demand cert minting, holds), so the POC numbers (7.7 MB per sandbox, 56.7 MB proxy) **do not carry over**.
+
+- Add `npm run bench`, not part of `npm test` or CI, with:
+  - 20 concurrent agents through `addAgent` + `launch`;
+  - RSS per sandbox (exact `/proc` tree walk of each bwrap PID, as in M0, never `pgrep -f`);
+  - proxy RSS idle, after minting certs for ~10 hosts, and with 20 parked holds.
+- Make it able to fail: exit non-zero above ≤ 10 MB per sandbox or ≤ 80 MB proxy.
+- Record the numbers in the PRD.
+- Write it so a human or reviewer runs it in a real shell; do not claim it verified from a sandbox that skips it.
+
+### 4. Then merge
+1. Push `rewrite`; CI green on GitHub. CI is the first time the bwrap suites run outside this machine.
+2. Run `/branch-review` on `rewrite` (includes a full security audit).
+3. Open a PR into main. Branch protection requires a PR + one approval, unless you use the admin bypass.
+
+### Can wait
+- Python `requests` client test; opt-in `test:real` (`git ls-remote` over https), outside the merge gate.
+- `barebox.context.md` gotcha: **any** listening unix socket under `$HOME` (IDE IPC, rootless container sockets) is reachable from inside. A read-only bind does not block `connect(2)`. Name the class, say the locked-paths list is the lever.
+
+### Done when (adds to section 4)
+- [ ] Runtime given as a symlink into `$HOME`/project: sockets invisible inside, connect fails, front door still works.
+- [ ] The control socket cannot exist outside `<runtime>`; the CLI has no cwd default.
+- [ ] `npm run bench` exists, can fail, was run in a real shell, numbers recorded in the PRD.
+- [ ] `rewrite` CI green on GitHub, `/branch-review` done, PR open.
