@@ -9,7 +9,7 @@
 // because the control socket server is deleted and two decision paths would
 // drift. Set SBX_RUNTIME instead.
 //
-// sbx run [--mode ask|auto|trust] [--json] -- <cmd> [...]
+// sbx run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]
 // Runs one sandboxed agent start-to-finish in this process (project = cwd).
 // The runtime is SBX_RUNTIME when set, else a short temp dir (printed to
 // stderr so a second terminal can approve from it). With --json, stdout
@@ -19,13 +19,22 @@
 // human-readable lines. The process exit code mirrors the agent's (usage
 // errors stay exit 2). SBX_ALLOW_LOOPBACK=1 is a TEST-ONLY opt-in (fixtures
 // live on 127.0.0.1); production never sets it.
+//
+// sbx diff [--agent <name>] | commit [--agent <name>] [--skip-conflicts] | rollback [--agent <name>]
+// Reviews the M4 tracing paper of the last overlay run in SBX_RUNTIME:
+// `diff` lists added/modified/deleted paths (`A`/`M`/`D`, conflicts flagged),
+// `commit` presses the paper down (refusing on conflicts unless
+// --skip-conflicts), `rollback` throws it away. Exit 1 on refusal or when no
+// overlay exists for the agent (default `agent`); SBX_RUNTIME is required.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { askPaths, writeFileAtomic } from './holds.js';
 import { run as sandboxRun } from './run.js';
+import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
+import { assertAgentName } from './proxy.js';
 
-const USAGE = 'usage: sbx [--help] | pending | approve <id> | deny <id> [reason] | run [--mode ask|auto|trust] [--json] -- <cmd> [...]';
+const USAGE = 'usage: sbx [--help] | pending | approve <id> | deny <id> [reason] | diff [--agent <name>] | commit [--agent <name>] [--skip-conflicts] | rollback [--agent <name>] | run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]';
 // Exit codes: 0 ok, 1 unknown id / refused / run failure, 2 usage.
 // `sbx run` mirrors the agent's exit code instead (usage errors stay 2).
 const [cmd, ...args] = process.argv.slice(2);
@@ -37,6 +46,7 @@ if (!cmd || cmd === '--help' || cmd === '-h') {
 if (cmd === 'run') {
   let mode = 'auto';
   let json = false;
+  let overlay = false;
   const sep = args.indexOf('--');
   if (sep < 0) {
     console.log(USAGE);
@@ -48,6 +58,8 @@ if (cmd === 'run') {
     const f = flags[i];
     if (f === '--json') {
       json = true;
+    } else if (f === '--overlay') {
+      overlay = true;
     } else if (f === '--mode') {
       const v = flags[++i];
       if (v !== 'ask' && v !== 'auto' && v !== 'trust') {
@@ -64,7 +76,9 @@ if (cmd === 'run') {
     console.log(USAGE);
     process.exit(2);
   }
-  await cliRun({ mode, json, command });
+  await cliRun({ mode, json, overlay, command });
+} else if (cmd === 'diff' || cmd === 'commit' || cmd === 'rollback') {
+  await cliOverlay(cmd, args);
 } else {
   if (!['pending', 'approve', 'deny'].includes(cmd) || (cmd !== 'pending' && !args[0])) {
     console.log(USAGE);
@@ -84,10 +98,11 @@ if (cmd === 'run') {
  * @param {object} opts
  * @param {string} opts.mode `ask` | `auto` | `trust`
  * @param {boolean} opts.json machine-readable JSON lines on stdout
+ * @param {boolean} opts.overlay run on the M4 tracing paper, reviewed after with `sbx diff`
  * @param {string[]} opts.command argv to run inside the sandbox
  * @returns {Promise<void>} sets `process.exitCode` (mirrors the agent)
  */
-async function cliRun({ mode, json, command }) {
+async function cliRun({ mode, json, overlay, command }) {
   const runtime = process.env.SBX_RUNTIME || fs.mkdtempSync(path.join(os.tmpdir(), 'sbx-'));
   const paths = askPaths(runtime);
   const seen = new Set();
@@ -120,12 +135,17 @@ async function cliRun({ mode, json, command }) {
   const poll = setInterval(() => { if (watching) sweepOnce(); }, 100);
   if (poll && typeof poll.unref === 'function') poll.unref();
   console.error(`runtime ${runtime} (answer with: SBX_RUNTIME=${runtime} sbx approve <id>)`);
-  /** @type {{ exit: number } | null} */
+  /** @type {{ exit: number, diff: { path: string }[] } | null} */
   let result = null;
   try {
+    // SBX_OVERLAY_IGNORE extends the M4 ignore list (Q3) as comma names.
+    const extraIgnore = (process.env.SBX_OVERLAY_IGNORE ?? '').split(',')
+      .map((s) => s.trim()).filter(Boolean);
     result = await sandboxRun({
       runtime, proj: process.cwd(), command, mode,
       allowLoopback: process.env.SBX_ALLOW_LOOPBACK === '1',
+      overlay,
+      ...(extraIgnore.length ? { overlayIgnore: ['node_modules', ...extraIgnore] } : {}),
       // With --json stdout is a pure event stream: agent output goes to
       // stderr so a parser never trips over it.
       ...(json ? { stdout: process.stderr, stderr: process.stderr } : {}),
@@ -142,7 +162,113 @@ async function cliRun({ mode, json, command }) {
   sweepOnce(); // an ask parked after the last poll still gets its line
   if (json) console.log(JSON.stringify({ ev: 'done', exit: result.exit }));
   else console.log(`done exit ${result.exit}`);
+  if (overlay) {
+    const n = result.diff.length;
+    console.error(n
+      ? `overlay: ${n} change(s) — review with: SBX_RUNTIME=${runtime} sbx diff`
+      : 'overlay: no changes');
+  }
   process.exitCode = result.exit;
+}
+
+/**
+ * `diff` / `commit` / `rollback` over one run's tracing paper.
+ *
+ * @param {string} overlayCmd `diff` | `commit` | `rollback`
+ * @param {string[]} rest command args (`--agent <name>`, commit's `--skip-conflicts`)
+ * @returns {Promise<void>}
+ */
+async function cliOverlay(overlayCmd, rest) {
+  const runtime = process.env.SBX_RUNTIME;
+  if (!runtime) {
+    console.log(USAGE);
+    process.exit(2);
+  }
+  let agent = 'agent';
+  let skipConflicts = false;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '--agent') {
+      const v = rest[++i];
+      if (!v) {
+        console.log(USAGE);
+        process.exit(2);
+      }
+      agent = v;
+    } else if (a === '--skip-conflicts' && overlayCmd === 'commit') {
+      skipConflicts = true;
+    } else {
+      console.log(USAGE);
+      process.exit(2);
+    }
+  }
+  try {
+    assertAgentName(agent);
+  } catch (e) {
+    console.log(e instanceof Error ? e.message : String(e));
+    process.exit(2);
+  }
+  /**
+   * @param {unknown} e
+   * @returns {never}
+   */
+  const fail = (e) => {
+    console.log(e instanceof Error ? e.message : String(e));
+    process.exit(1);
+    throw new Error('unreachable');
+  };
+  const letter = (/** @type {string} */ s) => (s === 'added' ? 'A' : s === 'deleted' ? 'D' : 'M');
+
+  if (overlayCmd === 'diff') {
+    let changes;
+    try {
+      changes = diffOverlay({ runtime, agent });
+    } catch (e) {
+      fail(e);
+    }
+    if (!changes.length) {
+      console.log('no changes');
+      return;
+    }
+    for (const c of changes) {
+      console.log(`${letter(c.status)} ${c.path}${c.conflict ? ` (CONFLICT: ${c.reason})` : ''}`);
+    }
+    return;
+  }
+
+  if (overlayCmd === 'commit') {
+    let res;
+    try {
+      res = commitOverlay({ runtime, agent, onConflict: skipConflicts ? 'skip' : 'refuse' });
+    } catch (e) {
+      // Refusal is the product working, not a crash: name every conflict and
+      // how to proceed, and exit 1 (never 0 — nothing was committed).
+      if (e instanceof Error && /** @type {{code?: string}} */ (e).code === 'SBX_CONFLICT') {
+        for (const c of /** @type {{conflicts: {path: string, reason: string}[]}} */ (/** @type {unknown} */ (e)).conflicts) {
+          console.log(`conflict: ${c.path} (${c.reason})`);
+        }
+        console.log('commit refused: resolve the conflicts, or re-run with --skip-conflicts to commit the rest');
+        process.exit(1);
+      }
+      fail(e);
+    }
+    for (const p of res.committed) console.log(`committed ${p}`);
+    for (const s of res.skipped) console.log(`skipped (conflict): ${s.path} (${s.reason})`);
+    if (!res.committed.length && !res.skipped.length) console.log('nothing to commit');
+    return;
+  }
+
+  let res;
+  try {
+    res = rollbackOverlay({ runtime, agent });
+  } catch (e) {
+    fail(e);
+  }
+  if (!res.discarded.length) {
+    console.log('nothing to discard');
+    return;
+  }
+  for (const c of res.discarded) console.log(`discarded ${letter(c.status)} ${c.path}`);
 }
 
 /**

@@ -38,6 +38,7 @@ import path from 'node:path';
 import { createProxy } from './proxy.js';
 import { launch } from './launcher.js';
 import { matchPath } from './holds.js';
+import { diffOverlay } from './overlay.js';
 
 /** Payment-destination path fragments: the URL-visible half of the floor (PRD section 2). */
 const FLOOR_PATHS = ['/checkout', '/payment', '/orders', '/purchase'];
@@ -129,6 +130,8 @@ export function shouldHoldForMode(mode, { match, shouldHold } = {}) {
  * @property {number} [proxyPort] front-door port inside the sandbox (default 3128)
  * @property {NodeJS.WritableStream} [stdout] where the agent's stdout goes (default process.stdout)
  * @property {NodeJS.WritableStream} [stderr] where the agent's stderr goes (default process.stderr)
+ * @property {boolean} [overlay] when true, mount a per-run overlay upper over the project (M4 tracing paper) instead of binding it read-only; the result's `diff` lists the run's changes for commit/rollback
+ * @property {string[]} [overlayIgnore] path segments invisible to the overlay (default `node_modules`; see overlay.js Q3)
  */
 
 /**
@@ -200,16 +203,19 @@ function collectAsks(auditFile, seen) {
  * @param {number} [opts.proxyPort] front-door port inside the sandbox (default 3128)
  * @param {NodeJS.WritableStream|null} [opts.stdout] where the agent's stdout goes (default process.stdout)
  * @param {NodeJS.WritableStream|null} [opts.stderr] where the agent's stderr goes (default process.stderr)
- * @returns {Promise<{ exit: number, asks: AskRecord[], audit: string }>} the agent process exit code, the collected ask records, and the JSONL audit log path
- * @when Reach for this to HARNESS-ONLY run one sandboxed agent start-to-finish in a single call: it starts the proxy, sandboxes the command, answers holds, and returns the exit code with the ask and audit trail.
- * @fails Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `gate`/`onAsk`, or a proxy that never becomes ready. The agent's own nonzero exit is returned as `exit`, never thrown.
+ * @param {boolean} [opts.overlay] when true, mount a per-run overlay upper over the project instead of binding it read-only; the result's `diff` lists the run's changes for commit/rollback
+ * @param {string[]} [opts.overlayIgnore] path segments invisible to the overlay (default `node_modules`; see overlay.js Q3)
+ * @returns {Promise<{ exit: number, asks: AskRecord[], audit: string, diff: import('./overlay.js').OverlayChange[], runtime: string }>} the agent process exit code, the collected ask records, the JSONL audit log path, the run's overlay diff (M4), and the runtime dir addressing it
+ * @when Reach for this to HARNESS-ONLY run one sandboxed agent start-to-finish in a single call: it starts the proxy, sandboxes the command, answers holds, and returns the exit code with the ask and audit trail (plus the overlay diff once M4 exists).
+ * @fails Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `gate`/`onAsk`, a proxy that never becomes ready, or an overlay diff that cannot be read. The agent's own nonzero exit is returned as `exit`, never thrown.
  * @example
  * import { run } from "barebox";
  * const { exit, asks, audit } = await run({ proj: "/tmp/proj", command: ["bash", "-c", "echo hi"] });
  */
 export async function run({ proj, command, mode = 'auto', gate = null, onAsk = null,
   runtime = null, agent = 'agent', match, shouldHold, timeoutMs, pollMs,
-  allowLoopback = false, extraEnv = {}, proxyPort = 3128, stdout = null, stderr = null }) {
+  allowLoopback = false, extraEnv = {}, proxyPort = 3128, stdout = null, stderr = null,
+  overlay = false, overlayIgnore }) {
   if (typeof proj !== 'string' || !proj) throw new Error('run: proj must be a non-empty string');
   if (!fs.existsSync(proj)) throw new Error(`run: proj does not exist: ${proj}`);
   if (!Array.isArray(command) || !command.length) {
@@ -271,6 +277,7 @@ export async function run({ proj, command, mode = 'auto', gate = null, onAsk = n
   const child = launch({
     runtime: rt, agent, proj, command,
     socket: sock, caFile: proxy.caFile, proxyPort, extraEnv,
+    overlay, overlayIgnore,
   });
   const out = stdout ?? process.stdout;
   const err = stderr ?? process.stderr;
@@ -286,5 +293,18 @@ export async function run({ proj, command, mode = 'auto', gate = null, onAsk = n
   } finally {
     await proxy.close();
   }
-  return { exit, asks: collectAsks(audit, seen), audit };
+  // M2.5 item 4: the result carries the M4 diff. Without overlay there is no
+  // upper, so nothing to review — an empty diff, never null.
+  /** @type {import('./overlay.js').OverlayChange[]} */
+  let diff = [];
+  if (overlay) {
+    try {
+      diff = diffOverlay({ runtime: rt, agent });
+    } catch (e) {
+      const err = /** @type {Error & {exit?: number}} */ (e instanceof Error ? e : new Error(String(e)));
+      err.exit = exit;
+      throw new Error(`run: overlay diff failed after exit ${exit}: ${err.message}`);
+    }
+  }
+  return { exit, asks: collectAsks(audit, seen), audit, diff, runtime: rt };
 }

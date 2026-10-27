@@ -1,10 +1,12 @@
 // Launcher: one sandboxed agent (bwrap walls + socat front-door bridge).
 // Port of poc/m0/launch.sh, minus the throwaway red-team hooks: secure
-// defaults are baked in, not switchable. No overlay (M4).
+// defaults are baked in, not switchable. The project bind is read-only unless
+// `overlay:true` mounts the M4 tracing paper over it (see overlay.js).
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, relative, isAbsolute } from 'node:path';
 import { socketPathForAgent, assertAgentName, realPathOf } from './proxy.js';
+import { setupOverlay } from './overlay.js';
 
 // Locked drawers: masked with an empty tmpfs wherever they exist.
 const LOCKED_PATHS = [
@@ -53,7 +55,9 @@ export function buildCaBundle(runtime, caFile) {
  * Start one sandboxed agent. The agent sees a read-only `/usr` and `/etc`,
  * its project and home read-only, the locked drawers masked, no network of
  * its own, and a single front door: anything sent to `localhost:<proxyPort>`
- * is carried out through this agent's socket to the proxy.
+ * is carried out through this agent's socket to the proxy. The agent starts
+ * in the project dir (`--chdir proj`), so relative paths resolve there no
+ * matter where the caller runs from.
  *
  * @param {object} opts
  * @param {string} opts.runtime where the runtime tree lives (`socks/` is created inside)
@@ -64,16 +68,19 @@ export function buildCaBundle(runtime, caFile) {
  * @param {object} [opts.extraEnv] extra environment entries for the inside
  * @param {string|null} [opts.socket] agent socket path, as returned by `proxy.addAgent` (default `<runtime>/socks/<agent>.sock`; the two must agree)
  * @param {string|null} [opts.caFile] barebox CA cert path (from `proxy.caFile`); when set, the sandbox trusts it for HTTPS alongside the system roots
+ * @param {boolean} [opts.overlay] when true, mount a per-run overlay upper over the project (M4 tracing paper) instead of binding it read-only; the child carries `.overlay` (`{upper, work}`) for diff/commit/rollback
+ * @param {string[]} [opts.overlayIgnore] path segments invisible to the overlay (default `node_modules`; see overlay.js Q3)
  * @returns {import('node:child_process').ChildProcess} the bwrap child (stdio piped); `close` gives its exit code
- * @when Reach for this to HARNESS-ONLY start one sandboxed agent run: it creates the sandbox the agent lives in. It does not decide anything; combine with the proxy for the front door and the gate (M3) for policy.
- * @fails Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, or when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent). The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.
+ * Carries `.overlay` (`{upper, work}`) when `overlay` is on.
+ * @when Reach for this to HARNESS-ONLY start one sandboxed agent run: it creates the sandbox the agent lives in. It does not decide anything; combine with the proxy for the front door and the gate (M3) for policy. Pass overlay:true for a writable tracing-paper run (M4). The agent starts in the project dir.
+ * @fails Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent), or with overlay on when the runtime sits inside the project or uncommitted changes linger. The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.
  * @example
  * import { launch } from "barebox";
  * const child = launch({ runtime: "/tmp/sbx", agent: "fx", proj: "/tmp/proj", command: ["bash", "-c", "echo hi"] });
  * await new Promise((r) => child.on("close", r)); // child.exitCode === 0
  */
 export function launch({ runtime, agent, proj, command, proxyPort = 3128,
-  extraEnv = {}, socket = null, caFile = null }) {
+  extraEnv = {}, socket = null, caFile = null, overlay = false, overlayIgnore }) {
   for (const [k, v] of Object.entries({ runtime, agent, proj })) {
     if (typeof v !== 'string' || !v) throw new Error(`launch: ${k} must be a non-empty string`);
   }
@@ -84,6 +91,22 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   const sock = socket ?? expected;
   if (sock !== expected) throw new Error(`launch: socket ${sock} disagrees with ${expected}`);
   mkdirSync(join(runtime, 'socks'), { recursive: true });
+  /** @type {{upper: string, work: string} | null} */
+  let ov = null;
+  if (overlay) {
+    // The upper/work dirs live under the runtime: a runtime inside the
+    // project would put them inside their own lower, which overlayfs
+    // forbids — so that layout throws here, before anything is snapshotted.
+    // (Lexical like the mask block below: bwrap sees these same spellings.)
+    const under = (base, target) => {
+      const rel = relative(base, target);
+      return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+    };
+    if (under(join(proj), join(runtime)) || under(realPathOf(join(proj)), realPathOf(join(runtime)))) {
+      throw new Error('launch: runtime must not be inside the project dir when overlay is on (the upper would sit inside its own lower)');
+    }
+    ov = setupOverlay({ runtime, agent, proj, ignore: overlayIgnore });
+  }
   const home = process.env.HOME || '/root';
   const args = [
     '--unshare-pid', '--unshare-uts', '--unshare-ipc', '--unshare-net',
@@ -92,7 +115,12 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     '--ro-bind', '/usr', '/usr',
     '--symlink', 'usr/lib64', '/lib64',
     '--ro-bind', '/etc', '/etc',
-    '--ro-bind', proj, proj,
+    // Tracing paper (M4): lower = real project, upper = this run's sheet.
+    // Without it the project stays a read-only bind and writes fail.
+    ...(ov
+      ? ['--overlay-src', proj, '--overlay', ov.upper, ov.work, proj]
+      : ['--ro-bind', proj, proj]),
+    '--chdir', proj,
     '--ro-bind', home, home,
   ];
   for (const p of LOCKED_PATHS) {
@@ -173,6 +201,12 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     `socat TCP-LISTEN:${door},bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/sbx/agent.sock & ` +
     `ok=; for i in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/${door}) 2>/dev/null && { ok=1; break; }; sleep 0.1; done; ` +
     '[ -n "$ok" ] || exit 99; exec "$@"';
-  return spawn('bwrap', [...args, '/usr/bin/bash', '-c', inner, 'bash', ...command],
+  const child = spawn('bwrap', [...args, '/usr/bin/bash', '-c', inner, 'bash', ...command],
     { stdio: ['ignore', 'pipe', 'pipe'] });
+  if (ov) {
+    // Address of this run's tracing paper for diff/commit/rollback.
+    const anyChild = /** @type {unknown} */ (child);
+    /** @type {{ overlay?: { upper: string, work: string } }} */ (anyChild).overlay = { ...ov };
+  }
+  return child;
 }
