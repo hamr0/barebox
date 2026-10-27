@@ -98,12 +98,17 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   for (const p of LOCKED_PATHS) {
     if (existsSync(`${home}/${p}`)) args.push('--tmpfs', `${home}/${p}`);
   }
-  // The runtime tree holds the control socket (approve/deny) and every
-  // agent's socket (identity). A read-only bind does NOT stop connect(2)
-  // to a unix socket, so wherever the runtime would show through the home
-  // or project binds, mask it with an empty tmpfs. (The agent's own socket
-  // is bound from the host side to /run/sbx/agent.sock, so masking the
-  // sandbox-side runtime path does not close the front door.)
+  // The runtime tree holds the file-checkpoint dirs (`asks/`, `answers/`
+  // — the approve/deny capability) and every agent's socket (identity). A
+  // read-only bind does NOT stop connect(2) to a unix socket, so wherever
+  // the runtime would show through the home or project binds, mask it with
+  // an empty tmpfs. The mask lands on the runtime dir itself, so `asks/`
+  // and `answers/` underneath are covered too: an agent cannot read its ask
+  // file, and a forged answer file would land on the mask (or fail where
+  // the runtime is outside home/proj and hence not bound in at all), never
+  // on the host tree the proxy polls. (The agent's own socket is bound from
+  // the host side to /run/sbx/agent.sock, so masking the sandbox-side
+  // runtime path does not close the front door.)
   {
     // Lexical on purpose: bwrap sees these same spellings, so the mask
     // lands on the path the sandbox actually shows. (`resolve` would

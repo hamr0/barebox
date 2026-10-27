@@ -261,10 +261,6 @@ export function socketPathForAgent(runtime, name) {
  * @property {number} [port] opt-in TCP listener for tests, bound to 127.0.0.1 only (default: none)
  * @property {string} [upstreamCa] extra PEM the proxy trusts for upstream TLS, on top of system roots
  * @property {HoldOptions} [hold] hold queue config, or omit to forward everything
- * @property {string|null} [controlSocket] unix socket path for `pending | approve | deny`.
- *   Must live inside `runtime` (compared via {@link realPathOf}, so symlinks
- *   cannot smuggle it out): anything else throws before any side effect.
- *   No default — omit it when no CLI decisions are needed.
  * @property {number} [upstreamTimeoutMs] give up on an upstream response after this (default 120000)
  * @property {boolean} [allowLoopback] TEST-ONLY opt-in: let loopback and unspecified
  *   destinations through (default false). Fixture servers listen on 127.0.0.1,
@@ -287,6 +283,10 @@ export function socketPathForAgent(runtime, name) {
  * @property {import('./holds.js').ShouldHold} [shouldHold] decision function; overrides `match`
  * @property {number|string} [timeoutMs] hold deadline in ms, or `'never'` (default 120000)
  * @property {number} [maxBody] bodies over this are denied at the door, never queued (default 1048576)
+ * @property {import('./holds.js').OnAsk} [onAsk] ask seam (bareguard `humanChannel` shape).
+ *   When present no files are involved; omit it for the default file checkpoint
+ *   (`<runtime>/asks` + `<runtime>/answers`, `sbx pending/approve/deny`).
+ * @property {number} [pollMs] answer poll interval in ms for the file checkpoint (default 250)
  */
 
 /**
@@ -325,29 +325,23 @@ export function socketPathForAgent(runtime, name) {
  */
 export function createProxy(opts) {
   const { logFile, certDir: certDirOpt, runtime: runtimeOpt, port = null,
-    upstreamCa = null, hold = null, controlSocket = null,
+    upstreamCa = null, hold = null,
     upstreamTimeoutMs = 120000, clientIdleMs = 60000,
     allowLoopback = false, allowUpstream = null, resolveUpstream = null,
     maxLogBody = 1048576, redact = (e) => e } = opts ?? {};
   const gate = { allowLoopback, allowUpstream, resolveUpstream: resolveUpstream ?? undefined };
   if (!logFile) throw new Error('createProxy: logFile is required');
+  // The M2 control socket is gone (M2.5 file checkpoint): stale callers fail
+  // loud here, before any side effect, instead of silently losing decisions.
+  if (opts && typeof opts === 'object' && 'controlSocket' in opts && opts.controlSocket) {
+    throw new Error('createProxy: controlSocket was removed in M2.5; decisions now flow through the file checkpoint (<runtime>/asks + <runtime>/answers) or hold.onAsk');
+  }
+  if (hold && typeof hold === 'object' && 'controlSocket' in hold) {
+    throw new Error('createProxy: hold.controlSocket was removed in M2.5; decisions now flow through the file checkpoint (<runtime>/asks + <runtime>/answers) or hold.onAsk');
+  }
   const runtime = runtimeOpt ?? (certDirOpt ? path.dirname(path.resolve(certDirOpt)) : null);
   const dirOpt = certDirOpt ?? (runtime ? path.join(runtime, 'certs') : null);
   if (!dirOpt) throw new Error('createProxy: certDir or runtime is required');
-  // The control socket is the approve-payments capability: it must live
-  // inside the runtime dir (the launcher masks exactly that dir), compared
-  // on real paths so a symlink cannot smuggle it out. Fail closed here,
-  // before the log stream, CA read, or any listener exists.
-  if (controlSocket) {
-    if (!runtime) {
-      throw new Error(`createProxy: controlSocket must live inside the runtime, got ${controlSocket} with no runtime`);
-    }
-    const realRt = realPathOf(runtime);
-    const realCtl = realPathOf(controlSocket);
-    if (!realCtl.startsWith(realRt + path.sep)) {
-      throw new Error(`createProxy: controlSocket must live inside the runtime: ${realCtl} not under ${realRt}`);
-    }
-  }
   // The CA private key lives in certDir, and the launcher masks exactly
   // the runtime dir: a certDir outside it would expose ca.key through the
   // read-only binds. Same containment rule as the control socket above —
@@ -517,7 +511,9 @@ export function createProxy(opts) {
     match: hold.match,
     timeoutMs: hold.timeoutMs,
     maxBody: holdMaxBody,
-    controlSocket,
+    runtime,
+    onAsk: hold.onAsk,
+    pollMs: hold.pollMs,
     onApprove: (h) => forward({ agent: h.agent, method: h.method, url: h.url,
       headers: h.headers, body: h.body, cres: h.cres }),
     onDeny: (h, reason) => denyRes(h.cres, 403, `denied: ${reason}`),
@@ -596,9 +592,10 @@ export function createProxy(opts) {
     creq.on('end', () => {
       if (over) { denyRes(cres, 403, 'body too large to hold'); return; }
       const body = finishLog();
-      // Parked: the tunnel stays open until a human decides.
+      // Parked: the tunnel stays open until the ask channel decides. The
+      // hold reason travels as `note` so the ask file carries its `rule`.
       queue.add({ agent, method, url: urlStr,
-        headers: { ...creq.headers }, body, sock, cres });
+        headers: { ...creq.headers }, body, sock, cres, note: reason });
     });
   }
   // Idle tunnels die here; a request in flight is never idle by definition.
@@ -741,7 +738,7 @@ export function createProxy(opts) {
     for (const [, srv] of agentServers) srv.close();
     agentServers.clear();
     // Parked holds settle as denied (guarded writes), timers cleared,
-    // control socket closed — all inside holds.close().
+    // ask files removed, sweeper stopped — all inside holds.close().
     holds?.close();
     for (const up of upstreams) { try { up.destroy(); } catch {} }
     upstreams.clear();

@@ -1,48 +1,212 @@
 #!/usr/bin/env node
-// sbx — second-terminal CLI for the hold queue:
+// sbx — second-terminal CLI for the hold queue (M2.5 file channel):
 // sbx pending | approve <id> | deny <id> [reason]
-// Talks to the proxy over its unix control socket. The socket path comes
-// from SBX_SOCK, else from SBX_RUNTIME as `<runtime>/ctl.sock`. There is no
-// cwd-relative default: missing both is a usage error (exit 2).
-import net from 'node:net';
+// Reads `<runtime>/asks/<id>.json`, answers by atomically writing
+// `<runtime>/answers/<id>.json` (tmp file + rename, so the proxy never sees
+// a partial). The runtime comes from SBX_RUNTIME only; there is no
+// cwd-relative default. Choice, documented: SBX_SOCK (the M2 control socket)
+// is UNSUPPORTED — setting it is a usage error (exit 2), not a fallback —
+// because the control socket server is deleted and two decision paths would
+// drift. Set SBX_RUNTIME instead.
+//
+// sbx run [--mode ask|auto|trust] [--json] -- <cmd> [...]
+// Runs one sandboxed agent start-to-finish in this process (project = cwd).
+// The runtime is SBX_RUNTIME when set, else a short temp dir (printed to
+// stderr so a second terminal can approve from it). With --json, stdout
+// carries JSON lines only (`{"ev":"ask",...}` per parked ask, then
+// `{"ev":"done","exit":N}`); the agent's own output goes to stderr there so
+// the stream stays parseable. Without --json the same events print as
+// human-readable lines. The process exit code mirrors the agent's (usage
+// errors stay exit 2). SBX_ALLOW_LOOPBACK=1 is a TEST-ONLY opt-in (fixtures
+// live on 127.0.0.1); production never sets it.
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { askPaths, writeFileAtomic } from './holds.js';
+import { run as sandboxRun } from './run.js';
 
-const USAGE = 'usage: sbx [--help] | pending | approve <id> | deny <id> [reason]';
-// Exit codes: 0 ok, 1 unknown id / refused / socket failure, 2 usage.
+const USAGE = 'usage: sbx [--help] | pending | approve <id> | deny <id> [reason] | run [--mode ask|auto|trust] [--json] -- <cmd> [...]';
+// Exit codes: 0 ok, 1 unknown id / refused / run failure, 2 usage.
+// `sbx run` mirrors the agent's exit code instead (usage errors stay 2).
 const [cmd, ...args] = process.argv.slice(2);
 if (!cmd || cmd === '--help' || cmd === '-h') {
   console.log(USAGE);
   process.exit(cmd ? 0 : 2);
 }
-if (!['pending', 'approve', 'deny'].includes(cmd) || (cmd !== 'pending' && !args[0])) {
-  console.log(USAGE);
-  process.exit(2);
-}
-const sockPath = process.env.SBX_SOCK
-  || (process.env.SBX_RUNTIME ? path.join(process.env.SBX_RUNTIME, 'ctl.sock') : null);
-if (!sockPath) {
-  console.log(USAGE);
-  process.exit(2);
+
+if (cmd === 'run') {
+  let mode = 'auto';
+  let json = false;
+  const sep = args.indexOf('--');
+  if (sep < 0) {
+    console.log(USAGE);
+    process.exit(2);
+  }
+  const flags = args.slice(0, sep);
+  const command = args.slice(sep + 1);
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i];
+    if (f === '--json') {
+      json = true;
+    } else if (f === '--mode') {
+      const v = flags[++i];
+      if (v !== 'ask' && v !== 'auto' && v !== 'trust') {
+        console.log(USAGE);
+        process.exit(2);
+      }
+      mode = v;
+    } else {
+      console.log(USAGE);
+      process.exit(2);
+    }
+  }
+  if (!command.length) {
+    console.log(USAGE);
+    process.exit(2);
+  }
+  await cliRun({ mode, json, command });
+} else {
+  if (!['pending', 'approve', 'deny'].includes(cmd) || (cmd !== 'pending' && !args[0])) {
+    console.log(USAGE);
+    process.exit(2);
+  }
+  if (process.env.SBX_SOCK) {
+    console.log('SBX_SOCK is no longer supported (control socket removed in M2.5); set SBX_RUNTIME instead');
+    process.exit(2);
+  }
+  await cliDecide(cmd, args);
 }
 
-const s = net.connect(sockPath, () => { s.write([cmd, ...args].join(' ') + '\n'); });
-s.setTimeout(5000, () => {
-  console.log('ctl timed out waiting for the proxy');
-  s.destroy();
-  process.exit(1);
-});
-let out = '';
-s.on('data', (ch) => { out += ch.toString('latin1'); });
-s.on('end', () => {
-  if (cmd === 'pending') {
-    const items = JSON.parse(out || '[]');
-    if (!items.length) { console.log('nothing held'); return; }
-    for (const h of items) {
-      console.log(`${h.id} ${h.agent} ${h.method} ${h.url} (${h.waitingSec}s) body=${h.body}`);
+/**
+ * One sandboxed run in this process. Watches the runtime's ask files and
+ * reports every parked ask, then the agent's exit code.
+ *
+ * @param {object} opts
+ * @param {string} opts.mode `ask` | `auto` | `trust`
+ * @param {boolean} opts.json machine-readable JSON lines on stdout
+ * @param {string[]} opts.command argv to run inside the sandbox
+ * @returns {Promise<void>} sets `process.exitCode` (mirrors the agent)
+ */
+async function cliRun({ mode, json, command }) {
+  const runtime = process.env.SBX_RUNTIME || fs.mkdtempSync(path.join(os.tmpdir(), 'sbx-'));
+  const paths = askPaths(runtime);
+  const seen = new Set();
+  const emitAsk = (h) => {
+    if (json) console.log(JSON.stringify({ ev: 'ask', ...h }));
+    else console.log(`ask ${h.id} ${h.agent} ${h.method} ${h.url} rule=${h.rule ?? ''}`);
+  };
+  const sweepOnce = () => {
+    let names;
+    try {
+      names = fs.readdirSync(paths.asksDir);
+    } catch {
+      return;
     }
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue;
+      const id = name.slice(0, -'.json'.length);
+      if (seen.has(id)) continue;
+      let h;
+      try {
+        h = JSON.parse(fs.readFileSync(path.join(paths.asksDir, name), 'utf8'));
+      } catch {
+        continue; // being written; the next sweep sees it
+      }
+      seen.add(id);
+      emitAsk(h);
+    }
+  };
+  let watching = true;
+  const poll = setInterval(() => { if (watching) sweepOnce(); }, 100);
+  if (poll && typeof poll.unref === 'function') poll.unref();
+  console.error(`runtime ${runtime} (answer with: SBX_RUNTIME=${runtime} sbx approve <id>)`);
+  /** @type {{ exit: number } | null} */
+  let result = null;
+  try {
+    result = await sandboxRun({
+      runtime, proj: process.cwd(), command, mode,
+      allowLoopback: process.env.SBX_ALLOW_LOOPBACK === '1',
+      // With --json stdout is a pure event stream: agent output goes to
+      // stderr so a parser never trips over it.
+      ...(json ? { stdout: process.stderr, stderr: process.stderr } : {}),
+    });
+  } catch (e) {
+    watching = false;
+    clearInterval(poll);
+    console.error(`run failed: ${e instanceof Error ? e.message : String(e)}`);
+    process.exitCode = 1;
     return;
   }
-  console.log(out.trim());
-  if (/^unknown /.test(out.trim())) process.exit(1);
-});
-s.on('error', (e) => { console.log(`ctl failed: ${e.message}`); process.exit(1); });
+  watching = false;
+  clearInterval(poll);
+  sweepOnce(); // an ask parked after the last poll still gets its line
+  if (json) console.log(JSON.stringify({ ev: 'done', exit: result.exit }));
+  else console.log(`done exit ${result.exit}`);
+  process.exitCode = result.exit;
+}
+
+/**
+ * `pending` / `approve` / `deny` over the file channel.
+ *
+ * @param {string} decisionCmd `pending` | `approve` | `deny`
+ * @param {string[]} rest command args
+ * @returns {Promise<void>}
+ */
+async function cliDecide(decisionCmd, rest) {
+  const runtime = process.env.SBX_RUNTIME;
+  if (!runtime) {
+    console.log(USAGE);
+    process.exit(2);
+  }
+  const paths = askPaths(runtime);
+
+  if (decisionCmd === 'pending') {
+    let names = [];
+    try {
+      names = fs.readdirSync(paths.asksDir);
+    } catch {}
+    const items = [];
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue;
+      try {
+        items.push(JSON.parse(fs.readFileSync(path.join(paths.asksDir, name), 'utf8')));
+      } catch {
+        // Being written; the next run sees it.
+      }
+    }
+    if (!items.length) {
+      console.log('nothing held');
+      process.exit(0);
+    }
+    for (const h of items) {
+      // Live wait from the ask file's mtime (the payload's waitingSec is 0 at park).
+      let waiting = 0;
+      try {
+        const st = fs.statSync(paths.askFile(h.id));
+        waiting = Math.max(0, Math.round((Date.now() - st.mtimeMs) / 1000));
+      } catch {}
+      const body = String(h.bodyPreview ?? '').replace(/\s+/g, ' ').slice(0, 200);
+      console.log(`${h.id} ${h.agent} ${h.method} ${h.url} (${waiting}s) rule=${h.rule ?? ''} body=${body}`);
+    }
+    process.exit(0);
+  }
+
+  const [id, ...ids] = rest;
+  // Unknown (never parked, or already settled and swept) is exit 1, never a
+  // stray answer file: writing one would linger as stale until the sweeper
+  // removes it, and could be misread as a decision that counted.
+  try {
+    fs.readFileSync(paths.askFile(id), 'utf8');
+  } catch {
+    console.log(`unknown ${id}`);
+    process.exit(1);
+  }
+  if (decisionCmd === 'approve') {
+    writeFileAtomic(paths.answerFile(id), JSON.stringify({ decision: 'allow' }));
+    console.log(`approved ${id}`);
+  } else {
+    writeFileAtomic(paths.answerFile(id),
+      JSON.stringify({ decision: 'deny', reason: ids.join(' ') || 'denied by user' }));
+    console.log(`denied ${id}`);
+  }
+}

@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { execFile as execFileCb, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
@@ -578,29 +578,34 @@ describe('dns rebinding wall (stubbed resolver)', () => {
 });
 
 describe('holds', () => {
-  // The control socket lives inside the runtime dir (createProxy enforces
-  // this: the launcher masks exactly that dir from sandboxed agents).
-  const ctlPath = () => join(RT, 'ctl.sock');
-  const NEED_UNIX = UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI';
+  // File checkpoint: `asks/<id>.json` appears on park, `answers/<id>.json`
+  // decides. No unix socket is involved, so these run everywhere.
+  const answersDir = () => join(RT, 'answers');
+  const askFile = (id) => join(RT, 'asks', `${id}.json`);
+  const answerFile = (id) => join(answersDir(), `${id}.json`);
+  // Atomic answer write, exactly like `sbx approve` / `sbx deny`.
+  const answer = (id, obj) => {
+    mkdirSync(answersDir(), { recursive: true });
+    const tmp = join(answersDir(), `.${id}.${process.pid}.tmp`);
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, answerFile(id));
+  };
+  const readAsk = (id) => JSON.parse(readFileSync(askFile(id), 'utf8'));
+  async function waitGone(p, what) {
+    await waitFor(() => !existsSync(p), what);
+  }
   let hp = null;
   let hport = 0;
-  const ctl = (cmd) => new Promise((resolve, reject) => {
-    const s = net.connect(ctlPath(), () => s.write(cmd + '\n'));
-    let out = '';
-    s.on('data', (c) => { out += c; });
-    s.on('end', () => resolve(out.trim()));
-    s.on('error', reject);
-  });
 
-  // Fast by design: 500 ms client-idle, ~1.5 s hold deadline. A parked
-  // request must outlive the idle timer (it is in flight, never idle), so
-  // the approve test sleeps past idle and finds the hold still parked.
+  // Fast by design: 500 ms client-idle, ~1.5 s hold deadline, 25 ms answer
+  // poll. A parked request must outlive the idle timer (it is in flight,
+  // never idle), so the approve test sleeps past idle and finds the hold
+  // still parked.
   async function holdProxy(holdExtra = {}) {
     hp = createProxy({ port: 0, certDir: join(RT, 'certs'),
       logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
       clientIdleMs: 500, allowLoopback: true,
-      hold: { match: '/hold', timeoutMs: 1500, ...holdExtra },
-      ...(UNIX_OK ? { controlSocket: ctlPath() } : {}) });
+      hold: { match: '/hold', timeoutMs: 1500, pollMs: 25, ...holdExtra } });
     ({ port: hport } = await hp.ready);
     return `http://127.0.0.1:${hport}`;
   }
@@ -610,17 +615,19 @@ describe('holds', () => {
       await hp?.close();
     } finally {
       hp = null;
-      try { if (RT) rmSync(join(RT, 'ctl.sock'), { force: true }); } catch {}
     }
   });
 
-  it('controlSocket outside the runtime throws, before any side effect', async () => {
+  it('controlSocket (top-level or hold) throws, before any side effect', async () => {
     // No unix bind needed: createProxy must refuse synchronously.
     const outside = join(tmpdir(), `bb-outside-${process.pid}.sock`);
     assert.throws(() => createProxy({ port: 0, certDir: join(RT, 'certs'),
       logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-      controlSocket: outside }), /inside the runtime/);
+      controlSocket: outside }), /removed in M2\.5/);
     assert.ok(!existsSync(outside), 'refused socket must not be created');
+    assert.throws(() => createProxy({ port: 0, certDir: join(RT, 'certs'),
+      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
+      hold: { match: '/hold', controlSocket: outside } }), /removed in M2\.5/);
   });
 
   it('certDir outside the runtime throws, before any side effect', async () => {
@@ -639,7 +646,7 @@ describe('holds', () => {
     }
   });
 
-  it('approve forwards, deny refuses with reason', { skip: NEED_UNIX }, async () => {
+  it('approve forwards, deny refuses with reason', async () => {
     const P2 = await holdProxy();
     try {
       const p1 = execA('curl', ['-s', '--max-time', '5', '-x', P2,
@@ -650,15 +657,27 @@ describe('holds', () => {
       // Parked past the 500 ms idle timer: still held, not reaped.
       await new Promise((r) => setTimeout(r, 600));
       assert.ok(hp.pending().some((h) => h.id === held.id), 'parked hold outlives the idle timer');
-      assert.equal(await ctl(`approve ${held.id}`), `approved ${held.id}`);
+      // The ask file is decision-ready: rule, letter x, body preview, ISO expiry.
+      const ask = readAsk(held.id);
+      assert.equal(ask.id, held.id);
+      assert.equal(ask.agent, 'tcp');
+      assert.match(ask.url, /\/hold/);
+      assert.equal(ask.rule, 'path matches /hold');
+      assert.equal(ask.letter, 'x');
+      assert.match(ask.bodyPreview, /HOLD1/);
+      assert.equal(ask.truncated, false);
+      assert.match(ask.expiresAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      answer(held.id, { decision: 'allow' });
       assert.match((await p1).stdout, /HOLD1/);
       assert.equal(hp.pending().length, 0);
+      assert.ok(!existsSync(askFile(held.id)), 'settled ask file is removed');
+      assert.ok(!existsSync(answerFile(held.id)), 'answer is consumed exactly once');
 
       const p2 = execA('curl', ['-s', '--max-time', '5', '-x', P2,
         '--cacert', CA, '--data', 'm=HOLD2', `${tlsUp.url}hold`], { encoding: 'latin1' });
       const held2 = await waitFor(() => hp.pending().find((h) => /HOLD2/.test(h.body)),
         'hold on m=HOLD2 to park');
-      assert.equal(await ctl(`deny ${held2.id} nope`), `denied ${held2.id}`);
+      answer(held2.id, { decision: 'deny', reason: 'nope' });
       assert.match((await p2).stdout, /denied: nope/);
     } finally {
       await hp.close();
@@ -687,8 +706,7 @@ describe('holds', () => {
       const held = await waitFor(() => hp.pending().find((h) => /PLAINHOLD/.test(h.body)),
         'plain-HTTP hold to park');
       assert.equal(held.agent, 'tcp');
-      if (!UNIX_OK) { p.catch(() => {}); return; } // parked is proven; approve needs the control socket
-      assert.equal(await ctl(`approve ${held.id}`), `approved ${held.id}`);
+      answer(held.id, { decision: 'allow' });
       assert.match((await p).stdout, /PLAINHOLD/);
     } finally {
       await hp.close();
@@ -724,7 +742,10 @@ describe('holds', () => {
       t.destroy(); // agent disconnects / gives up
       await waitFor(() => hp.pending().length === 0, 'abandoned hold to drop');
       await waitLog(/hold-abandoned/, 'hold-abandoned');
-      if (UNIX_OK) assert.equal(await ctl(`approve ${held.id}`), `unknown ${held.id}`);
+      // A late answer is stale: ignored, logged, swept — never forwarded.
+      answer(held.id, { decision: 'allow' });
+      await waitGone(answerFile(held.id), 'late answer to be swept');
+      await waitLog(/stale-answer/, 'stale-answer');
       assert.equal(tlsUp.hits.get('/hold') ?? 0, before, 'abandoned hold must never reach upstream');
     } finally {
       await hp.close();
@@ -749,7 +770,7 @@ describe('holds', () => {
     idle.destroy();
   });
 
-  it('other requests complete while one is parked (go/no-go b)', { skip: NEED_UNIX }, async () => {
+  it('other requests complete while one is parked (go/no-go b)', async () => {
     const P2 = await holdProxy();
     try {
       const held = execA('curl', ['-s', '--max-time', '8', '-x', P2,
@@ -762,9 +783,139 @@ describe('holds', () => {
         '--cacert', CA, `${tlsUp.url}?m=free`], { encoding: 'latin1' });
       assert.equal(free.stdout, 'local-ok');
       assert.ok(hp.pending().some((h) => h.id === parked.id), 'first request still parked');
-      assert.equal(await ctl(`approve ${parked.id}`), `approved ${parked.id}`);
+      answer(parked.id, { decision: 'allow' });
       assert.match((await held).stdout, /BUSY1/);
       assert.equal(hp.pending().length, 0);
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
+  it('onAsk answers with no files involved', async () => {
+    const seen = new Set((() => { try { return readdirSync(join(RT, 'asks')); } catch { return []; } })());
+    const op = createProxy({ port: 0, certDir: join(RT, 'certs'),
+      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
+      clientIdleMs: 500, allowLoopback: true,
+      hold: { match: '/hold', timeoutMs: 5000,
+        onAsk: async (ask) => {
+          assert.equal(ask.letter, 'x');
+          assert.equal(ask.rule, 'path matches /hold');
+          return { decision: 'allow' };
+        } } });
+    try {
+      const { port } = await op.ready;
+      const r = await execA('curl', ['-s', '--max-time', '5', '-x', `http://127.0.0.1:${port}`,
+        '--cacert', CA, '--data', 'm=ONASK', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      assert.match(r.stdout, /ONASK/);
+      assert.equal(op.pending().length, 0);
+      // The file channel stayed silent: no ask file appeared.
+      const now = new Set((() => { try { return readdirSync(join(RT, 'asks')); } catch { return []; } })());
+      assert.deepEqual([...now].filter((f) => !seen.has(f)), [],
+        'onAsk must not write ask files');
+    } finally {
+      await op.close();
+    }
+  });
+
+  it('depth 3: concurrent holds decide independently', async () => {
+    const P2 = await holdProxy({ timeoutMs: 10000 });
+    try {
+      const bodies = ['DEPTH1', 'DEPTH2', 'DEPTH3'];
+      const ps = bodies.map((m) => execA('curl', ['-s', '--max-time', '8', '-x', P2,
+        '--cacert', CA, '--data', `m=${m}`, `${tlsUp.url}hold`], { encoding: 'latin1' }));
+      const held = await waitFor(() => {
+        const p = hp.pending();
+        return p.length === 3 ? p : null;
+      }, '3 holds to park');
+      const byBody = (m) => held.find((h) => h.body.includes(m));
+      answer(byBody('DEPTH1').id, { decision: 'allow' });
+      answer(byBody('DEPTH2').id, { decision: 'deny', reason: 'second' });
+      answer(byBody('DEPTH3').id, { decision: 'allow' });
+      const [r1, r2, r3] = await Promise.all(ps);
+      assert.match(r1.stdout, /DEPTH1/);
+      assert.match(r2.stdout, /denied: second/);
+      assert.match(r3.stdout, /DEPTH3/);
+      assert.equal(hp.pending().length, 0);
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
+  it('double answer settles once; the late one is stale', async () => {
+    const P2 = await holdProxy();
+    try {
+      const before = tlsUp.hits.get('/hold') ?? 0;
+      const p = execA('curl', ['-s', '--max-time', '5', '-x', P2,
+        '--cacert', CA, '--data', 'm=DOUBLE', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const held = await waitFor(() => hp.pending().find((h) => /DOUBLE/.test(h.body)),
+        'hold on m=DOUBLE to park');
+      answer(held.id, { decision: 'allow' });
+      assert.match((await p).stdout, /DOUBLE/);
+      assert.equal(tlsUp.hits.get('/hold') ?? 0, before + 1);
+      // Decided already: a second answer is stale — swept, logged, never
+      // applied twice.
+      answer(held.id, { decision: 'deny', reason: 'late' });
+      await waitGone(answerFile(held.id), 'late answer to be swept');
+      await waitLog(/stale-answer/, 'stale-answer');
+      assert.equal(tlsUp.hits.get('/hold') ?? 0, before + 1, 'late answer must not forward again');
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
+  it('malformed answers are ignored; a valid one still decides', async () => {
+    const P2 = await holdProxy();
+    try {
+      const p = execA('curl', ['-s', '--max-time', '8', '-x', P2,
+        '--cacert', CA, '--data', 'm=MALFORMED', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const held = await waitFor(() => hp.pending().find((h) => /MALFORMED/.test(h.body)),
+        'hold on m=MALFORMED to park');
+      // Bad JSON: consumed, logged, still parked.
+      mkdirSync(answersDir(), { recursive: true });
+      writeFileSync(answerFile(held.id), 'not json{');
+      await waitGone(answerFile(held.id), 'garbage answer to be consumed');
+      // Unknown decision: consumed, logged, still parked.
+      answer(held.id, { decision: 'maybe' });
+      await waitGone(answerFile(held.id), 'odd answer to be consumed');
+      await waitLog(/malformed-answer/, 'malformed-answer');
+      assert.equal(hp.pending().length, 1, 'malformed answers must not settle the hold');
+      answer(held.id, { decision: 'allow' });
+      assert.match((await p).stdout, /MALFORMED/);
+      assert.equal(hp.pending().length, 0);
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
+  it('stale answers for unknown ids are ignored and logged', async () => {
+    const P2 = await holdProxy();
+    try {
+      assert.equal(hp.pending().length, 0);
+      answer('h9999', { decision: 'allow' });
+      await waitGone(answerFile('h9999'), 'unknown answer to be swept');
+      await waitLog(/stale-answer/, 'stale-answer');
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
+  it('never holds until answered', async () => {
+    const P2 = await holdProxy({ timeoutMs: 'never' });
+    try {
+      const p = execA('curl', ['-s', '--max-time', '8', '-x', P2,
+        '--cacert', CA, '--data', 'm=NEVER', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const held = await waitFor(() => hp.pending().find((h) => /NEVER/.test(h.body)),
+        'hold on m=NEVER to park');
+      assert.equal(readAsk(held.id).expiresAt, null);
+      await new Promise((r) => setTimeout(r, 400));
+      assert.ok(hp.pending().some((h) => h.id === held.id), 'never hold stays parked');
+      answer(held.id, { decision: 'deny', reason: 'finally' });
+      assert.match((await p).stdout, /denied: finally/);
     } finally {
       await hp.close();
       hp = null;
@@ -802,22 +953,21 @@ describe('holds', () => {
 });
 
 describe('two agents keep identity under interleave', () => {
-  const ctl2Path = () => join(RT, 'ctl2.sock');
   const NEED_UNIX2 = UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI';
-  const ctl2 = (cmd) => new Promise((resolve, reject) => {
-    const s = net.connect(ctl2Path(), () => s.write(cmd + '\n'));
-    let out = '';
-    s.on('data', (c) => { out += c; });
-    s.on('end', () => resolve(out.trim()));
-    s.on('error', reject);
-  });
+  const answer = (id, obj) => {
+    const dir = join(RT, 'answers');
+    mkdirSync(dir, { recursive: true });
+    const tmp = join(dir, `.${id}.${process.pid}.tmp`);
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, join(dir, `${id}.json`));
+  };
 
   it('holds, responses and log lines name the right agent',
     { skip: NEED_UNIX2 }, async () => {
       const tp = createProxy({ port: 0, certDir: join(RT, 'certs'),
         logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
         clientIdleMs: 1000, allowLoopback: true,
-        hold: { match: '/hold', timeoutMs: 15000 }, controlSocket: ctl2Path() });
+        hold: { match: '/hold', timeoutMs: 15000, pollMs: 25 } });
       await tp.ready;
       const sa = [];
       try {
@@ -853,8 +1003,8 @@ describe('two agents keep identity under interleave', () => {
         assert.equal(free.status, 200);
         assert.equal(free.body, 'local-ok');
         assert.equal(tp.pending().length, 2, 'holds still parked');
-        assert.equal(await ctl2(`approve ${gotA.id}`), `approved ${gotA.id}`);
-        assert.equal(await ctl2(`approve ${gotB.id}`), `approved ${gotB.id}`);
+        answer(gotA.id, { decision: 'allow' });
+        answer(gotB.id, { decision: 'allow' });
         const rA = await rAP;
         const rB = await rBP;
         assert.equal(rA.status, 200);
@@ -869,7 +1019,6 @@ describe('two agents keep identity under interleave', () => {
         try { tp.removeAgent('fa'); } catch {}
         try { tp.removeAgent('fb'); } catch {}
         await tp.close();
-        try { rmSync(ctl2Path(), { force: true }); } catch {}
       }
     });
 });

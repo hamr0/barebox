@@ -42,13 +42,13 @@ await proxy.close();
 
 ## Holds (human approval)
 
-Start the proxy with a hold rule and a control socket, then decide from a
-second terminal:
+Start the proxy with a hold rule, then decide from a second terminal
+through the file checkpoint (`<runtime>/asks` + `<runtime>/answers`):
 
 ```bash
-SBX_SOCK=/tmp/sbx/ctl.sock npx sbx pending
-SBX_SOCK=/tmp/sbx/ctl.sock npx sbx approve h1
-SBX_SOCK=/tmp/sbx/ctl.sock npx sbx deny h2 "reason here"
+SBX_RUNTIME=/tmp/sbx npx sbx pending
+SBX_RUNTIME=/tmp/sbx npx sbx approve h1
+SBX_RUNTIME=/tmp/sbx npx sbx deny h2 "reason here"
 ```
 
 Held requests wait (default 120 s, `never` supported); approve forwards,

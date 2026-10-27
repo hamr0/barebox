@@ -69,7 +69,7 @@ describe(`end-to-end (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}` : 
   }
   const log = () => readFileSync(join(rt, 'mitm.log'), 'latin1');
   const sbx = (...args) => execA('node', [join(ROOT, 'src/cli.js'), ...args],
-    { encoding: 'latin1', env: { ...process.env, SBX_SOCK: join(rt, 'ctl.sock') } });
+    { encoding: 'latin1', env: { ...process.env, SBX_RUNTIME: rt } });
 
   before(async () => {
     root = mkdtempSync(join(tmpdir(), 'bb-e2e-'));
@@ -87,7 +87,7 @@ describe(`end-to-end (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}` : 
     proxy = createProxy({ certDir: join(rt, 'certs'), runtime: rt,
       logFile: join(rt, 'mitm.log'), upstreamCa: join(rt, 'certs', 'ca.pem'),
       allowLoopback: true,
-      hold: { match: '/hold', timeoutMs: 15000 }, controlSocket: join(rt, 'ctl.sock') });
+      hold: { match: '/hold', timeoutMs: 15000, pollMs: 100 } });
     await proxy.ready;
     sock = proxy.addAgent('e2e');
   });

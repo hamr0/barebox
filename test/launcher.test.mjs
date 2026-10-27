@@ -224,11 +224,56 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     assert.equal((await run(c)).code, 0);
   });
 
+  it('an agent cannot answer its own ask (runtime under $HOME is masked)', async () => {
+    // The file checkpoint is the approve/deny capability: a forged
+    // `answers/<id>.json` from inside must never reach the host tree the
+    // proxy polls. The runtime lives under $HOME here, so the launcher
+    // masks it; the write below lands on the mask (or fails) — either way
+    // the host must not see it. The trailing visibility check catches
+    // missing masks: without them $HOME/rt shows through (readable) and
+    // the inner command exits nonzero even though the write itself fails.
+    const rtHome = join(home, 'rt');
+    mkdirSync(join(rtHome, 'answers'), { recursive: true });
+    mkdirSync(join(rtHome, 'asks'), { recursive: true });
+    mkdirSync(join(rtHome, 'socks'), { recursive: true });
+    const srv = net.createServer((s) => s.resume());
+    await new Promise((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(join(rtHome, 'socks', 'ta.sock'), resolve);
+    });
+    servers.push(srv);
+    const c = launch({ runtime: rtHome, agent: 'ta', proj,
+      command: ['bash', '-c', 'echo \'{"decision":"allow"}\' > "$HOME/rt/answers/h1.json"; echo wrote:$?; test ! -e "$HOME/rt/asks" && test ! -e "$HOME/rt/answers"'] });
+    const r = await run(c);
+    assert.equal(r.code, 0, r.err);
+    assert.ok(!existsSync(join(rtHome, 'answers', 'h1.json')),
+      `forged answer reached the host (inside said: ${r.out}${r.err})`);
+  });
+
+  it('a runtime outside home/proj is not visible inside at all', async () => {
+    const rtOut = join(root, 'rt-out');
+    mkdirSync(join(rtOut, 'answers'), { recursive: true });
+    mkdirSync(join(rtOut, 'socks'), { recursive: true });
+    const srv = net.createServer((s) => s.resume());
+    await new Promise((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(join(rtOut, 'socks', 'tb.sock'), resolve);
+    });
+    servers.push(srv);
+    const c = launch({ runtime: rtOut, agent: 'tb', proj,
+      extraEnv: { RT_OUT: rtOut },
+      command: ['bash', '-c', 'echo \'{"decision":"allow"}\' > "$RT_OUT/answers/h1.json"'] });
+    const r = await run(c);
+    assert.notEqual(r.code, 0, `write to an invisible runtime must fail (got ${r.code})`);
+    assert.ok(!existsSync(join(rtOut, 'answers', 'h1.json')), 'host tree untouched');
+  });
+
   it('hides runtime sockets that show through $HOME, front door still works', async () => {
     // Production layout: the runtime lives under $HOME, so the ro-bind of
-    // home would expose every agent socket (identity) and the control
-    // socket (approve/deny) — and a read-only bind does NOT stop
-    // connect(2). The launch must mask the runtime dir inside.
+    // home would expose every agent socket (identity) and the file
+    // checkpoint (`asks/`, `answers/` — approve/deny) — and a read-only
+    // bind does NOT stop connect(2). The launch must mask the runtime dir
+    // inside.
     const rtHome = join(home, 'rt');
     mkdirSync(join(rtHome, 'socks'), { recursive: true });
     const sock = join(rtHome, 'socks', 't8.sock');

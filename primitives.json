@@ -18,6 +18,15 @@
       "signature": "launch(opts: object) => ChildProcess",
       "fails": "Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, or when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent). The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.",
       "example": "import { launch } from \"barebox\";\nconst child = launch({ runtime: \"/tmp/sbx\", agent: \"fx\", proj: \"/tmp/proj\", command: [\"bash\", \"-c\", \"echo hi\"] });\nawait new Promise((r) => child.on(\"close\", r)); // child.exitCode === 0"
+    },
+    {
+      "name": "run",
+      "category": "run",
+      "when": "Reach for this to HARNESS-ONLY run one sandboxed agent start-to-finish in a single call: it starts the proxy, sandboxes the command, answers holds, and returns the exit code with the ask and audit trail.",
+      "import": "import { run } from 'barebox'",
+      "signature": "run(opts: object) => Promise<{ exit: number, asks: AskRecord[], audit: string }>",
+      "fails": "Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `gate`/`onAsk`, or a proxy that never becomes ready. The agent's own nonzero exit is returned as `exit`, never thrown.",
+      "example": "import { run } from \"barebox\";\nconst { exit, asks, audit } = await run({ proj: \"/tmp/proj\", command: [\"bash\", \"-c\", \"echo hi\"] });"
     }
   ]
 }
