@@ -12,6 +12,7 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile as execFileCb, spawnSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import {
   mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync,
@@ -23,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { Writable } from 'node:stream';
 import net from 'node:net';
 import {
-  setupOverlay, diffOverlay, commitOverlay, rollbackOverlay,
+  setupOverlay, diffOverlay, commitOverlay, rollbackOverlay, undoJournal,
   OverlayConflictError, DEFAULT_IGNORE,
 } from '../src/overlay.js';
 import { launch } from '../src/launcher.js';
@@ -117,6 +118,32 @@ const sbx = (args, env = {}) => execA('node', [CLI, ...args],
   { encoding: 'latin1', timeout: 60000, env: { ...process.env, ...env } });
 
 const sqTest = (s) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/**
+ * Byte-for-byte project comparison: recursive hash of content, modes and
+ * symlink targets. Every "unchanged" or "exact" claim below compares these.
+ */
+function treeHash(dir) {
+  const h = createHash('sha256');
+  const walk = (/** @type {string} */ rel) => {
+    const abs = join(dir, rel);
+    const st = lstatSync(abs);
+    if (st.isDirectory()) {
+      h.update(`d:${rel}:${(st.mode & 0o7777).toString(8)}\0`);
+      for (const n of readdirSync(abs).sort()) walk(rel ? `${rel}/${n}` : n);
+    } else if (st.isFile()) {
+      h.update(`f:${rel}:${(st.mode & 0o7777).toString(8)}:`);
+      h.update(readFileSync(abs));
+      h.update('\0');
+    } else if (st.isSymbolicLink()) {
+      h.update(`l:${rel}:${readlinkSync(abs)}\0`);
+    } else {
+      h.update(`?:${rel}\0`);
+    }
+  };
+  walk('');
+  return h.digest('hex');
+}
 
 describe('setupOverlay (no sandbox needed)', () => {
   let root;
@@ -319,40 +346,8 @@ describe('commit and rollback (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_S
     rollbackOverlay({ runtime: rt, agent: 'c' });
   });
 
-  it('an unwritable destination fails before writing anything (chmod-500)', () => {
-    // The repro: `sub` is read-only from the start (500 keeps r-x, so the
-    // snapshot and the diff still read it). The commit must refuse with the
-    // project untouched — never apply the earlier-sorting files and hide
-    // them from the next `sbx diff`.
-    const proj = mkproj(mkdtempSync(join(root, 'p-')));
-    chmodSync(join(proj, 'sub'), 0o500);
-    const rt = mkdtempSync(join(root, 'rt-'));
-    const { upper } = setupOverlay({ runtime: rt, agent: 'c', proj });
-    writeFileSync(join(upper, 'edit.txt'), 'agent\n');
-    mkdirSync(join(upper, 'sub'), { recursive: true });
-    writeFileSync(join(upper, 'sub', 'x.txt'), 'agent\n');
-    chmodSync(join(upper, 'sub'), 0o500); // no mode-only change on `sub` itself
-    try {
-      let err = null;
-      try {
-        commitOverlay({ runtime: rt, agent: 'c' });
-      } catch (e) {
-        err = e;
-      }
-      assert.ok(err, 'commit must throw');
-      assert.equal(err.code, 'SBX_COMMIT_FAILED');
-      assert.match(err.message, /not writable/);
-      assert.match(err.message, /sub\/x\.txt/);
-      assert.deepEqual(err.applied, [], 'nothing may be applied');
-      assert.ok(err.unapplied.includes('sub/x.txt'));
-      assert.equal(readFileSync(join(proj, 'edit.txt'), 'utf8'), 'orig\n',
-        'the earlier-sorting file must not slip through a refused commit');
-      assert.ok(!existsSync(join(proj, 'sub', 'x.txt')));
-    } finally {
-      chmodSync(join(proj, 'sub'), 0o700);
-      rollbackOverlay({ runtime: rt, agent: 'c' });
-    }
-  });
+  // (The old chmod-500 preflight test is gone with the preflight: cases 2 and
+  // 6 of the 1E block below cover unwritable destinations through the journal.)
 
   it('commit strips setuid/setgid bits but keeps the low bits', () => {
     const proj = mkproj(mkdtempSync(join(root, 'p-')));
@@ -394,13 +389,286 @@ describe('commit and rollback (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_S
     setupOverlay({ runtime: rt, agent: 'c', proj });
     assert.deepEqual(
       withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'c' })),
-      { discarded: [] });
+      { discarded: [], exact: true });
   });
 
   it('rollback without an overlay throws', () => {
     const rt = mkdtempSync(join(root, 'rt-'));
     assert.throws(() => rollbackOverlay({ runtime: rt, agent: 'ghost' }), /no overlay/);
   });
+});
+
+describe('M4 rework cases 1E (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_SKIP }, () => {
+  // Behavioral cases from the rework brief: every "unchanged" claim compares
+  // treeHash (content, modes, symlink targets). Failures are injected with
+  // filesystem permissions, never hooks — except case 7, which atomic
+  // renames make unreachable through commit (see the test).
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-1e-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Project fixture for the commit cases: a deletable file, a subdir, a type-change pair. */
+  function mkcase(dir) {
+    writeFileSync(join(dir, 'a_del'), 'doomed\n');
+    writeFileSync(join(dir, 'keep.txt'), 'keep\n');
+    mkdirSync(join(dir, 'sub'), { recursive: true });
+    writeFileSync(join(dir, 'sub', 'victim.txt'), 'victim\n');
+    writeFileSync(join(dir, 'asfile'), 'file-now\n');
+    mkdirSync(join(dir, 'asdir'), { recursive: true });
+    writeFileSync(join(dir, 'asdir', 'y'), 'dir-now\n');
+    return dir;
+  }
+
+  it('1: delete + mkdir q + chmod 555 q commits with the mode applied last', () => {
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'e1', proj });
+    agentWrite({ ...ov, lower: proj, script: 'rm "$M/a_del"; mkdir "$M/q"; echo x > "$M/q/f"; chmod 555 "$M/q"' });
+    try {
+      const res = commitOverlay({ runtime: rt, agent: 'e1' });
+      assert.deepEqual(res, { committed: ['a_del', 'q', 'q/f'], skipped: [] });
+      assert.equal(lstatSync(join(proj, 'q')).mode & 0o7777, 0o555, 'q carries 555');
+      assert.equal(readFileSync(join(proj, 'q', 'f'), 'utf8'), 'x\n', 'q/f landed before the chmod');
+      assert.ok(!existsSync(join(proj, 'a_del')));
+    } finally {
+      chmodSync(join(proj, 'q'), 0o700); // else the root cleanup cannot unlink q/f
+      rollbackOverlay({ runtime: rt, agent: 'e1' });
+    }
+  });
+
+  it('2: deleted file under an unwritable parent fails with the project byte-identical', () => {
+    // Why a conflict, not a phase-2 failure: deleting through the mount copies
+    // `sub` up at its old mode, so chmodding the project parent puts `sub`
+    // itself in the changeset — and the pinned rule refuses before phase 2.
+    // Any chmod-based parent lock ends here by construction.
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'e2', proj });
+    agentWrite({ ...ov, lower: proj, script: 'rm "$M/a_del"; rm "$M/sub/victim.txt"' });
+    chmodSync(join(proj, 'sub'), 0o555);
+    const before = treeHash(proj);
+    try {
+      let err = null;
+      try {
+        commitOverlay({ runtime: rt, agent: 'e2' });
+      } catch (e) {
+        err = e;
+      }
+      assert.ok(err instanceof OverlayConflictError, `expected a conflict refusal, got ${err}`);
+      assert.deepEqual(err.conflicts.map((c) => c.path), ['sub']);
+      assert.match(err.message, /nothing was applied/);
+      assert.deepEqual(treeHash(proj), before, 'project byte-for-byte unchanged');
+      assert.equal(readFileSync(join(proj, 'sub', 'victim.txt'), 'utf8'), 'victim\n');
+      assert.equal(readFileSync(join(proj, 'a_del'), 'utf8'), 'doomed\n');
+    } finally {
+      chmodSync(join(proj, 'sub'), 0o700);
+      rollbackOverlay({ runtime: rt, agent: 'e2' });
+    }
+  });
+
+  it('3: file becomes a folder', () => {
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'e3', proj });
+    agentWrite({ ...ov, lower: proj, script: 'rm "$M/asfile"; mkdir "$M/asfile"; echo z > "$M/asfile/z"' });
+    const res = commitOverlay({ runtime: rt, agent: 'e3' });
+    assert.deepEqual(res, { committed: ['asfile', 'asfile/z'], skipped: [] });
+    assert.ok(lstatSync(join(proj, 'asfile')).isDirectory());
+    assert.equal(readFileSync(join(proj, 'asfile', 'z'), 'utf8'), 'z\n');
+    rollbackOverlay({ runtime: rt, agent: 'e3' });
+  });
+
+  it('4: folder becomes a file', () => {
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'e4', proj });
+    agentWrite({ ...ov, lower: proj, script: 'rm -rf "$M/asdir"; echo f > "$M/asdir"' });
+    const res = commitOverlay({ runtime: rt, agent: 'e4' });
+    assert.deepEqual(res, { committed: ['asdir', 'asdir/y'], skipped: [] });
+    assert.equal(readFileSync(join(proj, 'asdir'), 'utf8'), 'f\n');
+    rollbackOverlay({ runtime: rt, agent: 'e4' });
+  });
+
+  it('5: folder holding node_modules cannot become a file', () => {
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    mkdirSync(join(proj, 'asdir', 'node_modules', 'pkg'), { recursive: true });
+    writeFileSync(join(proj, 'asdir', 'node_modules', 'pkg', 'lib.js'), 'v1\n');
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'e5', proj });
+    agentWrite({ ...ov, lower: proj, script: 'rm -rf "$M/asdir"; echo f > "$M/asdir"' });
+    const before = treeHash(proj);
+    let err = null;
+    try {
+      commitOverlay({ runtime: rt, agent: 'e5' });
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, 'commit must refuse');
+    assert.match(err.message, /holds ignored content; cannot replace it with a file/);
+    assert.deepEqual(treeHash(proj), before, 'project byte-for-byte unchanged');
+    assert.ok(lstatSync(join(proj, 'asdir')).isDirectory(), 'the folder is still a folder');
+    rollbackOverlay({ runtime: rt, agent: 'e5' });
+  });
+
+  it('6: a mid-swap refusal undoes asides and rmdirs exactly', () => {
+    // The brief's literal shape (an unwritable destination parent) cannot
+    // reach phase 2: chmodding any changeset ancestor puts it in the
+    // changeset itself (copy-up mode residue), so the pinned rule refuses in
+    // phase 1 — see case 2. This is the richest journal a real refusal can
+    // leave: asides plus a landed rmdir, all undone, byte for byte.
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    mkdirSync(join(proj, 'd1'), { recursive: true });
+    writeFileSync(join(proj, 'd1', 'f1'), 'f1\n');
+    mkdirSync(join(proj, 'iw', 'node_modules', 'pkg'), { recursive: true });
+    writeFileSync(join(proj, 'iw', 'y'), 'why\n');
+    writeFileSync(join(proj, 'iw', 'node_modules', 'pkg', 'lib.js'), 'v1\n');
+    symlinkSync('keep.txt', join(proj, 'link.txt'));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'e6', proj });
+    agentWrite({
+      ...ov, lower: proj,
+      script: 'rm "$M/d1/f1"; rm -rf "$M/d1"; rm "$M/iw/y"; rm -rf "$M/iw"; echo f > "$M/iw"; rm "$M/link.txt"',
+    });
+    const before = treeHash(proj);
+    let err = null;
+    try {
+      commitOverlay({ runtime: rt, agent: 'e6' });
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, 'commit must refuse the ignored-content replace');
+    assert.equal(err.code, 'SBX_COMMIT_FAILED');
+    assert.match(err.message, /iw holds ignored content; cannot replace it with a file/);
+    assert.match(err.message, /nothing was applied/);
+    assert.deepEqual(treeHash(proj), before, 'content, modes, symlinks and deleted files all back');
+    assert.equal(readFileSync(join(proj, 'd1', 'f1'), 'utf8'), 'f1\n', 'asided file back');
+    assert.equal(readFileSync(join(proj, 'iw', 'y'), 'utf8'), 'why\n', 'asided file back');
+    assert.equal(readlinkSync(join(proj, 'link.txt')), 'keep.txt', 'asided symlink back');
+    assert.ok(lstatSync(join(proj, 'd1')).isDirectory(), 'removed dir recreated');
+    assert.ok(lstatSync(join(proj, 'iw')).isDirectory(), 'replace target still a folder');
+    rollbackOverlay({ runtime: rt, agent: 'e6' });
+  });
+
+  it('7: undoJournal lists exactly the steps it cannot undo', () => {
+    // Unreachable through commit on purpose: every phase-2 op is an atomic
+    // rename/mkdir/rmdir/chmod, so a failed op leaves no partial state and an
+    // undo step can only fail when the tree moved underneath it — which the
+    // phase-1 re-fingerprint refuses first. chmod alone cannot produce it, so
+    // this drives the real undo with a sabotaged tree instead of a hook.
+    const proj = mkdtempSync(join(root, 'p-'));
+    mkdirSync(join(proj, 'ok'));
+    writeFileSync(join(proj, 'ok', 'a.txt'), 'new-content\n');
+    mkdirSync(join(proj, 'q'));
+    writeFileSync(join(proj, 'q', 'pinned.txt'), 'pins the rmdir\n');
+    const notUndone = undoJournal([
+      { op: 'in', path: 'ok/a.txt' },
+      { op: 'mkdir', path: 'q' },
+    ], proj);
+    assert.deepEqual(notUndone, ['mkdir q'], 'exactly the failed step is listed');
+    assert.ok(!existsSync(join(proj, 'ok', 'a.txt')), 'the rest still undoes');
+    assert.equal(readFileSync(join(proj, 'q', 'pinned.txt'), 'utf8'), 'pins the rmdir\n');
+  });
+
+  it('8: a leftover commit folder blocks diff, commit and run-setup, naming it', () => {
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    setupOverlay({ runtime: rt, agent: 'e8', proj });
+    const leftover = join(proj, '.sbx-commit-1-deadbeef');
+    mkdirSync(join(leftover, 'new'), { recursive: true });
+    mkdirSync(join(leftover, 'old'), { recursive: true });
+    try {
+      assert.throws(() => diffOverlay({ runtime: rt, agent: 'e8' }), new RegExp(leftover.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+      assert.throws(() => commitOverlay({ runtime: rt, agent: 'e8' }), /\.sbx-commit-/);
+      assert.throws(() => setupOverlay({ runtime: rt, agent: 'e8', proj }), /\.sbx-commit-/);
+    } finally {
+      rmSync(leftover, { recursive: true, force: true });
+      rollbackOverlay({ runtime: rt, agent: 'e8' });
+    }
+  });
+
+  it('9: rollback reports exactly what diff returns, then the overlay is gone', () => {
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'e9', proj });
+    agentWrite({
+      ...ov, lower: proj,
+      script: 'echo hacked > "$M/keep.txt"; rm "$M/a_del"; echo evil > "$M/evil.txt"; rm -rf "$M/asdir"; mkdir "$M/n"; echo x > "$M/n/y"',
+    });
+    const diffed = diffOverlay({ runtime: rt, agent: 'e9' });
+    assert.ok(diffed.length >= 5, `expected the chaos listed, got ${JSON.stringify(diffed)}`);
+    const { discarded, exact } = rollbackOverlay({ runtime: rt, agent: 'e9' });
+    assert.equal(exact, true);
+    assert.deepEqual(discarded, diffed, 'rollback output equals diff output');
+    assert.ok(!existsSync(join(rt, 'overlay', 'e9')), 'overlay folder gone');
+    assert.throws(() => diffOverlay({ runtime: rt, agent: 'e9' }), /no overlay/);
+  });
+
+  it('10: rollback with the project gone lists raw paths and allows the next run', async () => {
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'e10', proj });
+    agentWrite({ ...ov, lower: proj, script: 'echo agent > "$M/edit.txt"; rm "$M/a_del"' });
+    rmSync(proj, { recursive: true, force: true });
+    const { discarded, exact } = rollbackOverlay({ runtime: rt, agent: 'e10' });
+    assert.equal(exact, false);
+    const paths = discarded.map((c) => c.path).sort();
+    assert.ok(paths.includes('edit.txt'), `raw list carries agent paths, got ${JSON.stringify(paths)}`);
+    for (const c of discarded) assert.equal(c.status, 'unknown', 'no inference without the project');
+    assert.ok(!existsSync(join(rt, 'overlay', 'e10')), 'overlay folder gone');
+    mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, 'keep.txt'), 'keep\n');
+    setupOverlay({ runtime: rt, agent: 'e10', proj }); // the next run is allowed
+    rollbackOverlay({ runtime: rt, agent: 'e10' });
+  });
+
+  it('11: control bytes and bidi controls in names never reach the terminal', async () => {
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'e11', proj });
+    // Built from char codes so the source carries no invisible bytes: CR +
+    // ESC[2K + ESC[1A tries to rewrite the reviewer's line; U+202E flips it.
+    const CR = String.fromCharCode(13);
+    const ESC = String.fromCharCode(27);
+    const BIDI = String.fromCharCode(0x202e);
+    // The CLI child prints UTF-8 but sbx() reads latin1: the unsanitized
+    // character would arrive as these three bytes, never as U+202E itself.
+    const BIDI_BYTES = String.fromCharCode(0xe2, 0x80, 0xae);
+    const evilCtl = 'x' + CR + ESC + '[2K' + ESC + '[1Aevil';
+    const evilBidi = 'a' + BIDI + 'cript.js';
+    agentWrite({
+      ...ov, lower: proj,
+      script: 'touch "$M/' + evilCtl + '" && echo bidi > "$M/' + evilBidi + '"',
+    });
+    const env = { SBX_RUNTIME: rt };
+    for (const cmd of [['diff', '--agent', 'e11'], ['commit', '--agent', 'e11']]) {
+      const out = (await sbx(cmd, env)).stdout;
+      assert.ok(!out.includes(ESC), cmd + ' prints no escape bytes');
+      assert.ok(!out.includes(CR), cmd + ' prints no carriage returns');
+      assert.ok(!out.includes(BIDI_BYTES), cmd + ' prints no bidi controls');
+    }
+    // The commit above pressed the evil names down; a fresh one checks rollback too.
+    agentWrite({ ...ov, lower: proj, script: 'echo again > "$M/' + evilBidi + '.2"' });
+    const rb = (await sbx(['rollback', '--agent', 'e11'], env)).stdout;
+    assert.ok(!rb.includes(ESC) && !rb.includes(CR) && !rb.includes(BIDI_BYTES), 'rollback prints sanitized');
+  });
+
+  it('12: a non-UTF-8 filename is refused loudly, named', () => {
+    const proj = mkcase(mkdtempSync(join(root, 'p-')));
+    // join() rejects Buffers: build the raw path for the refusal fixture.
+    writeFileSync(Buffer.concat([Buffer.from(`${proj}/`), Buffer.from([0xff, 0xfe])]), 'bad\n');
+    const rt = mkdtempSync(join(root, 'rt-'));
+    assert.throws(() => setupOverlay({ runtime: rt, agent: 'e12', proj }), /non-UTF-8 filename/);
+    try {
+      setupOverlay({ runtime: rt, agent: 'e12', proj });
+    } catch (e) {
+      assert.match(/** @type {Error} */ (e).message, /fffe/, 'the hex names the file');
+    }
+  });
+  // Case 13 (project under $HOME) is the existing mount-order block below, kept as-is.
 });
 
 describe('rollback without the project (no sandbox needed)', () => {
@@ -424,13 +692,15 @@ describe('rollback without the project (no sandbox needed)', () => {
     writeFileSync(join(rt, 'overlay', 'gone', 'upper', 'edit.txt'), 'agent-edit\n');
     symlinkSync('keep.txt', join(rt, 'overlay', 'gone', 'upper', 'link.txt'));
     rmSync(proj, { recursive: true, force: true }); // the project is gone
-    const { discarded } = withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'gone' }));
+    const { discarded, exact } = withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'gone' }));
+    assert.equal(exact, false, 'no project: statuses are not inferred');
     const byPath = new Map(discarded.map((c) => [c.path, c]));
     assert.ok(byPath.has('sub/x.txt'), `agent file reported, got ${JSON.stringify(discarded)}`);
     assert.ok(byPath.has('edit.txt'));
     assert.ok(byPath.has('link.txt'));
-    assert.equal(byPath.get('edit.txt').status, 'modified', 'in the run-start snapshot');
-    assert.equal(byPath.get('sub/x.txt').status, 'added', 'not in the run-start snapshot');
+    for (const c of discarded) {
+      assert.equal(c.status, 'unknown', `${c.path}: raw fallback infers nothing`);
+    }
     // The overlay record is fully gone: upper, work and manifest.
     assert.ok(!existsSync(join(rt, 'overlay', 'gone', 'manifest.json')));
     assert.ok(!existsSync(join(rt, 'overlay', 'gone', 'upper', 'edit.txt')));
@@ -441,28 +711,30 @@ describe('rollback without the project (no sandbox needed)', () => {
     rollbackOverlay({ runtime: rt, agent: 'gone' });
   });
 
-  it('rollback with the project present lists the upper with no mount (bwrap hidden)', () => {
+  it('rollback with the project present but no userns falls back to raw paths (bwrap hidden)', () => {
     const proj = mkproj(mkdtempSync(join(root, 'p-')));
     const rt = mkdtempSync(join(root, 'rt-'));
     setupOverlay({ runtime: rt, agent: 'still', proj });
     writeFileSync(join(rt, 'overlay', 'still', 'upper', 'new.txt'), 'agent\n');
-    const { discarded } = withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'still' }));
-    assert.deepEqual(discarded.map((c) => [c.status, c.path]), [['added', 'new.txt']]);
+    const { discarded, exact } = withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'still' }));
+    assert.equal(exact, false, 'the mount failed: statuses are not inferred');
+    assert.deepEqual(discarded.map((c) => [c.status, c.path]), [['unknown', 'new.txt']]);
     assert.ok(!existsSync(join(rt, 'overlay', 'still', 'manifest.json')));
     assert.equal(readFileSync(join(proj, 'keep.txt'), 'utf8'), 'keep\n', 'project untouched');
   });
 
-  it('rollback reports a real whiteout as deleted (needs bwrap)',
+  it('rollback lists a real whiteout path without inferring its status (needs bwrap)',
     { skip: BWRAP_OK ? false : BWRAP_SKIP }, () => {
       const proj = mkproj(mkdtempSync(join(root, 'p-')));
       const rt = mkdtempSync(join(root, 'rt-'));
       const ov = setupOverlay({ runtime: rt, agent: 'white', proj });
       agentWrite({ ...ov, lower: proj, script: 'rm "$M/del.txt"; echo agent > "$M/edit.txt"' });
       rmSync(proj, { recursive: true, force: true });
-      const { discarded } = rollbackOverlay({ runtime: rt, agent: 'white' });
+      const { discarded, exact } = rollbackOverlay({ runtime: rt, agent: 'white' });
+      assert.equal(exact, false, 'no project: statuses are not inferred');
       const byPath = new Map(discarded.map((c) => [c.path, c.status]));
-      assert.equal(byPath.get('del.txt'), 'deleted', `whiteout listed, got ${JSON.stringify(discarded)}`);
-      assert.equal(byPath.get('edit.txt'), 'modified');
+      assert.equal(byPath.get('del.txt'), 'unknown', `whiteout listed raw, got ${JSON.stringify(discarded)}`);
+      assert.equal(byPath.get('edit.txt'), 'unknown');
     });
 });
 
@@ -492,7 +764,8 @@ describe('ignored dirs are invisible (Q3)', () => {
       withoutBwrap(() => commitOverlay({ runtime: rt, agent: 'g' })),
       { committed: [], skipped: [] });
     assert.equal(readFileSync(join(proj, 'node_modules', 'pkg', 'index.js'), 'utf8'), 'v1\n');
-    assert.deepEqual(withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'g' })), { discarded: [] });
+    assert.deepEqual(withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'g' })),
+      { discarded: [], exact: true });
   });
 
   it('a custom ignore list prunes several dirs through a real mount (needs bwrap)',

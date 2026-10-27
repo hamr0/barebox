@@ -42,14 +42,20 @@ const HOLD_ID_RE = /^h\d+$/;
 
 /**
  * Strip terminal control before printing agent-controlled bytes (ask URLs,
- * rules, body previews): an escape sequence smuggled into a preview could
- * otherwise rewrite the approver's terminal line before approval.
+ * rules, body previews, overlay paths): an escape sequence smuggled into a
+ * preview could otherwise rewrite the approver's terminal line before
+ * approval, and bidi controls in an agent-chosen filename could flip how a
+ * reviewed path reads.
  *
  * @param {unknown} s value to print
- * @returns {string} printable text with no VT sequences or C0/C1 controls
+ * @returns {string} printable text with no VT sequences, C0/C1 controls, or bidi controls
  */
 function safe(s) {
-  return stripVTControlCharacters(String(s ?? '')).replace(/[\x00-\x1f\x7f]/g, '');
+  return stripVTControlCharacters(String(s ?? ''))
+    .replace(/[\x00-\x1f\x7f]/g, '')
+    // Bidi controls U+200E/F, U+202A-E, U+2066-9: an agent-chosen filename
+    // could otherwise flip how a reviewed path reads.
+    .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
 }
 // Exit codes: 0 ok, 1 unknown id / refused / run failure, 2 usage.
 // `sbx run` mirrors the agent's exit code instead (usage errors stay 2).
@@ -232,11 +238,21 @@ async function cliOverlay(overlayCmd, rest) {
     process.exit(2);
   }
   /**
+   * The one function that prints an agent-controlled change (or an overlay
+   * error carrying agent-controlled paths): every path and reason is
+   * sanitized here, once — never at the call sites below.
+   *
+   * @param {unknown} line full line to print
+   */
+  const say = (line) => {
+    console.log(safe(line));
+  };
+  /**
    * @param {unknown} e
    * @returns {never}
    */
   const fail = (e) => {
-    console.log(e instanceof Error ? e.message : String(e));
+    say(e instanceof Error ? e.message : String(e));
     process.exit(1);
     throw new Error('unreachable');
   };
@@ -250,11 +266,11 @@ async function cliOverlay(overlayCmd, rest) {
       fail(e);
     }
     if (!changes.length) {
-      console.log('no changes');
+      say('no changes');
       return;
     }
     for (const c of changes) {
-      console.log(`${letter(c.status)} ${c.path}${c.conflict ? ` (CONFLICT: ${c.reason})` : ''}`);
+      say(`${letter(c.status)} ${c.path}${c.conflict ? ` (CONFLICT: ${c.reason})` : ''}`);
     }
     return;
   }
@@ -268,16 +284,16 @@ async function cliOverlay(overlayCmd, rest) {
       // how to proceed, and exit 1 (never 0 — nothing was committed).
       if (e instanceof Error && /** @type {{code?: string}} */ (e).code === 'SBX_CONFLICT') {
         for (const c of /** @type {{conflicts: {path: string, reason: string}[]}} */ (/** @type {unknown} */ (e)).conflicts) {
-          console.log(`conflict: ${c.path} (${c.reason})`);
+          say(`conflict: ${c.path} (${c.reason})`);
         }
-        console.log('commit refused: resolve the conflicts, or re-run with --skip-conflicts to commit the rest');
+        say('commit refused: resolve the conflicts, or re-run with --skip-conflicts to commit the rest');
         process.exit(1);
       }
       fail(e);
     }
-    for (const p of res.committed) console.log(`committed ${p}`);
-    for (const s of res.skipped) console.log(`skipped (conflict): ${s.path} (${s.reason})`);
-    if (!res.committed.length && !res.skipped.length) console.log('nothing to commit');
+    for (const p of res.committed) say(`committed ${p}`);
+    for (const s of res.skipped) say(`skipped (conflict): ${s.path} (${s.reason})`);
+    if (!res.committed.length && !res.skipped.length) say('nothing to commit');
     return;
   }
 
@@ -288,10 +304,15 @@ async function cliOverlay(overlayCmd, rest) {
     fail(e);
   }
   if (!res.discarded.length) {
-    console.log('nothing to discard');
+    say('nothing to discard');
     return;
   }
-  for (const c of res.discarded) console.log(`discarded ${letter(c.status)} ${c.path}`);
+  if (!res.exact) {
+    say(`discarded ${res.discarded.length} entries (project gone or no userns: exact list unavailable)`);
+  }
+  for (const c of res.discarded) {
+    say(c.status === 'unknown' ? `discarded ${c.path}` : `discarded ${letter(c.status)} ${c.path}`);
+  }
 }
 
 /**

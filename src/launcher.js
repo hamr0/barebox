@@ -57,7 +57,10 @@ export function buildCaBundle(runtime, caFile) {
  * its own, and a single front door: anything sent to `localhost:<proxyPort>`
  * is carried out through this agent's socket to the proxy. The agent starts
  * in the project dir (`--chdir proj`), so relative paths resolve there no
- * matter where the caller runs from.
+ * matter where the caller runs from. The agent always runs in a new session
+ * (`--new-session`), detached from the caller's terminal, so it cannot inject
+ * keystrokes via TIOCSTI on kernels with `dev.tty.legacy_tiocsti=1`. Its stdin
+ * is never the terminal (`stdio: ignore`), so detaching costs nothing.
  *
  * @param {object} opts
  * @param {string} opts.runtime where the runtime tree lives (`socks/` is created inside)
@@ -73,7 +76,7 @@ export function buildCaBundle(runtime, caFile) {
  * @returns {import('node:child_process').ChildProcess} the bwrap child (stdio piped); `close` gives its exit code
  * Carries `.overlay` (`{upper, work}`) when `overlay` is on.
  * @when Reach for this to HARNESS-ONLY start one sandboxed agent run: it creates the sandbox the agent lives in. It does not decide anything; combine with the proxy for the front door and the gate (M3) for policy. Pass overlay:true for a writable tracing-paper run (M4). The agent starts in the project dir.
- * @fails Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent), or with overlay on when the runtime sits inside the project or uncommitted changes linger. The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.
+ * @fails Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on a non-integer `proxyPort`, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent), or with overlay on when the runtime sits inside the project or uncommitted changes linger. The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.
  * @example
  * import { launch } from "barebox";
  * const child = launch({ runtime: "/tmp/sbx", agent: "fx", proj: "/tmp/proj", command: ["bash", "-c", "echo hi"] });
@@ -85,6 +88,10 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     if (typeof v !== 'string' || !v) throw new Error(`launch: ${k} must be a non-empty string`);
   }
   if (!Array.isArray(command) || !command.length) throw new Error('launch: command must be a non-empty argv array');
+  // Pasted into the sandbox's start-up script: anything but an integer port is shell injection.
+  if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535) {
+    throw new Error(`launch: proxyPort must be an integer from 1 to 65535, got ${JSON.stringify(proxyPort)}`);
+  }
   assertAgentName(agent);
   // The socket IS the identity: both sides must name the same path.
   const expected = socketPathForAgent(runtime, agent);
@@ -126,6 +133,11 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
       ? ['--overlay-src', proj, '--overlay', ov.upper, ov.work, proj]
       : ['--ro-bind', proj, proj]),
     '--chdir', proj,
+    // Always detach from our controlling terminal: otherwise the agent could
+    // open /dev/tty and TIOCSTI keystrokes into it (e.g. into `sbx approve`)
+    // on kernels with dev.tty.legacy_tiocsti=1. The agent's stdin is never
+    // the terminal (spawned with stdin ignored), so nothing interactive is lost.
+    '--new-session',
   ];
   // Locked drawers AFTER the project mount: the tmpfs mask must land on top,
   // or a project that contains one of these paths (a project that IS $HOME,
@@ -155,17 +167,12 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     if (rt === hm || rt === pr) {
       throw new Error(`launch: runtime must not be ${rt === hm ? 'HOME' : 'the project dir'} itself (its sockets cannot be hidden there)`);
     }
-    const inside = (base) => {
-      const rel = relative(base, rt);
-      return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
-    };
-    if (inside(hm) || inside(pr)) args.push('--tmpfs', rt);
-    // Real-tree mask as well: the sandbox shows the REAL tree (symlinks
-    // resolved), so a runtime passed as a symlink from outside $HOME/proj
-    // can still land inside it and stay visible through the ro-binds. The
-    // lexical mask above covers the spelling bwrap is given; this one covers
-    // the sandbox-visible spelling join(home, relative(realHome, realRt))
-    // (likewise proj). Both masks are cheap; keep both.
+    // Mask the sandbox-visible spelling join(home, relative(realHome, realRt))
+    // (likewise proj): where nothing is a symlink this IS the lexical path,
+    // so no separate lexical mask is needed. The sandbox shows the REAL tree
+    // (symlinks resolved), so a runtime passed as a symlink from outside
+    // $HOME/proj can still land inside it and stay visible through the
+    // ro-binds — this one mask covers both spellings.
     const realRt = realPathOf(rt);
     const realHm = realPathOf(hm);
     const realPr = realPathOf(pr);

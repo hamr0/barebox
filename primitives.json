@@ -4,10 +4,10 @@
     {
       "name": "commitOverlay",
       "category": "overlay",
-      "when": "Reach for this to press one run's tracing paper down: it copies the sandbox's added and modified files into the project and applies its deletions, refusing loudly on mid-run conflicts.",
+      "when": "Reach for this to press one run's tracing paper down: it stages the sandbox's changes and swaps them into the project by rename, refusing loudly on mid-run conflicts.",
       "import": "import { commitOverlay } from 'barebox'",
       "signature": "commitOverlay(opts: object) => {committed: string[], skipped: {path: string, reason: string}[]}",
-      "fails": "Throws (writing nothing) when any changed file was also changed in the project mid-run, unless onConflict is `skip`; throws on unsupported file kinds and on a project that moved mid-commit. Unwritable destinations fail the preflight (writing nothing); a failure that still strikes mid-commit restores every stashed original and throws `SBX_COMMIT_FAILED` carrying exactly which paths were `applied`, `restored`, and `unapplied`. Setuid/setgid bits are stripped from committed modes; mtimes are not preserved (fresh on commit — conflict detection uses content hashes, never mtimes).",
+      "fails": "Throws (writing nothing) when any changed file was also changed in the project mid-run, unless onConflict is `skip`; throws on unsupported file kinds and on a project that moved mid-commit. A phase-2 failure undoes every journaled step: a full undo reports `nothing was applied`, a partial one throws `SBX_COMMIT_FAILED` listing exactly the steps not undone and keeping the commit folder (originals in `old/`) named in the error. Setuid/setgid bits are stripped from committed modes; mtimes are not preserved. A killed commit leaves a folder that blocks the next diff/commit/setup until removed.",
       "example": "import { commitOverlay } from \"barebox\";\nconst { committed, skipped } = commitOverlay({ runtime: \"/tmp/sbx-abc\", agent: \"agent\" });\nconsole.log(`committed ${committed.length} file(s), skipped ${skipped.length}`);"
     },
     {
@@ -25,7 +25,7 @@
       "when": "Reach for this to review one run's tracing paper: it lists every file the sandboxed run added, modified or deleted, flagging the ones the project changed meanwhile.",
       "import": "import { diffOverlay } from 'barebox'",
       "signature": "diffOverlay(opts: object) => OverlayChange[]",
-      "fails": "Throws when no overlay exists for the agent, when the project is gone, or when the overlay view cannot be mounted; never writes anything.",
+      "fails": "Throws when no overlay exists for the agent, when the project is gone, when a leftover commit folder blocks, or when the overlay view cannot be mounted; never writes anything.",
       "example": "import { diffOverlay } from \"barebox\";\nconst changes = diffOverlay({ runtime: \"/tmp/sbx-abc\", agent: \"agent\" });\nfor (const c of changes) console.log(c.status, c.path, c.conflict ? \"(CONFLICT)\" : \"\");"
     },
     {
@@ -34,7 +34,7 @@
       "when": "Reach for this to HARNESS-ONLY start one sandboxed agent run: it creates the sandbox the agent lives in. It does not decide anything; combine with the proxy for the front door and the gate (M3) for policy. Pass overlay:true for a writable tracing-paper run (M4). The agent starts in the project dir.",
       "import": "import { launch } from 'barebox'",
       "signature": "launch(opts: object) => ChildProcess",
-      "fails": "Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent), or with overlay on when the runtime sits inside the project or uncommitted changes linger. The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.",
+      "fails": "Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on a non-integer `proxyPort`, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent), or with overlay on when the runtime sits inside the project or uncommitted changes linger. The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.",
       "example": "import { launch } from \"barebox\";\nconst child = launch({ runtime: \"/tmp/sbx\", agent: \"fx\", proj: \"/tmp/proj\", command: [\"bash\", \"-c\", \"echo hi\"] });\nawait new Promise((r) => child.on(\"close\", r)); // child.exitCode === 0"
     },
     {
@@ -42,7 +42,7 @@
       "category": "overlay",
       "when": "Reach for this to throw one run's tracing paper away: it drops every sandboxed change and leaves the project exactly as it was.",
       "import": "import { rollbackOverlay } from 'barebox'",
-      "signature": "rollbackOverlay(opts: object) => {discarded: OverlayChange[]}",
+      "signature": "rollbackOverlay(opts: object) => {discarded: OverlayChange[], exact: boolean}",
       "fails": "Throws when no overlay exists for the agent; dropping the upper never touches the project.",
       "example": "import { rollbackOverlay } from \"barebox\";\nconst { discarded } = rollbackOverlay({ runtime: \"/tmp/sbx-abc\", agent: \"agent\" });\nconsole.log(`discarded ${discarded.length} change(s)`);"
     },

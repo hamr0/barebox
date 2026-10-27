@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { execFile as execFileCb, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, existsSync, statSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
@@ -1067,6 +1067,57 @@ describe('audit log secrets', () => {
       assert.match(text, /"hookRan":"req"/);
       assert.match(text, /\[redacted\]/);
       assert.ok(!text.includes(secret), 'secret must not survive the hook either');
+    } finally {
+      await tp.close();
+    }
+  });
+});
+
+describe('upstream fallback (2.1 item 1)', () => {
+  it('localhost reaches a 127.0.0.1 upstream when ::1 refuses', async () => {
+    // localhost resolves to ::1 first here; the fixture listens on 127.0.0.1
+    // only, so dialing just the first address gets ECONNREFUSED. The wall
+    // passes both under allowLoopback and the dial falls through to 127.0.0.1.
+    const r = await curl(`http://localhost:${plainUp.port}/?m=localhost`);
+    assert.equal(r.stdout, 'local-ok');
+    await waitLog(/m=localhost/, 'localhost request');
+  });
+});
+
+describe('audit log secrets, continued (2.1 items 3-4)', () => {
+  it('cookie and api-key headers leave no secret in logged req lines', async () => {
+    const session = `session=${process.pid}-secret`;
+    const apiKey = `key-${process.pid}-secret`;
+    const r = await curl('-H', `Cookie: ${session}`,
+      '-H', `X-Api-Key: ${apiKey}`,
+      `${plainUp.url}?m=cookiekey`);
+    assert.equal(r.stdout, 'local-ok');
+    await waitLog(/m=cookiekey/, 'cookiekey request');
+    const text = log();
+    assert.ok(!text.includes(session), 'cookie must not appear in the log');
+    assert.ok(!text.includes(apiKey), 'api key must not appear in the log');
+    const line = text.split('\n').find((l) => l.includes('m=cookiekey'));
+    assert.ok(line, 'cookiekey req line is logged');
+    assert.match(line, /\[redacted\]/);
+  });
+
+  it('an existing 0644 log is tightened to 0600 on start', async () => {
+    const logPath = join(RT, 'mitm-old.log');
+    writeFileSync(logPath, 'old line\n');
+    chmodSync(logPath, 0o644);
+    const tp = createProxy({ port: 0, certDir: join(RT, 'certs'),
+      logFile: logPath, runtime: RT,
+      clientIdleMs: 1000, allowLoopback: true });
+    try {
+      const { port } = await tp.ready;
+      await execA('curl', ['-s', '--max-time', '8', '-x', `http://127.0.0.1:${port}`,
+        `${plainUp.url}?m=oldlog`], { encoding: 'latin1' });
+      const oldLog = () => {
+        try { return readFileSync(logPath, 'latin1'); }
+        catch { return ''; }
+      };
+      await waitFor(() => /m=oldlog/.test(oldLog()), 'oldlog line');
+      assert.equal(statSync(logPath).mode & 0o777, 0o600);
     } finally {
       await tp.close();
     }

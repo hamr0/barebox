@@ -50,6 +50,14 @@ describe('launch validation (no sandbox needed)', () => {
       command: ['true'], socket: '/elsewhere.sock' }), /disagrees/);
   });
 
+  it('rejects a non-integer proxyPort before spawning (shell injection)', () => {
+    const base = { runtime: '/x', agent: 'a', proj: '/y', command: ['true'] };
+    assert.throws(() => launch({ ...base, proxyPort: '3128;touch /tmp/x' }), /proxyPort/);
+    assert.throws(() => launch({ ...base, proxyPort: 0 }), /proxyPort/);
+    assert.throws(() => launch({ ...base, proxyPort: 70000 }), /proxyPort/);
+    assert.throws(() => launch({ ...base, proxyPort: 3.5 }), /proxyPort/);
+  });
+
   it('fails loudly past the ~108-char socket path limit', () => {
     const rt = join(tmpdir(), `bb-long-${'d'.repeat(90)}`);
     assert.throws(() => launch({ runtime: rt, agent: 'agent', proj: '/y', command: ['true'] }),
@@ -151,6 +159,27 @@ describe('mount order for a project under $HOME (no sandbox needed)', () => {
       assert.ok(homeIdx >= 0 && projIdx >= 0, `binds missing in ${args.join(' ')}`);
       assert.ok(homeIdx < projIdx, `home bind must precede the project bind (got ${homeIdx} vs ${projIdx})`);
     } finally {
+      process.env.HOME = savedHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('always detaches the terminal (--new-session), even when stdin is a TTY', async () => {
+    // Pretend the caller sits at a terminal: the flag must not depend on it.
+    const root = mkdtempSync(join(tmpdir(), 'bb-mo-'));
+    const savedTty = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+    try {
+      const home = join(root, 'home');
+      const proj = join(home, 'proj');
+      const rt = join(root, 'rt');
+      mkdirSync(proj, { recursive: true });
+      process.env.HOME = home;
+      Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+      const args = await launchArgs({ runtime: rt, agent: 'ns', proj, command: ['true'] });
+      assert.ok(args.includes('--new-session'), `--new-session missing in ${args.join(' ')}`);
+    } finally {
+      if (savedTty) Object.defineProperty(process.stdin, 'isTTY', savedTty);
+      else delete process.stdin.isTTY;
       process.env.HOME = savedHome;
       rmSync(root, { recursive: true, force: true });
     }
@@ -261,6 +290,18 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     const c = launch({ runtime: rt, agent: 't0', proj, command: ['true'] });
     const r = await run(c);
     assert.equal(r.code, 0, r.err);
+  });
+
+  it('runs the agent in its own session, detached from our terminal', async () => {
+    // /proc/self/stat field 6 is the session id. Without --new-session the
+    // session leader lives outside the sandbox's pid namespace and reads as
+    // 0; with it the session starts inside, so the id is nonzero.
+    await listenSock('ts');
+    const c = launch({ runtime: rt, agent: 'ts', proj,
+      command: ['bash', '-c', 'read -r l </proc/self/stat; set -- ${l##*) }; echo "$4"'] });
+    const r = await run(c);
+    assert.equal(r.code, 0, r.err);
+    assert.notEqual(r.out.trim(), '0', 'agent shares the caller\'s session (no --new-session)');
   });
 
   it('masks locked drawers', async () => {

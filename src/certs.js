@@ -7,7 +7,8 @@ import { execFile } from 'node:child_process';
 import { mkdirSync, chmodSync, existsSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
-const HOST_RE = /^[A-Za-z0-9.-]+$/;
+/** Hostname/IP spelling both the mint cache and the proxy wall accept. Single definition (see proxy.js). */
+export const HOST_RE = /^[A-Za-z0-9.-]+$/;
 
 function sh(file, args) {
   return new Promise((resolve, reject) => {

@@ -207,8 +207,8 @@ function sleepMs(ms) {
 export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   maxBody = 1048576, runtime = null, onAsk = null, pollMs = DEFAULT_POLL_MS,
   onApprove, onDeny }) {
-  const decide = shouldHold
-    ?? ((req) => (match && new URL(req.url).pathname.includes(match) ? `path matches ${match}` : null));
+  // The default IS matchPath: one definition of the path-substring rule (see below).
+  const decide = shouldHold ?? (match ? matchPath(match) : () => null);
   /** @returns {number|null} */
   const deadlineMs = () => {
     if (timeoutMs === 'never') return null;

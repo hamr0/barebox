@@ -16,13 +16,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { lookup as dnsLookup } from 'node:dns/promises';
-import { ensureCA, certFor } from './certs.js';
+import { ensureCA, certFor, HOST_RE } from './certs.js';
 import { createHolds } from './holds.js';
 
 const AGENT = Symbol('agent');
 const SECURE = Symbol('secure');
 const IP_RE = /^\d+\.\d+\.\d+\.\d+$/;
-const HOST_RE = /^[A-Za-z0-9.-]+$/;
 const AGENT_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
 // Linux sun_path: 108 bytes including the NUL.
 const MAX_SOCK_PATH = 107;
@@ -36,7 +35,9 @@ const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
 // user's `redact` hook runs after this scrubbing, so it sees (and further
 // shapes) an already-safe entry. Bodies stay logged as-is.
 const REDACTED = '[redacted]';
-const SENSITIVE_HEADERS = new Set(['authorization', 'proxy-authorization']);
+// Interim set (M3 replaces this with bareguard's `secrets` redaction): header names whose values never land verbatim.
+const SENSITIVE_HEADERS = new Set(['authorization', 'proxy-authorization',
+  'cookie', 'set-cookie', 'x-api-key', 'x-auth-token', 'api-key']);
 
 /**
  * Copy a log entry with sensitive header values replaced by `[redacted]`.
@@ -166,14 +167,33 @@ async function resolveAllUpstream(host, stub) {
 }
 
 /**
+ * Order resolved addresses with IPv4 and IPv6 interleaved, keeping DNS order within each family.
+ *
+ * @param {string[]} ips resolved addresses, already checked against the wall
+ * @returns {string[]} dial order, starting with the family DNS listed first
+ */
+function interleaveIps(ips) {
+  const v4 = ips.filter((ip) => net.isIP(ip) !== 6);
+  const v6 = ips.filter((ip) => net.isIP(ip) === 6);
+  const [first, second] = net.isIP(ips[0]) === 6 ? [v6, v4] : [v4, v6];
+  const out = [];
+  while (first.length || second.length) {
+    if (first.length) out.push(/** @type {string} */ (first.shift()));
+    if (second.length) out.push(/** @type {string} */ (second.shift()));
+  }
+  return out;
+}
+
+/**
  * The wall: resolve every answer, then default-deny loopback/link-local/
  * host-local/private unless the test-only opt-ins allow it. Denies when ANY
- * answer is walled, denies unresolvable names, and pins the first checked IP
- * so the dial below cannot resolve the name a second time (no rebinding).
+ * answer is walled, denies unresolvable names, and pins every checked IP so
+ * the dial below tries them in order without resolving a second time (no
+ * rebinding, with fallback when the first address refuses).
  *
  * @param {string} host CONNECT/request hostname
  * @param {{ allowLoopback: boolean, allowUpstream: ((host: string, ip: string) => boolean) | null, resolveUpstream?: (host: string) => Promise<string[] | string | null> }} gate
- * @returns {Promise<{ ok: true, ip: string } | { ok: false, ip: string, reason: string }>}
+ * @returns {Promise<{ ok: true, ips: string[] } | { ok: false, ip: string, reason: string }>}
  */
 async function checkUpstream(host, gate) {
   const ips = await resolveAllUpstream(host, gate.resolveUpstream);
@@ -192,7 +212,7 @@ async function checkUpstream(host, gate) {
       return { ok: false, ip, reason: `${kind} upstream denied: ${where}` };
     }
   }
-  return { ok: true, ip: ips[0] };
+  return { ok: true, ips: interleaveIps(ips) };
 }
 
 /**
@@ -361,6 +381,10 @@ export function createProxy(opts) {
   const holdMaxBody = hold?.maxBody ?? 1048576;
 
   const logStream = fs.createWriteStream(logFile, { flags: 'a', mode: 0o600 });
+  // `mode` applies only at creation: a 0644 log from an older run would stay
+  // world-readable while new lines append, so fix it up on every start. A
+  // not-yet-created file throws here and is created 0600 by the stream.
+  try { fs.chmodSync(logFile, 0o600); } catch {}
   const log = (o) => { logStream.write(JSON.stringify(redact(scrubSecrets(o))) + '\n'); };
   let trust = null;
   if (upstreamCa) {
@@ -419,9 +443,9 @@ export function createProxy(opts) {
     }
     // Sync from here: forwardInner answers every failure itself, but a
     // throw before it can answer must still be loud, never a floating reject.
-    // The dial is pinned to the checked IP: no second DNS resolution.
+    // The dial is pinned to the checked IPs: no second DNS resolution.
     try {
-      forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIp: verdict.ip });
+      forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIps: verdict.ips });
     } catch (e) {
       // The live stream arrives paused (see handleRequest): unpause so no
       // paused stream leaks on this path.
@@ -431,8 +455,8 @@ export function createProxy(opts) {
     }
   }
 
-  /** @param {ForwardArgs & { u: URL, upstreamIp?: string }} args */
-  function forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIp }) {
+  /** @param {ForwardArgs & { u: URL, upstreamIps: string[] }} args */
+  function forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIps }) {
     const sock = cres.socket;
     if (!sock) return; // no transport left to answer on
     const secure = u.protocol === 'https:';
@@ -441,21 +465,31 @@ export function createProxy(opts) {
     for (const [k, v] of Object.entries(headers)) {
       if (!HOP_REQ.has(k.toLowerCase())) fwdHeaders[k] = v;
     }
-    const pinned = upstreamIp && net.isIP(upstreamIp) ? upstreamIp : null;
+    const pinned = (upstreamIps ?? []).filter((ip) => net.isIP(ip));
     const mod = secure ? https : http;
     const up = mod.request({
       host: u.hostname,
       port: u.port ? parseInt(u.port, 10) : (secure ? 443 : 80),
-      // Pinned dial: answer from the checked IP, never DNS again. Node asks
-      // with `{ all: true }`, which wants an array back (not the triple).
-      ...(pinned ? { lookup: (h, o, cb) => {
-        const fn = typeof o === 'function' ? o : cb;
-        const opts = typeof o === 'function' ? {} : (o ?? {});
-        const fam = net.isIP(pinned);
+      // Pinned dial: answer from the checked IPs, never DNS again. Node asks
+      // with `{ all: true }` and attempts every address (Happy Eyeballs: a
+      // refused address falls through to the next, each attempt short-timed);
+      // otherwise the first pinned address answers alone. A custom socket
+      // cannot serve here: the TLS stack will not handshake over one.
+      ...(pinned.length ? { lookup: (h, o, cb) => {
+        const done = /** @type {(err: unknown, ...rest: unknown[]) => void} */ (typeof o === 'function' ? o : cb);
+        /** @param {string} ip */
+        const fam = (ip) => net.isIP(ip);
         try {
-          if (opts && opts.all) fn(null, [{ address: pinned, family: fam }]);
-          else fn(null, pinned, fam);
-        } catch (e) { try { /** @type {(err: unknown) => void} */ (fn)(e); } catch {} }
+          const opts = typeof o === 'function' ? {} : (o ?? {});
+          if (opts && /** @type {{ all?: boolean }} */ (opts).all) {
+            done(null, pinned.map((address) => ({ address, family: fam(address) })));
+          } else {
+            const first = /** @type {string} */ (pinned[0]);
+            done(null, first, fam(first));
+          }
+        } catch (e) {
+          done(e);
+        }
       } } : {}),
       ...(secure && !IP_RE.test(u.hostname) ? { servername: u.hostname } : {}),
       ...(secure && trust ? { ca: trust } : {}),
