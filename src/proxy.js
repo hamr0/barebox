@@ -384,6 +384,9 @@ export function createProxy(opts) {
     try {
       forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIp: verdict.ip });
     } catch (e) {
+      // The live stream arrives paused (see handleRequest): unpause so no
+      // paused stream leaks on this path.
+      try { stream?.resume(); } catch {}
       log({ ev: 'deny', agent, code: 502, note: `upstream failed: ${e.message}` });
       denyRes(cres, 502, `upstream failed: ${e.message}`);
     }
@@ -521,6 +524,13 @@ export function createProxy(opts) {
       return body;
     };
     if (!reason || !queue) {
+      // Pause before any body listener: the tee below would otherwise put
+      // the stream in flowing mode, and forward() awaits a second wall
+      // check before forwardInner pipes to upstream — body bytes arriving
+      // during that wait would go to the tee only, starving upstream
+      // against Content-Length. Buffered here, pipe() resumes the flow,
+      // so both the tee and upstream see the whole body.
+      creq.pause();
       creq.on('data', (c) => {
         size += c.length;
         if (size > maxLogBody || over) { over = true; return; }

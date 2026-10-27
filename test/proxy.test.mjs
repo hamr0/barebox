@@ -536,6 +536,25 @@ describe('dns rebinding wall (stubbed resolver)', () => {
     }
   });
 
+  it('POST body survives slow DNS: delayed stub still forwards the whole body', async () => {
+    // Race: the direct-forward path tees the body, then forward() awaits a
+    // second wall check. With a slow resolver the body arrives during that
+    // wait; it must still reach upstream whole, not just the log tee.
+    const marker = `marker=BODYRACE-${Date.now()}`;
+    const { p, url } = await stubProxy(async () => {
+      await new Promise((r) => setTimeout(r, 300));
+      return ['127.0.0.1'];
+    }, { allowLoopback: true, upstreamTimeoutMs: 3000 });
+    try {
+      const target = `${plainUp.url}?m=bodyrace`.replace('http://127.0.0.1', 'http://slowdns.test');
+      const r = await execA('curl', ['-s', '--max-time', '10', '-x', url,
+        '--data', marker, target], { encoding: 'latin1' });
+      assert.equal(r.stdout, marker);
+    } finally {
+      await p.close();
+    }
+  });
+
   it('the dial is pinned to the checked IP: later DNS answers are never used', async () => {
     let calls = 0;
     const before = plainUp.hits.get('/') ?? 0;
