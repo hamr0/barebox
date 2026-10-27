@@ -81,6 +81,12 @@ jobs:
         run: npm run check:lockfile --if-present
       - name: Typecheck
         run: npm run typecheck --if-present
+      # Same runner deps as ci.yml: the sandbox suites need bwrap + socat, and
+      # Ubuntu's AppArmor blocks unprivileged user namespaces unless relaxed.
+      - name: Install sandbox runner deps
+        run: |
+          sudo apt-get install -y bubblewrap socat curl openssl
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Test
         run: npm test --if-present
       - name: Skip if this version is already on npm
