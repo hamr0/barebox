@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Working name: TBD (see Open questions).
-> Status: M2 PASS Oct 26 (local hold matrix, all six scenarios); M3 next. Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M2 PASS Oct 26 (local hold matrix, all nine scenarios); graduation rewrite next (not M3). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 – Nov 4 2026 (10 days). Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -221,6 +221,7 @@ Signed off by the user.
 | Locked paths (M0) | `~/.ssh`, `~/secrets`, `~/.mozilla`, `~/.config/chromium`, `~/.gnupg`. More later without changing the walls. |
 | Browser agents + Jev | Out of v1. Demo A uses an API, not a browser. |
 | M0 harness | 20× idle sandboxes (`sleep` + `socat`, no real agent) for walls-only overhead ≤ 10 MB each; bypass set = unset proxy env, `--noproxy`, direct curl to IP. Real-agent and TLS memory come in M1/M6. |
+| API surface | CLI for sure plus programmatic APIs for spawning sandboxed workflows (goal: spawn workflows in a sandbox easily). |
 
 ### Why own walls (option B)
 

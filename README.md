@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/status-POC-c0841a" alt="status: POC">
 </p>
 
-> **Status:** POC. The walls (M0) and HTTPS inspection (M1) are proven and measured; hold-and-ask (M2) is next. The npm package is a name reservation — the API lands with the graduation rewrite after M2. Linux only.
+> **Status:** POC. The walls (M0), HTTPS inspection (M1), and hold-and-ask (M2) are proven and measured. The npm package is a name reservation — the API lands with the graduation rewrite next. Linux only.
 
 ## Why
 
