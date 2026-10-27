@@ -233,6 +233,34 @@ describe('buildCaBundle (no sandbox needed)', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('a present bundle is reused, not rewritten (5.3)', () => {
+    // The CA doesn't change during a runtime's life: 20 agents launching at
+    // once build the bundle once. A second CA must not replace the first.
+    const root = mkdtempSync(join(tmpdir(), 'bb-ca2-'));
+    try {
+      const mkCa = (cn, keyN, pemN) => {
+        execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+          '-keyout', join(root, keyN), '-out', join(root, pemN), '-days', '1',
+          '-subj', `/CN=${cn}`], { stdio: 'ignore' });
+        return join(root, pemN);
+      };
+      const ca1 = mkCa('bb-test-ca-1', 'ca1.key', 'ca1.pem');
+      const ca2 = mkCa('bb-test-ca-2', 'ca2.key', 'ca2.pem');
+      const rt = join(root, 'rt');
+      const out = buildCaBundle(rt, ca1);
+      assert.ok(out.endsWith('ca-bundle.pem'), 'still reports the bundle path');
+      const first = readFileSync(out, 'utf8');
+      assert.ok(first.includes(readFileSync(ca1, 'utf8').trim()), 'first CA in the bundle');
+      const again = buildCaBundle(rt, ca2);
+      assert.equal(again, out, 'same path back');
+      const second = readFileSync(out, 'utf8');
+      assert.equal(second, first, 'not rewritten');
+      assert.ok(!second.includes(readFileSync(ca2, 'utf8').trim()), 'second CA ignored');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {

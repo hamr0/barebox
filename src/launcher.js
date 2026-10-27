@@ -4,8 +4,8 @@
 // `overlay:true` mounts the M4 tracing paper over it (see overlay.js).
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join, relative, isAbsolute } from 'node:path';
-import { socketPathForAgent, assertAgentName, realPathOf } from './proxy.js';
+import { join, relative, dirname } from 'node:path';
+import { assertAgentName, isInside, realPathOf, runtimePaths } from './runtime.js';
 import { setupOverlay } from './overlay.js';
 
 // Locked drawers: masked with an empty tmpfs wherever they exist.
@@ -39,13 +39,16 @@ const CA_ENV_VARS = ['SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS', 'REQUESTS_CA_BUNDLE
  * @returns {string} path of the combined bundle inside `runtime`
  */
 export function buildCaBundle(runtime, caFile) {
+  const out = join(runtime, 'ca-bundle.pem');
+  // Once per runtime: the CA doesn't change during a runtime's life, so a
+  // present bundle is reused (20 agents launching at once build it once).
+  if (existsSync(out)) return out;
   const ca = readFileSync(caFile, 'utf8');
   if (!ca.includes('BEGIN CERTIFICATE')) throw new Error(`buildCaBundle: no cert in ${caFile}`);
   let sys = '';
   for (const p of SYSTEM_BUNDLES) {
     if (existsSync(p)) { sys = readFileSync(p, 'utf8'); break; }
   }
-  const out = join(runtime, 'ca-bundle.pem');
   mkdirSync(runtime, { recursive: true });
   writeFileSync(out, `${sys}${sys.endsWith('\n') || !sys ? '' : '\n'}${ca}`);
   return out;
@@ -71,10 +74,9 @@ export function buildCaBundle(runtime, caFile) {
  * @param {object} [opts.extraEnv] extra environment entries for the inside
  * @param {string|null} [opts.socket] agent socket path, as returned by `proxy.addAgent` (default `<runtime>/socks/<agent>.sock`; the two must agree)
  * @param {string|null} [opts.caFile] barebox CA cert path (from `proxy.caFile`); when set, the sandbox trusts it for HTTPS alongside the system roots
- * @param {boolean} [opts.overlay] when true, mount a per-run overlay upper over the project (M4 tracing paper) instead of binding it read-only; the child carries `.overlay` (`{upper, work}`) for diff/commit/rollback
+ * @param {boolean} [opts.overlay] when true, mount a per-run overlay upper over the project (M4 tracing paper) instead of binding it read-only; diff/commit/rollback address it as `runtimePaths(runtime).overlay(agent)`
  * @param {string[]} [opts.overlayIgnore] path segments invisible to the overlay (default `node_modules`; see overlay.js Q3)
  * @returns {import('node:child_process').ChildProcess} the bwrap child (stdio piped); `close` gives its exit code
- * Carries `.overlay` (`{upper, work}`) when `overlay` is on.
  * @when Reach for this to HARNESS-ONLY start one sandboxed agent run: it creates the sandbox the agent lives in. It does not decide anything; combine with the proxy for the front door and the gate (M3) for policy. Pass overlay:true for a writable tracing-paper run (M4). The agent starts in the project dir.
  * @fails Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on a non-integer `proxyPort`, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent), or with overlay on when the runtime sits inside the project or uncommitted changes linger. The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.
  * @example
@@ -94,22 +96,17 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   }
   assertAgentName(agent);
   // The socket IS the identity: both sides must name the same path.
-  const expected = socketPathForAgent(runtime, agent);
+  const expected = runtimePaths(runtime).socket(agent);
   const sock = socket ?? expected;
   if (sock !== expected) throw new Error(`launch: socket ${sock} disagrees with ${expected}`);
-  mkdirSync(join(runtime, 'socks'), { recursive: true });
+  mkdirSync(dirname(expected), { recursive: true });
   /** @type {{upper: string, work: string} | null} */
   let ov = null;
   if (overlay) {
     // The upper/work dirs live under the runtime: a runtime inside the
     // project would put them inside their own lower, which overlayfs
     // forbids — so that layout throws here, before anything is snapshotted.
-    // (Lexical like the mask block below: bwrap sees these same spellings.)
-    const under = (base, target) => {
-      const rel = relative(base, target);
-      return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
-    };
-    if (under(join(proj), join(runtime)) || under(realPathOf(join(proj)), realPathOf(join(runtime)))) {
+    if (isInside(proj, runtime)) {
       throw new Error('launch: runtime must not be inside the project dir when overlay is on (the upper would sit inside its own lower)');
     }
     ov = setupOverlay({ runtime, agent, proj, ignore: overlayIgnore });
@@ -158,34 +155,29 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   // runtime path does not close the front door.) These masks stay after the
   // project and locked mounts: where paths overlap, the later mount wins.
   {
-    // Lexical on purpose: bwrap sees these same spellings, so the mask
-    // lands on the path the sandbox actually shows. (`resolve` would
-    // follow symlinks and can name a path the sandbox never displays.)
-    const rt = join(runtime);
+    // bwrap sees these same spellings, so the mask lands on the path the
+    // sandbox actually shows. The sandbox shows the REAL tree (symlinks
+    // resolved), so a runtime passed as a symlink from outside $HOME/proj
+    // can still land inside it and stay visible through the ro-binds — the
+    // mask below covers that spelling too.
     const hm = join(home);
     const pr = join(proj);
-    if (rt === hm || rt === pr) {
-      throw new Error(`launch: runtime must not be ${rt === hm ? 'HOME' : 'the project dir'} itself (its sockets cannot be hidden there)`);
-    }
-    // Mask the sandbox-visible spelling join(home, relative(realHome, realRt))
-    // (likewise proj): where nothing is a symlink this IS the lexical path,
-    // so no separate lexical mask is needed. The sandbox shows the REAL tree
-    // (symlinks resolved), so a runtime passed as a symlink from outside
-    // $HOME/proj can still land inside it and stay visible through the
-    // ro-binds — this one mask covers both spellings.
-    const realRt = realPathOf(rt);
+    const realRt = realPathOf(join(runtime));
     const realHm = realPathOf(hm);
     const realPr = realPathOf(pr);
+    // One real-path comparison: a lexically-equal spelling resolves to the
+    // same real path, so it is subsumed here.
     if (realRt === realHm || realRt === realPr) {
       throw new Error(`launch: runtime must not be ${realRt === realHm ? 'HOME' : 'the project dir'} itself (its sockets cannot be hidden there)`);
     }
-    const realInside = (realBase, baseSpelling) => {
-      const rel = relative(realBase, realRt);
-      if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) return null;
-      return join(baseSpelling, rel);
-    };
-    for (const m of [realInside(realHm, hm), realInside(realPr, pr)]) {
-      if (m && !args.includes(m)) args.push('--tmpfs', m);
+    // Mask the sandbox-visible spelling join(home, relative(realHome, realRt))
+    // (likewise proj): where nothing is a symlink this IS the lexical path,
+    // so no separate lexical mask is needed.
+    for (const [realBase, baseSpelling] of [[realHm, hm], [realPr, pr]]) {
+      if (realRt !== realBase && isInside(realBase, realRt)) {
+        const m = join(baseSpelling, relative(realBase, realRt));
+        if (!args.includes(m)) args.push('--tmpfs', m);
+      }
     }
   }
   args.push(
@@ -218,10 +210,7 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     '[ -n "$ok" ] || exit 99; exec "$@"';
   const child = spawn('bwrap', [...args, '/usr/bin/bash', '-c', inner, 'bash', ...command],
     { stdio: ['ignore', 'pipe', 'pipe'] });
-  if (ov) {
-    // Address of this run's tracing paper for diff/commit/rollback.
-    const anyChild = /** @type {unknown} */ (child);
-    /** @type {{ overlay?: { upper: string, work: string } }} */ (anyChild).overlay = { ...ov };
-  }
+  // No `.overlay` on the child: the tracing paper's address is one call,
+  // `runtimePaths(runtime).overlay(agent)`, so there is nothing to keep in sync.
   return child;
 }

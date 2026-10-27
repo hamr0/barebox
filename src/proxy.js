@@ -18,13 +18,11 @@ import path from 'node:path';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { ensureCA, certFor, HOST_RE } from './certs.js';
 import { createHolds } from './holds.js';
+import { runtimePaths } from './runtime.js';
 
 const AGENT = Symbol('agent');
 const SECURE = Symbol('secure');
 const IP_RE = /^\d+\.\d+\.\d+\.\d+$/;
-const AGENT_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
-// Linux sun_path: 108 bytes including the NUL.
-const MAX_SOCK_PATH = 107;
 // Hop-by-hop headers must not be forwarded: node's HTTP stack re-frames.
 const HOP_REQ = new Set(['proxy-connection', 'proxy-authorization']);
 const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
@@ -64,9 +62,9 @@ function scrubSecrets(entry) {
  // 100.64/10, IPv6 ULA fc00::/7). The check runs AFTER DNS resolution, so a
  // hostname that resolves to 127.0.0.1 is denied exactly like the literal.
  // Unresolvable names are denied too (fail closed, never 502-then-dial).
-// Only `allowLoopback` (loopback + unspecified) or `allowUpstream(host, ip)`
-// lets a denied destination through; only tests pass those. There is no
-// allowPrivate flag: a private destination passes only via `allowUpstream`.
+// Only the TEST-ONLY `unsafeTestOnly.allowLoopback` (loopback + unspecified)
+// lets a denied destination through; only tests pass it. There is no
+// allowPrivate flag and no per-host escape hatch: the wall is default-deny.
 
 /** Strip brackets/scope, lowercase: one spelling per address. */
 function normIp(ip) {
@@ -192,7 +190,7 @@ function interleaveIps(ips) {
  * rebinding, with fallback when the first address refuses).
  *
  * @param {string} host CONNECT/request hostname
- * @param {{ allowLoopback: boolean, allowUpstream: ((host: string, ip: string) => boolean) | null, resolveUpstream?: (host: string) => Promise<string[] | string | null> }} gate
+ * @param {{ allowLoopback: boolean, resolveUpstream?: (host: string) => Promise<string[] | string | null> }} gate
  * @returns {Promise<{ ok: true, ips: string[] } | { ok: false, ip: string, reason: string }>}
  */
 async function checkUpstream(host, gate) {
@@ -201,11 +199,6 @@ async function checkUpstream(host, gate) {
     return { ok: false, ip: host, reason: `unresolvable upstream denied: ${host}` };
   }
   for (const ip of ips) {
-    if (typeof gate.allowUpstream === 'function') {
-      let pass = false;
-      try { pass = gate.allowUpstream(host, ip) === true; } catch { pass = false; }
-      if (pass) continue;
-    }
     const kind = denyReasonForIp(ip, gate.allowLoopback);
     if (kind) {
       const where = ip === host ? host : `${host} (${ip})`;
@@ -216,79 +209,21 @@ async function checkUpstream(host, gate) {
 }
 
 /**
- * Check an agent name before it reaches the filesystem.
- *
- * @param {string} name agent name
- * @returns {void} throws on `../` and friends
- */
-export function assertAgentName(name) {
-  if (!AGENT_RE.test(name || '')) {
-    throw new Error(`bad agent name ${JSON.stringify(name)}: must match ${AGENT_RE}`);
-  }
-}
-
-/**
- * Resolve symlinks through the nearest existing ancestor: socket paths may
- * not exist yet, so `realpathSync` on the full path would throw. Walks up
- * to the first existing ancestor, resolves that, then re-attaches the rest.
- *
- * @param {string} p any path, existing or not
- * @returns {string} the real (symlink-free) spelling of `p`
- */
-export function realPathOf(p) {
-  const abs = path.resolve(p);
-  let cur = abs;
-  /** @type {string[]} */
-  const rest = [];
-  while (!fs.existsSync(cur)) {
-    const parent = path.dirname(cur);
-    if (parent === cur) break;
-    rest.unshift(path.basename(cur));
-    cur = parent;
-  }
-  const real = fs.realpathSync(cur);
-  return rest.length ? path.join(real, ...rest) : real;
-}
-
-/**
- * The one path both sides agree on: the proxy listens here, the launcher
- * binds it into the sandbox. This function is the single writer of the shape.
- *
- * @param {string} runtime runtime dir
- * @param {string} name agent name
- * @returns {string} `<runtime>/socks/<name>.sock`
- */
-export function socketPathForAgent(runtime, name) {
-  assertAgentName(name);
-  const p = path.join(runtime, 'socks', `${name}.sock`);
-  if (p.length > MAX_SOCK_PATH) {
-    throw new Error(`agent socket path too long (${p.length} > ${MAX_SOCK_PATH}): ${p}`);
-  }
-  return p;
-}
-
-/**
  * Options for {@link createProxy}.
  *
  * @typedef {object} ProxyOptions
  * @property {string} logFile JSON-lines log path (`req`, `resp`, `deny`, `hold`, `decide`, `hold-abandoned`)
- * @property {string} [certDir] dir for the CA + minted host certs (default `<runtime>/certs`).
- *   Must live inside `runtime` (compared via {@link realPathOf}, so symlinks
- *   cannot smuggle it out): anything else throws before any side effect.
- *   The CA private key lives here, and the sandbox bind-mounts only the
- *   runtime dir — an outside certDir would expose `ca.key` through the binds.
- * @property {string} [runtime] runtime dir; required for `addAgent`, default parent of `certDir`
+ * @property {string} runtime runtime dir; required. Holds the CA + minted host certs (`certs/`, see `runtime.js`), the agent sockets, and the hold queue files.
  * @property {number} [port] opt-in TCP listener for tests, bound to 127.0.0.1 only (default: none)
  * @property {string} [upstreamCa] extra PEM the proxy trusts for upstream TLS, on top of system roots
  * @property {HoldOptions} [hold] hold queue config, or omit to forward everything
  * @property {number} [upstreamTimeoutMs] give up on an upstream response after this (default 120000)
- * @property {boolean} [allowLoopback] TEST-ONLY opt-in: let loopback and unspecified
+ * @property {object} [unsafeTestOnly] TEST-ONLY escape hatch: everything under
+ *   it weakens the sandbox wall, so production omits it and tests name it loudly.
+ * @property {boolean} [unsafeTestOnly.allowLoopback] let loopback and unspecified
  *   destinations through (default false). Fixture servers listen on 127.0.0.1,
  *   so tests pass this; production never should.
- * @property {(host: string, ip: string) => boolean} [allowUpstream] escape hatch,
- *   consulted after DNS with each resolved IP: return true to let through a
- *   destination the default wall would deny. Only tests use this.
- * @property {(host: string) => Promise<string[] | string | null>} [resolveUpstream] TEST-ONLY
+ * @property {(host: string) => Promise<string[] | string | null>} [unsafeTestOnly.resolveUpstream]
  *   DNS stub: replaces the wall's resolver so rebinding is testable. Production omits it.
  * @property {number} [clientIdleMs] kill a client tunnel idle this long; never fires mid-request (default 60000)
  * @property {number} [maxLogBody] log at most this many request-body bytes, then `truncated: true` (default 1048576)
@@ -303,10 +238,11 @@ export function socketPathForAgent(runtime, name) {
  * @property {import('./holds.js').ShouldHold} [shouldHold] decision function; overrides `match`
  * @property {number|string} [timeoutMs] hold deadline in ms, or `'never'` (default 120000)
  * @property {number} [maxBody] bodies over this are denied at the door, never queued (default 1048576)
- * @property {import('./holds.js').OnAsk} [onAsk] ask seam (bareguard `humanChannel` shape).
+ * @property {import('./holds.js').OnAsk|null} [onAsk] ask seam (bareguard `humanChannel` shape).
  *   When present no files are involved; omit it for the default file checkpoint
  *   (`<runtime>/asks` + `<runtime>/answers`, `sbx pending/approve/deny`).
  * @property {number} [pollMs] answer poll interval in ms for the file checkpoint (default 250)
+ * @property {import('./holds.js').OnEvent} [onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle
  */
 
 /**
@@ -336,48 +272,26 @@ export function socketPathForAgent(runtime, name) {
  * @param {ProxyOptions} opts
  * @returns live proxy: `ready` resolves when listeners + CA are up; the shape is inferred, see `Proxy`
  * @when Reach for this HARNESS-ONLY to run the front door: it terminates agent TLS, sees every request, and parks the ones a human must decide. It decides nothing itself; pair with the launcher for sandboxes and `sbx` for decisions.
- * @fails Throws synchronously on a missing `logFile` (or neither `certDir` nor `runtime`). At runtime, dead upstreams, malformed input, over-cap and timed-out holds all become loud logged HTTP errors, never silence and never a crash. A second proxy on the same port rejects `ready`, never crashes the process.
+ * @fails Throws synchronously on a missing `logFile` or `runtime`. At runtime, dead upstreams, malformed input, over-cap and timed-out holds all become loud logged HTTP errors, never silence and never a crash. A second proxy on the same port rejects `ready`, never crashes the process.
  * @example
  * import { createProxy } from "barebox";
- * const proxy = createProxy({ port: 0, certDir: "./certs", logFile: "./mitm.log" });
+ * const proxy = createProxy({ port: 0, runtime: "./sbx-runtime", logFile: "./mitm.log" });
  * const { port } = await proxy.ready;
  * await proxy.close();
  */
 export function createProxy(opts) {
-  const { logFile, certDir: certDirOpt, runtime: runtimeOpt, port = null,
+  const { logFile, runtime, port = null,
     upstreamCa = null, hold = null,
     upstreamTimeoutMs = 120000, clientIdleMs = 60000,
-    allowLoopback = false, allowUpstream = null, resolveUpstream = null,
+    unsafeTestOnly = null,
     maxLogBody = 1048576, redact = (e) => e } = opts ?? {};
-  const gate = { allowLoopback, allowUpstream, resolveUpstream: resolveUpstream ?? undefined };
+  const { allowLoopback = false, resolveUpstream = null } = unsafeTestOnly ?? {};
+  const gate = { allowLoopback, resolveUpstream: resolveUpstream ?? undefined };
   if (!logFile) throw new Error('createProxy: logFile is required');
-  // The M2 control socket is gone (M2.5 file checkpoint): stale callers fail
-  // loud here, before any side effect, instead of silently losing decisions.
-  if (opts && typeof opts === 'object' && 'controlSocket' in opts && opts.controlSocket) {
-    throw new Error('createProxy: controlSocket was removed in M2.5; decisions now flow through the file checkpoint (<runtime>/asks + <runtime>/answers) or hold.onAsk');
-  }
-  if (hold && typeof hold === 'object' && 'controlSocket' in hold) {
-    throw new Error('createProxy: hold.controlSocket was removed in M2.5; decisions now flow through the file checkpoint (<runtime>/asks + <runtime>/answers) or hold.onAsk');
-  }
-  const runtime = runtimeOpt ?? (certDirOpt ? path.dirname(path.resolve(certDirOpt)) : null);
-  const dirOpt = certDirOpt ?? (runtime ? path.join(runtime, 'certs') : null);
-  if (!dirOpt) throw new Error('createProxy: certDir or runtime is required');
-  // The CA private key lives in certDir, and the launcher masks exactly
-  // the runtime dir: a certDir outside it would expose ca.key through the
-  // read-only binds. Same containment rule as the control socket above —
-  // fail closed here, before the log stream, CA read, or any listener.
-  // The default `<runtime>/certs` passes trivially.
-  if (!runtime) {
-    throw new Error(`createProxy: certDir must live inside the runtime, got ${dirOpt} with no runtime`);
-  }
-  {
-    const realRt = realPathOf(runtime);
-    const realCerts = realPathOf(dirOpt);
-    if (!realCerts.startsWith(realRt + path.sep)) {
-      throw new Error(`createProxy: certDir must live inside the runtime: ${realCerts} not under ${realRt}`);
-    }
-  }
-  const certDir = dirOpt;
+  if (typeof runtime !== 'string' || !runtime) throw new Error('createProxy: runtime is required');
+  // Always `<runtime>/certs`: one layout, owned by runtime.js, so there is
+  // nothing to contain and no check to fail.
+  const certDir = runtimePaths(runtime).certsDir;
   const holdMaxBody = hold?.maxBody ?? 1048576;
 
   const logStream = fs.createWriteStream(logFile, { flags: 'a', mode: 0o600 });
@@ -548,6 +462,7 @@ export function createProxy(opts) {
     runtime,
     onAsk: hold.onAsk,
     pollMs: hold.pollMs,
+    onEvent: hold.onEvent,
     onApprove: (h) => forward({ agent: h.agent, method: h.method, url: h.url,
       headers: h.headers, body: h.body, cres: h.cres }),
     onDeny: (h, reason) => denyRes(h.cres, 403, `denied: ${reason}`),
@@ -739,11 +654,10 @@ export function createProxy(opts) {
   ready.catch(() => {});
 
   function addAgent(name) {
-    if (!runtime) throw new Error('createProxy: addAgent needs the runtime option');
-    const sockPath = socketPathForAgent(runtime, name);
+    const sockPath = runtimePaths(runtime).socket(name);
     if (agentServers.has(name)) return sockPath;
     try { fs.unlinkSync(sockPath); } catch {}
-    fs.mkdirSync(path.join(runtime, 'socks'), { recursive: true });
+    fs.mkdirSync(path.dirname(sockPath), { recursive: true });
     const srv = net.createServer((sock) => {
       if (closed) { sock.destroy(); return; }
       admit(sock, name);
@@ -761,9 +675,7 @@ export function createProxy(opts) {
     if (!srv) return;
     agentServers.delete(name);
     srv.close();
-    if (runtime) {
-      try { fs.unlinkSync(socketPathForAgent(runtime, name)); } catch {}
-    }
+    try { fs.unlinkSync(runtimePaths(runtime).socket(name)); } catch {}
   }
 
   async function close() {

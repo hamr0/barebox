@@ -11,10 +11,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - M2.5 integration seam: `ask`, `auto` (the default) and `trust` modes with the card/payment floor in every mode; the `onAsk` seam plus the file-checkpoint ask channel (`asks/<id>.json` → `answers/<id>.json`, control socket deleted); `run()` wrapping proxy + launch; `sbx run [--mode ask|auto|trust] [--json] [--overlay]`; a 0600 JSONL audit log (bareguard's line shape deferred to M3).
 - M4 undo layer: per-run overlay tracing paper with `sbx diff` / `commit` / `rollback`, conflict flagging (refuse by default, `--skip-conflicts`), and `node_modules` invisibility (Q3). Diff walks the merged view with node inside the mount (no shell); `commit` stages into the project and swaps by journaled rename, undoing every step on failure (a full undo reports nothing was applied; a partial one names the steps not undone and keeps the commit folder with the originals); it strips setuid/setgid bits, and committed files get fresh mtimes. `rollback` reports diff's answer, or raw upper paths when the project is gone.
 - The agent always starts in the project dir.
+- The commit applies under read-only project folders (6.3).
+- Rollback always removes the overlay upper, whatever the agent left there (6.2).
+- The walker has no output cap, and node is resolved wherever it is installed (6.5, 6.6).
 
 ### Security
 
 - Ask and answer files are owner-only (0600); `sbx approve`/`deny` accept only `h<n>` ids; `sbx pending` and `sbx run` strip terminal control sequences from agent-controlled fields before printing.
+
+### Removed
+
+- Control socket (`createProxy`'s `controlSocket` option, `SBX_SOCK`): decisions flow through the file checkpoint (`<runtime>/asks` + `<runtime>/answers`) or `hold.onAsk`; the migration guards are deleted.
+- `createProxy`'s `certDir`. Certificates always live in `<runtime>/certs`, and `runtime` is now required.
+- `createProxy`'s `allowUpstream`. There is no escape hatch around the upstream wall.
+- `run()`'s `gate`, `match`, `shouldHold`, `pollMs`, `proxyPort` and `extraEnv`. Use `createProxy` + `launch` for low-level control.
+- The hold queue's `approve(id)`, `deny(id)` and `size()`, and `body` on `pending()` entries (the ask payload carries `bodyPreview`).
+- The library's `ASK OPEN <id>` write to stderr. The library never prints.
+
+### Changed
+
+- Test-only options moved under one key: `createProxy({ unsafeTestOnly: { allowLoopback, resolveUpstream } })`, `run({ unsafeTestOnly: { allowLoopback } })`. The CLI variable is renamed from `SBX_ALLOW_LOOPBACK` to `SBX_UNSAFE_TEST_ALLOW_LOOPBACK`.
+- `onEvent(e)` on `createHolds` / `createProxy`'s `hold` / `run()`: `{ type: 'ask', ask }` when a hold parks, `{ type: 'decided', id, decision, reason }` when it settles. `run()`'s `asks` result is built from these events.
+- Decisions are written as `allow` / `deny` everywhere, the audit log included. `approve` is still accepted, as an alias in answer files only.
+- `sbx` results go to stdout; every error, refusal and usage-on-error goes to stderr through `err`. `--help` stays on stdout, exit 0. Exit codes don't change. (Item 4 changed no output streams.)
 
 ## [0.2.0] - 2026-10-27
 

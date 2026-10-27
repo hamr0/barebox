@@ -1,0 +1,220 @@
+// Holds unit tests: decision normalization and the event channel, with no
+// proxy, sandbox, or sockets involved. The file channel works on a temp
+// runtime dir; the `onAsk` channel needs no runtime at all.
+import { describe, it, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHolds, normalizeDecision } from '../src/holds.js';
+
+async function waitFor(cond, what, timeoutMs = 5000) {
+  const t0 = Date.now();
+  for (;;) {
+    const v = await cond();
+    if (v) return v;
+    if (Date.now() - t0 > timeoutMs) throw new Error(`timed out waiting for: ${what}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
+describe('normalizeDecision (2.3)', () => {
+  it('allows allow, denies deny with its reason', () => {
+    assert.deepEqual(normalizeDecision({ decision: 'allow' }), { decision: 'allow' });
+    assert.deepEqual(normalizeDecision({ decision: 'allow', reason: 'whatever' }),
+      { decision: 'allow' });
+    assert.deepEqual(normalizeDecision({ decision: 'deny', reason: 'no' }),
+      { decision: 'deny', reason: 'no' });
+  });
+
+  it('defaults a missing reason to denied', () => {
+    assert.deepEqual(normalizeDecision({ decision: 'deny' }), { decision: 'deny', reason: 'denied' });
+    assert.deepEqual(normalizeDecision({ decision: 'deny', reason: '' }),
+      { decision: 'deny', reason: 'denied' });
+  });
+
+  it('accepts approve as an alias in answer files only', () => {
+    assert.deepEqual(normalizeDecision({ decision: 'approve' }, { approveAlias: true }),
+      { decision: 'allow' });
+    assert.equal(normalizeDecision({ decision: 'approve' }), null);
+  });
+
+  it('rejects everything else as not-a-decision', () => {
+    assert.equal(normalizeDecision({ decision: 'maybe' }, { approveAlias: true }), null);
+    assert.equal(normalizeDecision({}), null);
+    assert.equal(normalizeDecision(null), null);
+    assert.equal(normalizeDecision({ decision: 42 }), null);
+  });
+});
+
+describe('hold queue events (2.1, 2.2, 2.4)', () => {
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-hu-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** A queue recording log lines and events, deciding nothing by itself. */
+  function mkQueue(extra = {}) {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const logs = [];
+    const events = [];
+    const approved = [];
+    const denied = [];
+    const q = createHolds({
+      log: (o) => logs.push(o),
+      runtime: rt,
+      timeoutMs: 5000,
+      pollMs: 10,
+      onEvent: (e) => events.push(e),
+      onApprove: (h) => approved.push(h.id),
+      onDeny: (h, reason) => denied.push([h.id, reason]),
+      ...extra,
+    });
+    return { rt, logs, events, approved, denied, q };
+  }
+
+  const answer = (rt, id, obj) => {
+    const dir = join(rt, 'answers');
+    mkdirSync(dir, { recursive: true });
+    const tmp = join(dir, `.${id}.${process.pid}.tmp`);
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, join(dir, `${id}.json`));
+  };
+
+  const park = (q, note = 'test hold') => q.add({
+    agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
+    body: Buffer.from('m=1'), sock: {}, cres: {}, note,
+  });
+
+  it('a file answer parks then settles, reported as ask + decided', async () => {
+    const { rt, logs, events, approved, q } = mkQueue();
+    try {
+      const id = park(q);
+      await waitFor(() => events.length >= 1, 'ask event');
+      assert.equal(events[0].type, 'ask');
+      assert.equal(events[0].ask.id, id);
+      assert.equal(events[0].ask.rule, 'test hold');
+      answer(rt, id, { decision: 'allow' });
+      await waitFor(() => approved.length === 1, 'settle');
+      assert.deepEqual(events.map((e) => e.type), ['ask', 'decided']);
+      assert.deepEqual(events[1], { type: 'decided', id, decision: 'allow', reason: undefined });
+      const decide = logs.find((l) => l.ev === 'decide');
+      assert.equal(decide.decision, 'allow', 'the audit log speaks allow, never approve');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('approve in an answer file aliases allow', async () => {
+    const { rt, events, approved, q } = mkQueue();
+    try {
+      const id = park(q);
+      await waitFor(() => events.length >= 1, 'ask event');
+      answer(rt, id, { decision: 'approve' });
+      await waitFor(() => approved.length === 1, 'settle');
+      assert.equal(events[1].decision, 'allow');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('the timer is the only deadline: no answer denies on time', async () => {
+    const { events, denied, q } = mkQueue({ timeoutMs: 60 });
+    try {
+      const id = park(q);
+      await waitFor(() => denied.length === 1, 'timeout deny');
+      assert.deepEqual(denied, [[id, 'hold timeout']]);
+      assert.deepEqual(events.map((e) => e.type), ['ask', 'decided']);
+    } finally {
+      q.close();
+    }
+  });
+
+  it('an abandoned hold emits no decision; its late answer is stale', async () => {
+    const { rt, logs, events, denied, q } = mkQueue();
+    try {
+      const id = park(q);
+      await waitFor(() => events.length >= 1, 'ask event');
+      q.abandon(id);
+      assert.deepEqual(events.map((e) => e.type), ['ask'], 'no decided event for abandon');
+      assert.deepEqual(denied, [[id, 'client gone']]);
+      answer(rt, id, { decision: 'allow' });
+      await waitFor(() => logs.some((l) => l.ev === 'stale-answer'), 'stale-answer');
+      assert.deepEqual(events.map((e) => e.type), ['ask'], 'still no decision');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('pending() carries no bodies', async () => {
+    const { events, q } = mkQueue();
+    try {
+      park(q);
+      await waitFor(() => events.length >= 1, 'ask event');
+      const [h] = q.pending();
+      assert.ok(h.id && h.agent && h.method && h.url && h.rule);
+      assert.ok(!('body' in h), 'no whole-body status payload');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('onAsk approve is not an alias: garbage and approve deny', async () => {
+    for (const [raw, reason] of [
+      [{ decision: 'approve' }, 'denied'],
+      [{ decision: 'maybe' }, 'denied'],
+    ]) {
+      const seen = [];
+      const q = createHolds({
+        log: () => {},
+        onAsk: async () => raw,
+        onEvent: (e) => seen.push(e),
+        onApprove: () => { throw new Error('must not approve'); },
+        onDeny: () => {},
+      });
+      try {
+        q.add({
+          agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
+          body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'r',
+        });
+        const decided = await waitFor(() => seen.find((e) => e.type === 'decided'), 'decide');
+        assert.equal(decided.decision, 'deny');
+        assert.equal(decided.reason, reason);
+      } finally {
+        q.close();
+      }
+    }
+  });
+
+  it('a throwing onAsk denies with the failure', async () => {
+    const seen = [];
+    const q = createHolds({
+      log: () => {},
+      onAsk: async () => { throw new Error('boom'); },
+      onEvent: (e) => seen.push(e),
+      onApprove: () => { throw new Error('must not approve'); },
+      onDeny: () => {},
+    });
+    try {
+      q.add({
+        agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
+        body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'r',
+      });
+      const decided = await waitFor(() => seen.find((e) => e.type === 'decided'), 'decide');
+      assert.equal(decided.decision, 'deny');
+      assert.match(decided.reason ?? '', /onAsk failed: boom/);
+    } finally {
+      q.close();
+    }
+  });
+
+  it('a misshapen onEvent is rejected', () => {
+    assert.throws(() => createHolds({
+      log: () => {}, runtime: join(root, 'rt-x'), onEvent: 'yes',
+      onApprove: () => {}, onDeny: () => {},
+    }), /onEvent/);
+  });
+});

@@ -17,6 +17,7 @@ import { promisify } from 'node:util';
 import {
   mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync,
   lstatSync, readlinkSync, symlinkSync, chmodSync, rmSync, existsSync,
+  copyFileSync, realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -25,8 +26,9 @@ import { Writable } from 'node:stream';
 import net from 'node:net';
 import {
   setupOverlay, diffOverlay, commitOverlay, rollbackOverlay, undoJournal,
-  OverlayConflictError, DEFAULT_IGNORE,
+  finishFailedCommit, changedSince, fpNow, OverlayConflictError, DEFAULT_IGNORE,
 } from '../src/overlay.js';
+import { runtimePaths } from '../src/runtime.js';
 import { launch } from '../src/launcher.js';
 import { run } from '../src/run.js';
 
@@ -364,6 +366,25 @@ describe('commit and rollback (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_S
     rollbackOverlay({ runtime: rt, agent: 'c' });
   });
 
+  it('unchanged files and links are never staged: inodes survive the commit', () => {
+    // Item 4: only upper paths are staged, so an untouched 0400 file keeps
+    // its inode (no copy, no rename) and an untouched symlink keeps its target.
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    writeFileSync(join(proj, 'ro.txt'), 'read-only\n');
+    chmodSync(join(proj, 'ro.txt'), 0o400);
+    symlinkSync('keep.txt', join(proj, 'link.txt'));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'c', proj });
+    const ino = lstatSync(join(proj, 'ro.txt')).ino;
+    agentWrite({ ...ov, lower: proj, script: 'echo agent > "$M/edit.txt"' });
+    const res = commitOverlay({ runtime: rt, agent: 'c' });
+    assert.deepEqual(res, { committed: ['edit.txt'], skipped: [] });
+    assert.equal(lstatSync(join(proj, 'ro.txt')).ino, ino, 'untouched file keeps its inode');
+    assert.equal(lstatSync(join(proj, 'ro.txt')).mode & 0o7777, 0o400);
+    assert.equal(readlinkSync(join(proj, 'link.txt')), 'keep.txt', 'untouched link keeps its target');
+    assert.equal(readFileSync(join(proj, 'edit.txt'), 'utf8'), 'agent\n');
+  });
+
   it('a user-created file colliding with an add is a conflict', () => {
     const proj = mkproj(mkdtempSync(join(root, 'p-')));
     const rt = mkdtempSync(join(root, 'rt-'));
@@ -389,12 +410,419 @@ describe('commit and rollback (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_S
     setupOverlay({ runtime: rt, agent: 'c', proj });
     assert.deepEqual(
       withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'c' })),
-      { discarded: [], exact: true });
+      { discarded: [], exact: true, why: null });
   });
 
   it('rollback without an overlay throws', () => {
     const rt = mkdtempSync(join(root, 'rt-'));
     assert.throws(() => rollbackOverlay({ runtime: rt, agent: 'ghost' }), /no overlay/);
+  });
+});
+
+describe('rollback over unreadable uppers, 6.2 (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_SKIP }, () => {
+  // The agent leaves a mode-000 file or folder in the upper. Rollback is
+  // the escape hatch: it must never depend on what is in the upper, so its
+  // first step fixes permissions, then it reports and removes.
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-o62-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Fresh fixture with agent debris: a mode-000 file, or a mode-000 folder holding a file. */
+  function mkDebris(kind, agent) {
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const { upper } = setupOverlay({ runtime: rt, agent, proj });
+    if (kind === 'file') {
+      writeFileSync(join(upper, 'f'), 'x\n');
+      chmodSync(join(upper, 'f'), 0);
+    } else {
+      mkdirSync(join(upper, 'd'));
+      writeFileSync(join(upper, 'd', 'f'), 'x\n');
+      chmodSync(join(upper, 'd'), 0);
+    }
+    return { proj, rt, before: treeHash(proj) };
+  }
+
+  /** The next overlay run must be allowed: `true` exits on its own; awaiting its natural close is the assertion. Never SIGKILL here: killing bwrap mid-setup orphans its inner child on our pipes and `close` never fires. */
+  async function nextLaunchAllowed(rt, proj, agent) {
+    const child = launch({ runtime: rt, agent, proj, command: ['true'], overlay: true });
+    child.on('error', () => {});
+    await new Promise((r) => child.on('close', r));
+    rollbackOverlay({ runtime: rt, agent });
+  }
+
+  for (const kind of ['file', 'dir']) {
+    it(`rollback succeeds over a mode-000 ${kind} left by the agent`, { timeout: 60000 }, async () => {
+      const agent = `rb-${kind}`;
+      const { proj, rt, before } = mkDebris(kind, agent);
+      const res = rollbackOverlay({ runtime: rt, agent });
+      assert.equal(res.exact, true, 'chmod-first makes the exact diff report available');
+      assert.ok(!existsSync(join(rt, 'overlay', agent)), 'the overlay folder is gone');
+      await nextLaunchAllowed(rt, proj, agent);
+      assert.equal(treeHash(proj), before, 'the project is byte-for-byte unchanged');
+    });
+
+    it(`diff and commit refuse a mode-000 ${kind} loudly, naming it`, () => {
+      const agent = `rc-${kind}`;
+      const { proj, rt, before } = mkDebris(kind, agent);
+      const want = kind === 'file' ? 'f' : 'd';
+      for (const op of ['diff', 'commit']) {
+        let err = null;
+        try {
+          if (op === 'diff') diffOverlay({ runtime: rt, agent });
+          else commitOverlay({ runtime: rt, agent });
+        } catch (e) { err = e; }
+        assert.ok(err, `${op} must refuse the unreadable upper`);
+        assert.match(err.message, new RegExp(`cannot read ${want}\\b`),
+          `${op} names the path: ${err.message}`);
+        assert.match(err.message, /rollback/, `${op} suggests rollback: ${err.message}`);
+      }
+      assert.equal(treeHash(proj), before, 'the project is byte-for-byte unchanged');
+      assert.deepEqual(readdirSync(proj).filter((n) => n.startsWith('.sbx-commit-')), [],
+        'a refused commit leaves no staging folder');
+      rollbackOverlay({ runtime: rt, agent });
+    });
+  }
+});
+
+describe('the failed-commit decision, 6.4', () => {
+  // finishFailedCommit owns one decision: delete the staging folder only
+  // when the undo left nothing behind, otherwise keep it (old/ holds the
+  // only copy of the originals) and name it in the error.
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-o64-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('unit: a partial undo keeps the folder and names it with the steps', () => {
+    const commitDir = join(root, '.sbx-commit-1-aaaa');
+    mkdirSync(join(commitDir, 'old'), { recursive: true });
+    const err = Object.assign(
+      new Error(`sbx: commit failed at x (boom): not undone [aside y] ` +
+        `(originals are in ${join(commitDir, 'old')}; commit folder kept: ${commitDir})`),
+      { code: 'SBX_COMMIT_FAILED', notUndone: ['aside y'] });
+    assert.strictEqual(finishFailedCommit(commitDir, err), err, 'returns the error to throw');
+    assert.ok(existsSync(commitDir), 'the folder still exists');
+    assert.match(err.message, new RegExp(commitDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
+      'the error names the folder');
+    assert.match(err.message, /aside y/, 'the error lists the steps');
+  });
+
+  it('unit: a clean undo removes the folder', () => {
+    const commitDir = join(root, '.sbx-commit-2-bbbb');
+    mkdirSync(join(commitDir, 'old'), { recursive: true });
+    const err = Object.assign(
+      new Error('sbx: commit failed at x (boom; nothing was applied)'),
+      { code: 'SBX_COMMIT_FAILED', notUndone: [] });
+    assert.strictEqual(finishFailedCommit(commitDir, err), err);
+    assert.ok(!existsSync(commitDir), 'the folder is gone');
+  });
+
+  it('unit: a phase-1 refusal (no notUndone) removes the folder', () => {
+    const commitDir = join(root, '.sbx-commit-3-cccc');
+    mkdirSync(join(commitDir, 'new'), { recursive: true });
+    const err = new Error('sbx: commit refused: 1 file(s) changed in the project');
+    assert.strictEqual(finishFailedCommit(commitDir, err), err);
+    assert.ok(!existsSync(commitDir), 'the folder is gone');
+  });
+
+  it('through commitOverlay: a cleanly undone phase-2 failure leaves no staging folder',
+    { skip: BWRAP_OK ? false : BWRAP_SKIP }, () => {
+      // Replacing a folder that holds ignored content with a file is refused
+      // in phase 2, after journaled steps: the undo is clean, so the folder
+      // must be gone (deleting the decision would strand old/ instead).
+      const proj = mkdtempSync(join(root, 'p-'));
+      mkdirSync(join(proj, 'iw'), { recursive: true });
+      writeFileSync(join(proj, 'iw', 'y'), 'why\n');
+      mkdirSync(join(proj, 'iw', 'node_modules'), { recursive: true });
+      writeFileSync(join(proj, 'iw', 'node_modules', 'keep.js'), 'v1\n');
+      const rt = mkdtempSync(join(root, 'rt-'));
+      const ov = setupOverlay({ runtime: rt, agent: 'fc', proj });
+      agentWrite({ ...ov, lower: proj, script: 'rm -rf "$M/iw"; echo f > "$M/iw"' });
+      let err = null;
+      try {
+        commitOverlay({ runtime: rt, agent: 'fc' });
+      } catch (e) { err = e; }
+      assert.ok(err, 'the commit must fail');
+      assert.equal(err.code, 'SBX_COMMIT_FAILED');
+      assert.match(err.message, /nothing was applied/);
+      assert.deepEqual(readdirSync(proj).filter((n) => n.startsWith('.sbx-commit-')), [],
+        'no staging folder left behind');
+      rollbackOverlay({ runtime: rt, agent: 'fc' });
+    });
+});
+
+describe('commit-folder exclusion, 6.8.1 (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_SKIP }, () => {
+  // A `.sbx-commit-x` folder planted by the agent is invisible to the whole
+  // layer: without the exclusion it would be committed into the project and
+  // then block every later operation as a leftover.
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-o68-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a planted commit folder is invisible and does not block', () => {
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const { upper } = setupOverlay({ runtime: rt, agent: 'cx', proj });
+    mkdirSync(join(upper, '.sbx-commit-9-evil'), { recursive: true });
+    writeFileSync(join(upper, '.sbx-commit-9-evil', 'f'), 'x\n');
+    assert.deepEqual(diffOverlay({ runtime: rt, agent: 'cx' }), [], 'not listed');
+    assert.deepEqual(commitOverlay({ runtime: rt, agent: 'cx' }),
+      { committed: [], skipped: [] }, 'nothing to commit');
+    assert.ok(!existsSync(join(proj, '.sbx-commit-9-evil')), 'not created in the project');
+    assert.deepEqual(diffOverlay({ runtime: rt, agent: 'cx' }), [], 'the next diff is not blocked');
+    rollbackOverlay({ runtime: rt, agent: 'cx' });
+  });
+});
+
+describe('large trees, 6.5 (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_SKIP }, () => {
+  // The walker manifest travels as a file, never stdout: no output cap,
+  // however many files the project holds. 20,000 small files diff and
+  // commit; a 1 MB stdout cap (the old shape) must fail this test.
+  let root, proj;
+  const DIRS = 20, PER = 1000;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-o65-'));
+    proj = join(root, 'p');
+    for (let d = 0; d < DIRS; d++) {
+      const sub = join(proj, 'big', String(d).padStart(2, '0'));
+      mkdirSync(sub, { recursive: true });
+      for (let i = 0; i < PER; i++) {
+        writeFileSync(join(sub, `f${String(i).padStart(4, '0')}`), `v${i}\n`);
+      }
+    }
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('20,000 files diff and commit correctly', { timeout: 240000 }, () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'big', proj });
+    agentWrite({ ...ov, lower: proj, script: 'for f in "$M/big/00"/*; do echo m >> "$f"; done' });
+    const changes = diffOverlay({ runtime: rt, agent: 'big' });
+    assert.equal(changes.length, PER, `one subdir of changes, got ${changes.length}`);
+    assert.ok(changes.every((c) => c.status === 'modified' && c.path.startsWith('big/00/')),
+      'every change is a modified file in big/00');
+    const res = commitOverlay({ runtime: rt, agent: 'big' });
+    assert.equal(res.committed.length, PER, 'all of them applied');
+    assert.equal(readFileSync(join(proj, 'big', '00', 'f0000'), 'utf8'), 'v0\nm\n');
+    assert.equal(readFileSync(join(proj, 'big', '19', 'f0999'), 'utf8'), 'v999\n',
+      'untouched files are byte-identical');
+    assert.deepEqual(diffOverlay({ runtime: rt, agent: 'big' }), [], 'clean after commit');
+    rollbackOverlay({ runtime: rt, agent: 'big' });
+  });
+});
+
+describe('node outside /usr, 6.6 (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_SKIP }, () => {
+  // The walker runs on the node running barebox now, never a hardcoded
+  // path: copy this node to a volta-style <prefix>/bin/node, run the diff
+  // from that copy, and the mount must still walk (its prefix is bound in).
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-o66-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a node outside /usr still walks the overlay', { timeout: 120000 }, () => {
+    mkdirSync(join(root, 'n', 'bin'), { recursive: true });
+    const nodeCopy = join(root, 'n', 'bin', 'node');
+    copyFileSync(realpathSync(process.execPath), nodeCopy);
+    chmodSync(nodeCopy, 0o755);
+    assert.ok(!nodeCopy.startsWith('/usr/'), 'the copy really lives outside /usr');
+    const proj = mkdtempSync(join(root, 'p-'));
+    writeFileSync(join(proj, 'keep.txt'), 'keep\n');
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const { upper } = setupOverlay({ runtime: rt, agent: 'n', proj });
+    writeFileSync(join(upper, 'new.txt'), 'new\n');
+    const script = join(root, 'list.mjs');
+    writeFileSync(script,
+      `import { diffOverlay } from ${JSON.stringify(join(ROOT, 'src', 'overlay.js'))};\n` +
+      `const changes = diffOverlay({ runtime: ${JSON.stringify(rt)}, agent: 'n' });\n` +
+      `process.stdout.write(JSON.stringify(changes.map((c) => [c.status, c.path])));\n`);
+    const res = spawnSync(nodeCopy, [script], { encoding: 'utf8', timeout: 60000 });
+    assert.equal(res.status, 0, `the copy must walk (stderr: ${res.stderr})`);
+    assert.deepEqual(JSON.parse(res.stdout), [['added', 'new.txt']]);
+    rollbackOverlay({ runtime: rt, agent: 'n' });
+  });
+});
+
+describe('the mid-commit project check, 6.7 (no sandbox needed)', () => {
+  // changedSince returns the first path whose live fingerprint differs
+  // from the snapshot, or null when nothing moved.
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-o67-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('unit: edits, deletions, creations report; stillness is null', () => {
+    const proj = mkdtempSync(join(root, 'p-'));
+    writeFileSync(join(proj, 'a.txt'), 'a\n');
+    writeFileSync(join(proj, 'b.txt'), 'b\n');
+    const fps = new Map([
+      ['a.txt', fpNow(join(proj, 'a.txt'))],
+      ['b.txt', fpNow(join(proj, 'b.txt'))],
+      ['c.txt', fpNow(join(proj, 'c.txt'))], // absent reads as null
+    ]);
+    assert.equal(changedSince(proj, ['a.txt', 'b.txt'], fps), null, 'no edit reads null');
+    writeFileSync(join(proj, 'a.txt'), 'a edited\n');
+    assert.equal(changedSince(proj, ['a.txt', 'b.txt'], fps), 'a.txt', 'an edited file reports');
+    rmSync(join(proj, 'b.txt'));
+    assert.equal(changedSince(proj, ['b.txt'], fps), 'b.txt', 'a deleted file reports');
+    writeFileSync(join(proj, 'c.txt'), 'c\n');
+    assert.equal(changedSince(proj, ['c.txt'], fps), 'c.txt', 'a created file reports');
+  });
+});
+
+describe('commit under read-only folders, 6.3 (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_SKIP }, () => {
+  // A rename needs write permission on the parent folder, so a change inside
+  // a 0555 folder could never commit. Phase 2 journals a temporary u+w on
+  // parents it owns and restores the final mode in step 5.
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-o63-'));
+  });
+  after(() => {
+    fixModes(root);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Add owner write everywhere under `dir`, so the fixture cleanup can unlink. */
+  function fixModes(dir) {
+    let st;
+    try {
+      st = lstatSync(dir);
+    } catch {
+      return;
+    }
+    if (st.isSymbolicLink()) return;
+    const want = (st.mode & 0o7777) | (st.isDirectory() ? 0o700 : 0o600);
+    if (want !== (st.mode & 0o7777)) chmodSync(dir, want);
+    if (st.isDirectory()) {
+      for (const n of readdirSync(dir)) fixModes(join(dir, n));
+    }
+  }
+
+  const modeOf = (p) => lstatSync(p).mode & 0o7777;
+
+  it('deleting inside a 0555 folder commits, and the folder stays 0555', () => {
+    const proj = mkdtempSync(join(root, 'p-'));
+    mkdirSync(join(proj, 'ro'), { recursive: true });
+    writeFileSync(join(proj, 'ro', 'f'), 'x\n');
+    chmodSync(join(proj, 'ro'), 0o555);
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'ro1', proj });
+    agentWrite({ ...ov, lower: proj, script: 'chmod u+w "$M/ro"; rm "$M/ro/f"; chmod 555 "$M/ro"' });
+    const res = commitOverlay({ runtime: rt, agent: 'ro1' });
+    assert.deepEqual(res, { committed: ['ro/f'], skipped: [] });
+    assert.ok(!existsSync(join(proj, 'ro', 'f')), 'ro/f is gone');
+    assert.equal(modeOf(join(proj, 'ro')), 0o555, 'ro/ is 0555 afterwards');
+    rollbackOverlay({ runtime: rt, agent: 'ro1' });
+  });
+
+  it('rm -rf on a 0555 tree two levels deep commits, and the tree is gone', () => {
+    const proj = mkdtempSync(join(root, 'p-'));
+    mkdirSync(join(proj, 'ro', 'sub'), { recursive: true });
+    writeFileSync(join(proj, 'ro', 'sub', 'f'), 'x\n');
+    writeFileSync(join(proj, 'ro', 'top.txt'), 't\n');
+    chmodSync(join(proj, 'ro', 'sub'), 0o555);
+    chmodSync(join(proj, 'ro'), 0o555);
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'ro2', proj });
+    agentWrite({ ...ov, lower: proj, script: 'chmod -R u+w "$M/ro"; rm -rf "$M/ro"' });
+    const res = commitOverlay({ runtime: rt, agent: 'ro2' });
+    assert.ok(res.committed.includes('ro'), `ro itself committed: ${res.committed}`);
+    assert.ok(!existsSync(join(proj, 'ro')), 'ro/ is gone');
+    rollbackOverlay({ runtime: rt, agent: 'ro2' });
+  });
+
+  it('a changed file under an untouched 0555 folder commits, folder stays 0555', () => {
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    chmodSync(join(proj, 'sub'), 0o555);
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'ro3', proj });
+    agentWrite({ ...ov, lower: proj, script: 'echo changed > "$M/sub/n.txt"' });
+    const res = commitOverlay({ runtime: rt, agent: 'ro3' });
+    assert.deepEqual(res, { committed: ['sub/n.txt'], skipped: [] });
+    assert.equal(readFileSync(join(proj, 'sub', 'n.txt'), 'utf8'), 'changed\n');
+    assert.equal(modeOf(join(proj, 'sub')), 0o555, 'the folder is still 0555');
+    rollbackOverlay({ runtime: rt, agent: 'ro3' });
+  });
+
+  it('a phase-2 failure after the temporary chmod undoes it exactly', () => {
+    // Phase 1 and 2 run synchronously, so nothing external can interleave
+    // after the temporary chmod: the failure comes from a second change in
+    // the same commit (replacing a folder that holds ignored content with
+    // a file is refused in step 2, after the aside of ro/f).
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    mkdirSync(join(proj, 'k', 'node_modules'), { recursive: true });
+    writeFileSync(join(proj, 'k', 'node_modules', 'keep.js'), 'v1\n');
+    mkdirSync(join(proj, 'ro'), { recursive: true });
+    writeFileSync(join(proj, 'ro', 'f'), 'x\n');
+    chmodSync(join(proj, 'ro'), 0o555);
+    const before = treeHash(proj);
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'ro4', proj });
+    agentWrite({ ...ov, lower: proj,
+      script: 'chmod u+w "$M/ro"; rm "$M/ro/f"; rm -rf "$M/k"; echo x > "$M/k"' });
+    let err = null;
+    try {
+      commitOverlay({ runtime: rt, agent: 'ro4' });
+    } catch (e) { err = e; }
+    assert.ok(err, 'the commit must fail on the ignored-content replace');
+    assert.match(err.message, /holds ignored content/, `names the cause: ${err?.message}`);
+    assert.equal(modeOf(join(proj, 'ro')), 0o555, 'the temporary chmod is undone');
+    assert.equal(readFileSync(join(proj, 'ro', 'f'), 'utf8'), 'x\n', 'the aside is back');
+    assert.equal(treeHash(proj), before, 'the 0555 modes are back afterwards');
+    rollbackOverlay({ runtime: rt, agent: 'ro4' });
+  });
+
+  it('an unowned unwritable parent is left alone, and the failure names it', () => {
+    // Ownership is the uid check in step 0: stub getuid so every fixture
+    // parent reads as foreign. The rename then fails and is undone, as
+    // before, and the error names the case.
+    const proj = mkdtempSync(join(root, 'p-'));
+    mkdirSync(join(proj, 'ro'), { recursive: true });
+    writeFileSync(join(proj, 'ro', 'f'), 'x\n');
+    chmodSync(join(proj, 'ro'), 0o555);
+    const before = treeHash(proj);
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'ro5', proj });
+    agentWrite({ ...ov, lower: proj, script: 'chmod u+w "$M/ro"; rm "$M/ro/f"; chmod 555 "$M/ro"' });
+    const realGetuid = process.getuid;
+    // A uid that owns nothing in the fixture, whatever user runs the suite.
+    const foreign = lstatSync(join(proj, 'ro')).uid + 1;
+    process.getuid = () => foreign;
+    try {
+      let err = null;
+      try {
+        commitOverlay({ runtime: rt, agent: 'ro5' });
+      } catch (e) { err = e; }
+      assert.ok(err, 'the commit must fail');
+      assert.match(err.message, /not owned/, `names the unowned case: ${err?.message}`);
+      assert.match(err.message, /nothing was applied/, 'nothing was applied');
+    } finally {
+      process.getuid = realGetuid;
+    }
+    assert.equal(treeHash(proj), before, 'the project is unchanged');
+    assert.equal(modeOf(join(proj, 'ro')), 0o555);
+    rollbackOverlay({ runtime: rt, agent: 'ro5' });
   });
 });
 
@@ -738,6 +1166,45 @@ describe('rollback without the project (no sandbox needed)', () => {
     });
 });
 
+describe('rollback inexact reports why (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_SKIP }, () => {
+  // Item 3: no fake `(could not list: …)` entries in `discarded`, no
+  // swallowed reasons. `why` carries diff's message (or `project <proj>
+  // is gone`), plus the raw-listing reason when that failed too.
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-orwhy-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('a non-UTF-8 name in the upper reports why and invents no paths', () => {
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    setupOverlay({ runtime: rt, agent: 'why-nonutf', proj });
+    writeFileSync(Buffer.concat([Buffer.from(`${rt}/overlay/why-nonutf/upper/`), Buffer.from([0xff, 0xfe])]), 'bad\n');
+    const { discarded, exact, why } = rollbackOverlay({ runtime: rt, agent: 'why-nonutf' });
+    assert.equal(exact, false);
+    assert.match(why, /non-UTF-8/, `why names the real reason, got ${why}`);
+    assert.ok(!discarded.some((c) => c.path.startsWith('(')), `no fake entries, got ${JSON.stringify(discarded)}`);
+    assert.ok(!existsSync(join(rt, 'overlay', 'why-nonutf')), 'the overlay folder is gone');
+  });
+
+  it('a deleted project reports why with the raw paths', () => {
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const ov = setupOverlay({ runtime: rt, agent: 'why-gone', proj });
+    agentWrite({ ...ov, lower: proj, script: 'echo agent > "$M/edit.txt"; rm "$M/del.txt"' });
+    rmSync(proj, { recursive: true, force: true });
+    const { discarded, exact, why } = rollbackOverlay({ runtime: rt, agent: 'why-gone' });
+    assert.equal(exact, false);
+    assert.match(why, /is gone/, `why names the project, got ${why}`);
+    assert.deepEqual(discarded.map((c) => c.path).sort(), ['del.txt', 'edit.txt']);
+    for (const c of discarded) assert.equal(c.status, 'unknown', 'raw list infers nothing');
+    assert.ok(!existsSync(join(rt, 'overlay', 'why-gone')), 'the overlay folder is gone');
+  });
+});
+
 describe('ignored dirs are invisible (Q3)', () => {
   let root;
   before(() => {
@@ -765,7 +1232,7 @@ describe('ignored dirs are invisible (Q3)', () => {
       { committed: [], skipped: [] });
     assert.equal(readFileSync(join(proj, 'node_modules', 'pkg', 'index.js'), 'utf8'), 'v1\n');
     assert.deepEqual(withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'g' })),
-      { discarded: [], exact: true });
+      { discarded: [], exact: true, why: null });
   });
 
   it('a custom ignore list prunes several dirs through a real mount (needs bwrap)',
@@ -949,7 +1416,7 @@ describe('launch overlay wiring', () => {
   });
 
   it('writes land in the upper while the project stays untouched (needs socket)',
-    { skip: SOCKET_OK ? false : SOCKET_SKIP }, async () => {
+    { skip: SOCKET_OK ? false : SOCKET_SKIP, timeout: 60000 }, async () => {
       const rt = join(root, 'rt-wire');
       mkdirSync(join(rt, 'socks'), { recursive: true });
       const sock = join(rt, 'socks', 'w.sock');
@@ -963,13 +1430,14 @@ describe('launch overlay wiring', () => {
           runtime: rt, agent: 'w', proj, socket: sock, overlay: true,
           command: ['bash', '-c', 'echo agent > "$0/new.txt" && echo agent > "$0/edit.txt"', proj],
         });
-        assert.ok(child.overlay?.upper, 'child carries its upper address');
+        const upper = runtimePaths(rt).overlay('w').upper;
+        assert.ok(upper, 'the overlay record addresses the upper');
         const code = await new Promise((resolve, reject) => {
           child.on('error', reject);
           child.on('close', resolve);
         });
         assert.equal(code, 0);
-        assert.equal(readFileSync(join(child.overlay.upper, 'new.txt'), 'utf8'), 'agent\n');
+        assert.equal(readFileSync(join(upper, 'new.txt'), 'utf8'), 'agent\n');
         assert.equal(readFileSync(join(proj, 'edit.txt'), 'utf8'), 'orig\n',
           'the project is untouched until commit');
         assert.deepEqual(
@@ -983,7 +1451,7 @@ describe('launch overlay wiring', () => {
     });
 
   it('the agent starts in the project dir, from a foreign cwd, with and without the overlay (needs socket)',
-    { skip: SOCKET_OK ? false : SOCKET_SKIP }, async () => {
+    { skip: SOCKET_OK ? false : SOCKET_SKIP, timeout: 60000 }, async () => {
       // Setup-independent: the caller starts at / (never the project), so a
       // missing --chdir shows up as the wrong pwd instead of passing by luck.
       const prevCwd = process.cwd();
@@ -1091,11 +1559,11 @@ describe('sbx diff/commit/rollback CLI', () => {
     for (const cmd of ['diff', 'commit', 'rollback']) {
       const env = { ...process.env };
       delete env.SBX_RUNTIME;
-      delete env.SBX_SOCK;
       const err = await execA('node', [CLI, cmd], { encoding: 'latin1', env })
         .then(() => null, (e) => e);
       assert.equal(err?.code, 2, cmd);
-      assert.match(err.stdout, /usage: sbx/);
+      assert.match(err.stderr, /usage: sbx/);
+      assert.equal(err.stdout, '', `${cmd}: usage writes nothing on stdout`);
     }
   });
 
@@ -1103,10 +1571,15 @@ describe('sbx diff/commit/rollback CLI', () => {
     const rt = mkdtempSync(join(root, 'rt-'));
     const err1 = await sbx(['diff', '--bogus'], { SBX_RUNTIME: rt }).then(() => null, (e) => e);
     assert.equal(err1?.code, 2);
+    assert.match(err1.stderr, /usage: sbx/);
+    assert.equal(err1.stdout, '', 'usage writes nothing on stdout');
     const err2 = await sbx(['diff', '--agent', '../evil'], { SBX_RUNTIME: rt }).then(() => null, (e) => e);
     assert.equal(err2?.code, 2);
+    assert.match(err2.stderr, /evil/, 'bad agent name on stderr');
+    assert.equal(err2.stdout, '', 'bad agent name writes nothing on stdout');
     const err3 = await sbx(['commit', '--agent'], { SBX_RUNTIME: rt }).then(() => null, (e) => e);
     assert.equal(err3?.code, 2);
+    assert.match(err3.stderr, /usage: sbx/);
   });
 
   it('an unknown agent exits 1, never 0', async () => {
@@ -1114,7 +1587,8 @@ describe('sbx diff/commit/rollback CLI', () => {
     for (const cmd of ['diff', 'commit', 'rollback']) {
       const err = await sbx([cmd], { SBX_RUNTIME: rt }).then(() => null, (e) => e);
       assert.equal(err?.code, 1, cmd);
-      assert.match(err.stdout, /no overlay/);
+      assert.match(err.stderr, /no overlay/);
+      assert.equal(err.stdout, '', `${cmd}: errors write nothing on stdout`);
     }
   });
 
@@ -1135,7 +1609,8 @@ describe('sbx diff/commit/rollback CLI', () => {
   it('run --overlay without -- is a usage error (exit 2)', async () => {
     const err = await sbx(['run', '--overlay']).then(() => null, (e) => e);
     assert.equal(err?.code, 2);
-    assert.match(err.stdout, /usage: sbx/);
+    assert.match(err.stderr, /usage: sbx/);
+    assert.equal(err.stdout, '', 'usage writes nothing on stdout');
   });
 
   it('diff lists, commit applies, diff is clean after (needs bwrap)',
@@ -1173,8 +1648,9 @@ describe('sbx diff/commit/rollback CLI', () => {
       assert.match((await sbx(['diff'], env)).stdout, /CONFLICT/);
       const refused = await sbx(['commit'], env).then(() => null, (e) => e);
       assert.equal(refused?.code, 1);
-      assert.match(refused.stdout, /conflict: edit\.txt/);
-      assert.match(refused.stdout, /commit refused/);
+      assert.match(refused.stderr, /conflict: edit\.txt/);
+      assert.match(refused.stderr, /commit refused/);
+      assert.equal(refused.stdout, '', 'refusals write nothing on stdout');
       assert.equal(readFileSync(join(proj, 'edit.txt'), 'utf8'), 'user\n');
       assert.ok(!existsSync(join(proj, 'clean.txt')), 'refusal wrote nothing');
       const skipped = (await sbx(['commit', '--skip-conflicts'], env)).stdout;
@@ -1201,8 +1677,33 @@ describe('sbx diff/commit/rollback CLI', () => {
       assert.deepEqual(readTree(proj), before);
     });
 
+  it('rollback over an unlistable upper says why, never a fake path (needs bwrap)',
+    { skip: BWRAP_OK ? false : BWRAP_SKIP }, async () => {
+      const proj = mkproj(mkdtempSync(join(root, 'p-')));
+      const rt = mkdtempSync(join(root, 'rt-'));
+      setupOverlay({ runtime: rt, agent: 'agent', proj });
+      writeFileSync(Buffer.concat([Buffer.from(`${rt}/overlay/agent/upper/`), Buffer.from([0xff, 0xfe])]), 'bad\n');
+      const out = (await sbx(['rollback'], { SBX_RUNTIME: rt })).stdout;
+      assert.match(out, /discarded \(could not list: .*non-UTF-8/, `why on one line, got ${out}`);
+      assert.ok(!out.includes('no userns'), `no wrong reason, got ${out}`);
+      assert.ok(!out.includes('project gone or'), `no wrong reason, got ${out}`);
+      assert.ok(!existsSync(join(rt, 'overlay', 'agent')), 'the overlay folder is gone');
+    });
+
+  it('rollback with the project gone names why on one line (needs bwrap)',
+    { skip: BWRAP_OK ? false : BWRAP_SKIP }, async () => {
+      const proj = mkproj(mkdtempSync(join(root, 'p-')));
+      const rt = mkdtempSync(join(root, 'rt-'));
+      const ov = setupOverlay({ runtime: rt, agent: 'agent', proj });
+      agentWrite({ ...ov, lower: proj, script: 'echo agent > "$M/edit.txt"' });
+      rmSync(proj, { recursive: true, force: true });
+      const out = (await sbx(['rollback'], { SBX_RUNTIME: rt })).stdout;
+      assert.match(out, /discarded 1 entries, exact list unavailable: .*is gone/, `why on one line, got ${out}`);
+      assert.ok(!out.includes('no userns'), `no wrong reason, got ${out}`);
+    });
+
   it('sbx run --overlay end to end (needs socket)',
-    { skip: SOCKET_OK ? false : SOCKET_SKIP }, async () => {
+    { skip: SOCKET_OK ? false : SOCKET_SKIP, timeout: 120000 }, async () => {
       const proj = mkproj(mkdtempSync(join(root, 'p-')));
       const rt = mkdtempSync(join(root, 'rt-'));
       const home = mkdtempSync(join(root, 'h-'));

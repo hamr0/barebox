@@ -129,9 +129,9 @@ before(async () => {
   plainUp = await startHttp();
   // allowLoopback is the TEST-ONLY opt-in: fixtures listen on 127.0.0.1,
   // which the default wall denies (see 'loopback wall' below).
-  proxy = createProxy({ port: 0, certDir: join(RT, 'certs'),
+  proxy = createProxy({ port: 0,
     logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-    clientIdleMs: 1000, allowLoopback: true });
+    clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true } });
   ({ port: PORT } = await proxy.ready);
   PROXY = `http://127.0.0.1:${PORT}`;
 });
@@ -345,8 +345,8 @@ describe('negatives', () => {
   });
 
   it('second proxy on the same port rejects ready, never crashes', async () => {
-    const dup = createProxy({ port: PORT, certDir: join(RT, 'certs'),
-      logFile: join(RT, 'mitm.log'), upstreamCa: CA });
+    const dup = createProxy({ port: PORT,
+      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT });
     await assert.rejects(dup.ready, /EADDRINUSE/);
     await dup.close();
     // Original still serves.
@@ -416,7 +416,7 @@ describe('loopback wall: default deny after DNS resolution', () => {
 
   before(async () => {
     // No allowLoopback: this is the production shape.
-    dp = createProxy({ port: 0, certDir: join(RT, 'certs'),
+    dp = createProxy({ port: 0,
       logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT });
     ({ port: dport } = await dp.ready);
     DPROXY = `http://127.0.0.1:${dport}`;
@@ -501,9 +501,10 @@ describe('loopback wall: default deny after DNS resolution', () => {
 
 describe('dns rebinding wall (stubbed resolver)', () => {
   async function stubProxy(stub, extra = {}) {
-    const p = createProxy({ port: 0, certDir: join(RT, 'certs'),
+    const { unsafeTestOnly: extraUnsafe, ...rest } = extra;
+    const p = createProxy({ port: 0,
       logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-      resolveUpstream: stub, ...extra });
+      unsafeTestOnly: { resolveUpstream: stub, ...(extraUnsafe ?? {}) }, ...rest });
     const { port } = await p.ready;
     return { p, url: `http://127.0.0.1:${port}` };
   }
@@ -544,7 +545,7 @@ describe('dns rebinding wall (stubbed resolver)', () => {
     const { p, url } = await stubProxy(async () => {
       await new Promise((r) => setTimeout(r, 300));
       return ['127.0.0.1'];
-    }, { allowLoopback: true, upstreamTimeoutMs: 3000 });
+    }, { unsafeTestOnly: { allowLoopback: true }, upstreamTimeoutMs: 3000 });
     try {
       const target = `${plainUp.url}?m=bodyrace`.replace('http://127.0.0.1', 'http://slowdns.test');
       const r = await execA('curl', ['-s', '--max-time', '10', '-x', url,
@@ -563,7 +564,7 @@ describe('dns rebinding wall (stubbed resolver)', () => {
       // Door + forward checks see the fixture; anything after would be a re-dial.
       if (calls <= 2) return ['127.0.0.1'];
       return ['93.184.216.34'];
-    }, { allowLoopback: true });
+    }, { unsafeTestOnly: { allowLoopback: true } });
     try {
       const r = await execA('curl', ['-s', '--max-time', '5', '-x', url,
         `${plainUp.url}?m=pin`.replace('http://127.0.0.1', 'http://pinned.test')],
@@ -591,6 +592,11 @@ describe('holds', () => {
     renameSync(tmp, answerFile(id));
   };
   const readAsk = (id) => JSON.parse(readFileSync(askFile(id), 'utf8'));
+  // pending() carries no bodies (2.4): find a parked hold by its ask file's
+  // body preview, which is what the approver sees.
+  const pendingWith = (marker) => hp.pending().find((h) => {
+    try { return new RegExp(marker).test(readAsk(h.id).bodyPreview); } catch { return false; }
+  });
   async function waitGone(p, what) {
     await waitFor(() => !existsSync(p), what);
   }
@@ -602,9 +608,9 @@ describe('holds', () => {
   // never idle), so the approve test sleeps past idle and finds the hold
   // still parked.
   async function holdProxy(holdExtra = {}) {
-    hp = createProxy({ port: 0, certDir: join(RT, 'certs'),
+    hp = createProxy({ port: 0,
       logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-      clientIdleMs: 500, allowLoopback: true,
+      clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
       hold: { match: '/hold', timeoutMs: 1500, pollMs: 25, ...holdExtra } });
     ({ port: hport } = await hp.ready);
     return `http://127.0.0.1:${hport}`;
@@ -618,28 +624,14 @@ describe('holds', () => {
     }
   });
 
-  it('controlSocket (top-level or hold) throws, before any side effect', async () => {
-    // No unix bind needed: createProxy must refuse synchronously.
-    const outside = join(tmpdir(), `bb-outside-${process.pid}.sock`);
-    assert.throws(() => createProxy({ port: 0, certDir: join(RT, 'certs'),
-      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-      controlSocket: outside }), /removed in M2\.5/);
-    assert.ok(!existsSync(outside), 'refused socket must not be created');
-    assert.throws(() => createProxy({ port: 0, certDir: join(RT, 'certs'),
-      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-      hold: { match: '/hold', controlSocket: outside } }), /removed in M2\.5/);
-  });
-
-  it('certDir outside the runtime throws, before any side effect', async () => {
+  it('runtime is required (certs always live at <runtime>/certs)', async () => {
     // No sandbox needed: createProxy must refuse synchronously, before the
     // log stream or any CA file (ca.key especially) is created.
     const outsideBase = mkdtempSync(join(tmpdir(), 'bb-outside-cert-'));
-    const outsideCerts = join(outsideBase, 'certs');
     const outsideLog = join(outsideBase, 'mitm.log');
     try {
-      assert.throws(() => createProxy({ port: 0, certDir: outsideCerts,
-        logFile: outsideLog, upstreamCa: CA, runtime: RT }), /inside the runtime/);
-      assert.ok(!existsSync(outsideCerts), 'refused certDir must not be created');
+      assert.throws(() => createProxy({ port: 0,
+        logFile: outsideLog, upstreamCa: CA }), /runtime is required/);
       assert.ok(!existsSync(outsideLog), 'refused log file must not be created');
     } finally {
       rmSync(outsideBase, { recursive: true, force: true });
@@ -651,7 +643,7 @@ describe('holds', () => {
     try {
       const p1 = execA('curl', ['-s', '--max-time', '5', '-x', P2,
         '--cacert', CA, '--data', 'm=HOLD1', `${tlsUp.url}hold`], { encoding: 'latin1' });
-      const held = await waitFor(() => hp.pending().find((h) => /HOLD1/.test(h.body)),
+      const held = await waitFor(() => pendingWith('HOLD1'),
         'hold on m=HOLD1 to park');
       assert.equal(held.agent, 'tcp');
       // Parked past the 500 ms idle timer: still held, not reaped.
@@ -675,7 +667,7 @@ describe('holds', () => {
 
       const p2 = execA('curl', ['-s', '--max-time', '5', '-x', P2,
         '--cacert', CA, '--data', 'm=HOLD2', `${tlsUp.url}hold`], { encoding: 'latin1' });
-      const held2 = await waitFor(() => hp.pending().find((h) => /HOLD2/.test(h.body)),
+      const held2 = await waitFor(() => pendingWith('HOLD2'),
         'hold on m=HOLD2 to park');
       answer(held2.id, { decision: 'deny', reason: 'nope' });
       assert.match((await p2).stdout, /denied: nope/);
@@ -703,7 +695,7 @@ describe('holds', () => {
     try {
       const p = execA('curl', ['-s', '--max-time', '5', '-x', P2,
         '--data', 'm=PLAINHOLD', `${plainUp.url}hold`], { encoding: 'latin1' });
-      const held = await waitFor(() => hp.pending().find((h) => /PLAINHOLD/.test(h.body)),
+      const held = await waitFor(() => pendingWith('PLAINHOLD'),
         'plain-HTTP hold to park');
       assert.equal(held.agent, 'tcp');
       answer(held.id, { decision: 'allow' });
@@ -737,7 +729,7 @@ describe('holds', () => {
       const t = await connectTunnelVia(P2, `127.0.0.1:${tlsUp.port}`);
       const body = 'm=ABANDON';
       t.write(`POST /hold HTTP/1.1\r\nHost: 127.0.0.1:${tlsUp.port}\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
-      const held = await waitFor(() => hp.pending().find((h) => /ABANDON/.test(h.body)),
+      const held = await waitFor(() => pendingWith('ABANDON'),
         'hold on m=ABANDON to park');
       t.destroy(); // agent disconnects / gives up
       await waitFor(() => hp.pending().length === 0, 'abandoned hold to drop');
@@ -775,7 +767,7 @@ describe('holds', () => {
     try {
       const held = execA('curl', ['-s', '--max-time', '8', '-x', P2,
         '--cacert', CA, '--data', 'm=BUSY1', `${tlsUp.url}hold`], { encoding: 'latin1' });
-      const parked = await waitFor(() => hp.pending().find((h) => /BUSY1/.test(h.body)),
+      const parked = await waitFor(() => pendingWith('BUSY1'),
         'hold on m=BUSY1 to park');
       // Same agent, separate connection, non-matching path: answers while
       // the first request is still parked — holds never gate the agent.
@@ -794,9 +786,9 @@ describe('holds', () => {
 
   it('onAsk answers with no files involved', async () => {
     const seen = new Set((() => { try { return readdirSync(join(RT, 'asks')); } catch { return []; } })());
-    const op = createProxy({ port: 0, certDir: join(RT, 'certs'),
+    const op = createProxy({ port: 0,
       logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-      clientIdleMs: 500, allowLoopback: true,
+      clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
       hold: { match: '/hold', timeoutMs: 5000,
         onAsk: async (ask) => {
           assert.equal(ask.letter, 'x');
@@ -828,7 +820,7 @@ describe('holds', () => {
         const p = hp.pending();
         return p.length === 3 ? p : null;
       }, '3 holds to park');
-      const byBody = (m) => held.find((h) => h.body.includes(m));
+      const byBody = (m) => held.find((h) => readAsk(h.id).bodyPreview.includes(m));
       answer(byBody('DEPTH1').id, { decision: 'allow' });
       answer(byBody('DEPTH2').id, { decision: 'deny', reason: 'second' });
       answer(byBody('DEPTH3').id, { decision: 'allow' });
@@ -849,7 +841,7 @@ describe('holds', () => {
       const before = tlsUp.hits.get('/hold') ?? 0;
       const p = execA('curl', ['-s', '--max-time', '5', '-x', P2,
         '--cacert', CA, '--data', 'm=DOUBLE', `${tlsUp.url}hold`], { encoding: 'latin1' });
-      const held = await waitFor(() => hp.pending().find((h) => /DOUBLE/.test(h.body)),
+      const held = await waitFor(() => pendingWith('DOUBLE'),
         'hold on m=DOUBLE to park');
       answer(held.id, { decision: 'allow' });
       assert.match((await p).stdout, /DOUBLE/);
@@ -871,7 +863,7 @@ describe('holds', () => {
     try {
       const p = execA('curl', ['-s', '--max-time', '8', '-x', P2,
         '--cacert', CA, '--data', 'm=MALFORMED', `${tlsUp.url}hold`], { encoding: 'latin1' });
-      const held = await waitFor(() => hp.pending().find((h) => /MALFORMED/.test(h.body)),
+      const held = await waitFor(() => pendingWith('MALFORMED'),
         'hold on m=MALFORMED to park');
       // Bad JSON: consumed, logged, still parked.
       mkdirSync(answersDir(), { recursive: true });
@@ -909,7 +901,7 @@ describe('holds', () => {
     try {
       const p = execA('curl', ['-s', '--max-time', '8', '-x', P2,
         '--cacert', CA, '--data', 'm=NEVER', `${tlsUp.url}hold`], { encoding: 'latin1' });
-      const held = await waitFor(() => hp.pending().find((h) => /NEVER/.test(h.body)),
+      const held = await waitFor(() => pendingWith('NEVER'),
         'hold on m=NEVER to park');
       assert.equal(readAsk(held.id).expiresAt, null);
       await new Promise((r) => setTimeout(r, 400));
@@ -964,9 +956,9 @@ describe('two agents keep identity under interleave', () => {
 
   it('holds, responses and log lines name the right agent',
     { skip: NEED_UNIX2 }, async () => {
-      const tp = createProxy({ port: 0, certDir: join(RT, 'certs'),
+      const tp = createProxy({ port: 0,
         logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-        clientIdleMs: 1000, allowLoopback: true,
+        clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true },
         hold: { match: '/hold', timeoutMs: 15000, pollMs: 25 } });
       await tp.ready;
       const sa = [];
@@ -994,8 +986,9 @@ describe('two agents keep identity under interleave', () => {
         }, 'both agents to park');
         const gotA = both.find((h) => h.agent === 'fa');
         const gotB = both.find((h) => h.agent === 'fb');
-        assert.ok(gotA && /FA1/.test(gotA.body), 'fa hold carries fa');
-        assert.ok(gotB && /FB1/.test(gotB.body), 'fb hold carries fb');
+        const previewOf = (h) => JSON.parse(readFileSync(join(RT, 'asks', `${h.id}.json`), 'utf8')).bodyPreview;
+        assert.ok(gotA && /FA1/.test(previewOf(gotA)), 'fa hold carries fa');
+        assert.ok(gotB && /FB1/.test(previewOf(gotB)), 'fb hold carries fb');
         // A free request on fa's door answers while both holds are parked.
         const sF = await open(fa,
           `GET http://${upHost}/?m=free HTTP/1.1\r\nHost: ${upHost}\r\nConnection: close\r\n\r\n`);
@@ -1047,9 +1040,9 @@ describe('audit log secrets', () => {
   });
 
   it('user redact hook runs after built-in scrubbing', async () => {
-    const tp = createProxy({ port: 0, certDir: join(RT, 'certs'),
+    const tp = createProxy({ port: 0,
       logFile: join(RT, 'mitm-hook.log'), runtime: RT,
-      clientIdleMs: 1000, allowLoopback: true,
+      clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true },
       redact: (e) => ({ ...e, hookRan: e.ev }) });
     try {
       const { port } = await tp.ready;
@@ -1105,9 +1098,9 @@ describe('audit log secrets, continued (2.1 items 3-4)', () => {
     const logPath = join(RT, 'mitm-old.log');
     writeFileSync(logPath, 'old line\n');
     chmodSync(logPath, 0o644);
-    const tp = createProxy({ port: 0, certDir: join(RT, 'certs'),
+    const tp = createProxy({ port: 0,
       logFile: logPath, runtime: RT,
-      clientIdleMs: 1000, allowLoopback: true });
+      clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true } });
     try {
       const { port } = await tp.ready;
       await execA('curl', ['-s', '--max-time', '8', '-x', `http://127.0.0.1:${port}`,

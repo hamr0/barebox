@@ -1,21 +1,27 @@
 // holds.js — the ONLY writer of the hold queue.
 //
 // A held request parks with its client socket open until the ask channel
-// answers. The seam is `onAsk(ask) -> Promise<{ decision, reason? }>`
-// (bareguard's `humanChannel` shape): pass a loop's own callback and no
-// files are involved; omit it and the default file checkpoint runs —
-// `<runtime>/asks/<id>.json` is written on park, `<runtime>/answers/<id>.json`
-// is consumed once (renamed away before reading), and the poll (default
-// 250 ms, PRD Q9) waits until the hold deadline. Timeout — or any failure
-// of the channel itself — is deny. An `ASK OPEN <id>` line goes to stderr
-// on park so a human watching a terminal knows.
+// answers. Two channels, one queue:
+// - `onAsk(ask) -> Promise<{ decision, reason? }>` (bareguard's
+//   `humanChannel` shape): one promise per hold, no files involved.
+// - the default file checkpoint: `<runtime>/asks/<id>.json` is written on
+//   park, and ONE interval per queue reads `<runtime>/answers/` once per
+//   tick (default 250 ms, PRD Q9), consuming each answer file (renamed away
+//   before reading). An answer for a held id settles it; anything else is
+//   stale: ignored, logged (`stale-answer`), removed.
+// The deadline timer in `add()` is the only deadline: nothing else looks
+// at the clock. Timeout — or any failure of the channel itself — is deny.
+// A malformed answer (bad JSON, missing/unknown decision) is ignored,
+// logged (`malformed-answer`), and removed; the hold keeps waiting until
+// the deadline. The queue never throws on channel input: everything
+// unexpected is loud in the log and eventually a deny.
 //
-// An answer for an unknown or already-settled id is stale: ignored, logged
-// (`stale-answer`), and removed by the sweeper, as in fwdloop. A malformed
-// answer (bad JSON, missing/unknown decision) is likewise ignored, logged
-// (`malformed-answer`), and removed; the poll keeps waiting until the
-// deadline. The queue never throws on channel input: everything unexpected
-// is loud in the log and eventually a deny.
+// Decisions enter through one `normalizeDecision` (`allow`/`deny`, with
+// `'approve'` accepted as an alias of `'allow'` in answer files only) and
+// are reported through one optional `onEvent` callback: `{ type: 'ask' }`
+// when a hold parks, `{ type: 'decided' }` when it settles. Outcomes are
+// reported, never reconstructed: `run()` and `sbx run` build their ask
+// records from these events. The library never writes to stdout or stderr.
 //
 // Approving a hold whose client is gone must be impossible: `abandon()`
 // removes the entry and its ask file, so a later answer is stale and
@@ -37,6 +43,7 @@
 // must write atomically (tmp file + rename); readers never see partials.
 import fs from 'node:fs';
 import path from 'node:path';
+import { runtimePaths } from './runtime.js';
 
 /** Body preview cap for `asks/<id>.json` (bytes). */
 export const ASK_BODY_LIMIT = 4096;
@@ -46,7 +53,9 @@ export const DEFAULT_POLL_MS = 250;
 
 /**
  * A parked request, as returned by {@link pending}. Plain objects only —
- * the queue itself never leaves this module.
+ * the queue itself never leaves this module. No body: returning whole 1 MB
+ * bodies from a status call is never needed, and the ask payload in
+ * `asks/<id>.json` carries the preview.
  *
  * @typedef {object} HeldRequest
  * @property {string} id hold id (`h<n>`)
@@ -54,8 +63,20 @@ export const DEFAULT_POLL_MS = 250;
  * @property {string} method HTTP method
  * @property {string} url full URL
  * @property {string} rule hold-reason string from the decision function
- * @property {string} body request body so far (utf8)
  * @property {number} waitingSec seconds since the hold parked
+ */
+
+/**
+ * A queue event, as delivered to the `onEvent` callback: `{ type: 'ask' }`
+ * when a hold parks, `{ type: 'decided' }` when it settles.
+ *
+ * @typedef {{ type: 'ask', ask: AskPayload } | { type: 'decided', id: string, decision: 'allow' | 'deny', reason?: string }} HoldEvent
+ */
+
+/**
+ * Queue event callback.
+ *
+ * @typedef {(e: HoldEvent) => void} OnEvent
  */
 
 /**
@@ -86,23 +107,6 @@ export const DEFAULT_POLL_MS = 250;
  *
  * @typedef {(req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null} ShouldHold
  */
-
-/**
- * File-checkpoint paths for a runtime dir. Both dirs are created on demand.
- *
- * @param {string} runtime runtime dir
- * @returns {{ asksDir: string, answersDir: string, askFile: (id: string) => string, answerFile: (id: string) => string }} dirs + per-id paths
- */
-export function askPaths(runtime) {
-  const asksDir = path.join(runtime, 'asks');
-  const answersDir = path.join(runtime, 'answers');
-  return {
-    asksDir,
-    answersDir,
-    askFile: (id) => path.join(asksDir, `${id}.json`),
-    answerFile: (id) => path.join(answersDir, `${id}.json`),
-  };
-}
 
 /**
  * Atomic write: tmp file + rename, so readers never see a partial payload.
@@ -148,11 +152,12 @@ function consumeFile(file) {
 }
 
 /**
- * Validate an answer payload. Accepts `{ decision: 'allow' | 'deny' }`
- * (`'approve'` aliases `'allow'`); anything else is malformed.
+ * Validate an answer payload's shape. Returns the raw decision pair;
+ * normalization (including the `'approve'` alias) is `normalizeDecision`'s
+ * job. Anything unparsable, or with a missing decision, is malformed.
  *
  * @param {string} text raw answer file content
- * @returns {{ decision: 'allow' | 'deny', reason?: string } | null} decision, or null when malformed
+ * @returns {{ decision: unknown, reason?: unknown } | null} raw pair, or null when malformed
  */
 function parseAnswer(text) {
   let obj;
@@ -162,30 +167,34 @@ function parseAnswer(text) {
     return null;
   }
   if (!obj || typeof obj !== 'object') return null;
-  const decision = /** @type {{ decision?: unknown, reason?: unknown }} */ (obj).decision;
-  if (decision === 'allow' || decision === 'approve') return { decision: 'allow' };
-  if (decision === 'deny') {
-    const reason = /** @type {{ reason?: unknown }} */ (obj).reason;
-    return {
-      decision: 'deny',
-      reason: typeof reason === 'string' && reason ? reason : 'denied by user',
-    };
-  }
-  return null;
+  const { decision, reason } = /** @type {{ decision?: unknown, reason?: unknown }} */ (obj);
+  if (typeof decision !== 'string' || !decision) return null;
+  return { decision, reason };
 }
 
 /**
- * Sleep without keeping the process alive: a parked `'never'` hold must
- * not hold the event loop open by itself.
+ * The one normalization of decisions, applied once wherever a decision
+ * enters (an answer file, or an `onAsk` result). The audit log speaks
+ * `allow`/`deny`, which is bareguard's vocabulary.
  *
- * @param {number} ms milliseconds
- * @returns {Promise<void>}
+ * @param {{ decision?: unknown, reason?: unknown } | null} input raw decision pair
+ * @param {object} [opts]
+ * @param {boolean} [opts.approveAlias] accept `'approve'` as an alias of `'allow'` (answer files only)
+ * @returns {{ decision: 'allow' | 'deny', reason?: string } | null} normalized, or null when not a decision at all
  */
-function sleepMs(ms) {
-  return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
-    if (typeof t.unref === 'function') t.unref();
-  });
+export function normalizeDecision(input, { approveAlias = false } = {}) {
+  const decision = input?.decision;
+  if (decision === 'allow' || (approveAlias && decision === 'approve')) {
+    return { decision: 'allow' };
+  }
+  if (decision === 'deny') {
+    const reason = input?.reason;
+    return {
+      decision: 'deny',
+      reason: typeof reason === 'string' && reason ? reason : 'denied',
+    };
+  }
+  return null;
 }
 
 /**
@@ -200,13 +209,14 @@ function sleepMs(ms) {
  * @param {string|null} [opts.runtime] runtime dir; required for the default file checkpoint (writes `asks/`, polls `answers/`)
  * @param {OnAsk|null} [opts.onAsk] ask seam (bareguard `humanChannel` shape); when present no files are involved
  * @param {number} [opts.pollMs] answer poll interval in ms for the default file checkpoint (default 250, PRD Q9)
+ * @param {OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle
  * @param {(entry: object) => void} opts.onApprove forward the parked request upstream
  * @param {(entry: object, reason: string) => void} opts.onDeny refuse the parked request
- * @returns {{ add: (entry: object) => string, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, approve: (id: string) => string, deny: (id: string, reason: string) => string, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], size: () => number, close: () => void }} queue handle
+ * @returns {{ add: (entry: object) => string, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
  */
 export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   maxBody = 1048576, runtime = null, onAsk = null, pollMs = DEFAULT_POLL_MS,
-  onApprove, onDeny }) {
+  onEvent = null, onApprove, onDeny }) {
   // The default IS matchPath: one definition of the path-substring rule (see below).
   const decide = shouldHold ?? (match ? matchPath(match) : () => null);
   /** @returns {number|null} */
@@ -218,6 +228,9 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   if (onAsk != null && typeof onAsk !== 'function') {
     throw new Error('createHolds: onAsk must be a function');
   }
+  if (onEvent != null && typeof onEvent !== 'function') {
+    throw new Error('createHolds: onEvent must be a function');
+  }
   const poll = typeof pollMs === 'number' && Number.isFinite(pollMs) && pollMs > 0
     ? pollMs
     : DEFAULT_POLL_MS;
@@ -227,7 +240,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   if (useFiles && !runtime) {
     throw new Error('createHolds: runtime is required for the default file checkpoint (or pass onAsk)');
   }
-  const paths = runtime ? askPaths(runtime) : null;
+  const paths = runtime ? runtimePaths(runtime) : null;
   if (paths) {
     fs.mkdirSync(paths.asksDir, { recursive: true });
     fs.mkdirSync(paths.answersDir, { recursive: true });
@@ -239,7 +252,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
 
   const pub = (h) => ({
     id: h.id, agent: h.agent, method: h.method, url: h.url, rule: h.note,
-    body: h.body.toString('utf8'), waitingSec: Math.round((Date.now() - h.t0) / 1000),
+    waitingSec: Math.round((Date.now() - h.t0) / 1000),
   });
 
   /**
@@ -275,53 +288,30 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
     } catch {}
   }
 
-  function settle(id, approve, reason) {
+  function settle(id, approved, reason) {
     const h = queue.get(id);
     if (!h) return `unknown ${id}`;
     queue.delete(id);
     if (h.timer) clearTimeout(h.timer);
     removeAskFile(id);
-    if (approve) {
-      log({ ev: 'decide', id, agent: h.agent, decision: 'approve', reason: reason || undefined });
+    const decision = approved ? 'allow' : 'deny';
+    if (approved) {
+      log({ ev: 'decide', id, agent: h.agent, decision, reason: reason || undefined });
       onApprove(h);
-      return `approved ${id}`;
+    } else {
+      log({ ev: 'decide', id, agent: h.agent, decision, reason });
+      onDeny(h, reason);
     }
-    log({ ev: 'decide', id, agent: h.agent, decision: 'deny', reason });
-    onDeny(h, reason);
-    return `denied ${id}`;
+    onEvent?.({ type: 'decided', id, decision, reason: reason || undefined });
+    return approved ? `approved ${id}` : `denied ${id}`;
   }
 
   /**
-   * Default `onAsk`: the file checkpoint. Polls this ask's answer file;
-   * timeout (or a vanished queue entry) is deny. Malformed answers are
-   * ignored with a log line and the wait continues until the deadline.
-   *
-   * @param {AskPayload} ask decision-ready ask
-   * @returns {Promise<{ decision: 'allow' | 'deny', reason?: string }>} decision
-   */
-  async function defaultFileAsk(ask) {
-    if (!paths) return { decision: 'deny', reason: 'ask channel failed' };
-    const ansPath = paths.answerFile(ask.id);
-    const deadline = ask.expiresAt ? Date.parse(ask.expiresAt) : Infinity;
-    for (;;) {
-      if (!queue.has(ask.id)) return { decision: 'deny', reason: 'settled elsewhere' };
-      const text = consumeFile(ansPath);
-      if (text !== null) {
-        const parsed = parseAnswer(text);
-        if (parsed) return parsed;
-        log({ ev: 'malformed-answer', id: ask.id, note: 'ignored; still waiting' });
-      }
-      if (Date.now() >= deadline) return { decision: 'deny', reason: 'hold timeout' };
-      await sleepMs(poll);
-    }
-  }
-
-  const askFn = onAsk ?? defaultFileAsk;
-
-  /**
-   * Park an entry: write the ask file + stderr line (file channel only),
-   * then resolve the decision through `onAsk`. Double-settle is safe:
-   * the deadline timer and the answer race, and the loser finds no entry.
+   * Park an entry: write the ask file (file channel only) and report the
+   * ask. Double-settle is safe: the deadline timer and the answer race,
+   * and the loser finds no entry. The file channel never waits here: the
+   * single interval settles on answer, the timer denies on deadline.
+   * The `onAsk` channel stays a promise per hold.
    *
    * @param {object} entry queue entry
    * @param {number|null} ms hold deadline in ms, or null for never
@@ -330,7 +320,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
    */
   async function park(entry, ms, rule) {
     const ask = askPayload(entry, ms, rule);
-    if (paths) {
+    if (useFiles && paths) {
       try {
         writeFileAtomic(paths.askFile(entry.id), JSON.stringify(ask));
       } catch (e) {
@@ -339,36 +329,32 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
         settle(entry.id, false, 'ask channel failed');
         return;
       }
+    }
+    onEvent?.({ type: 'ask', ask });
+    if (!useFiles) {
+      /** @type {{ decision?: unknown, reason?: unknown } | null} */
+      let raw = null;
       try {
-        process.stderr.write(`ASK OPEN ${entry.id}\n`);
-      } catch {}
-    }
-    /** @type {{ decision: string, reason?: string } | null} */
-    let decision = null;
-    try {
-      decision = await askFn(ask);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      decision = { decision: 'deny', reason: `onAsk failed: ${msg}` };
-    }
-    if (decision && (decision.decision === 'allow' || decision.decision === 'approve')) {
-      settle(entry.id, true, '');
-    } else {
-      const reason = decision && typeof decision.reason === 'string' && decision.reason
-        ? decision.reason
-        : 'denied';
-      settle(entry.id, false, reason);
+        raw = await onAsk(ask);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        raw = { decision: 'deny', reason: `onAsk failed: ${msg}` };
+      }
+      const norm = normalizeDecision(raw);
+      if (norm && norm.decision === 'allow') settle(entry.id, true, '');
+      else settle(entry.id, false, norm?.reason ?? 'denied');
     }
   }
 
   /**
-   * Sweep answers for unknown or already-settled ids: stale, ignored,
-   * logged, removed. Runs only for the file channel; a custom `onAsk`
-   * owns its own late answers.
+   * The one answer reader (file channel only): each tick reads `answers/`
+   * once, consuming every answer file. A held id settles; anything else is
+   * stale (ignored, logged, removed). Malformed answers are ignored and
+   * logged; the hold keeps waiting until its deadline.
    *
    * @returns {void}
    */
-  function sweepStaleAnswers() {
+  function pollAnswers() {
     if (!paths) return;
     let names;
     try {
@@ -379,17 +365,25 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
     for (const name of names) {
       if (!name.endsWith('.json')) continue;
       const id = name.slice(0, -'.json'.length);
-      if (queue.has(id)) continue;
-      const consumed = consumeFile(paths.answerFile(id));
-      if (consumed === null) continue;
-      log({ ev: 'stale-answer', id, note: 'unknown or already-settled id; ignored' });
+      const text = consumeFile(paths.answerFile(id));
+      if (text === null) continue;
+      const norm = normalizeDecision(parseAnswer(text), { approveAlias: true });
+      if (!norm) {
+        log({ ev: 'malformed-answer', id, note: 'ignored; still waiting' });
+        continue;
+      }
+      if (!queue.has(id)) {
+        log({ ev: 'stale-answer', id, note: 'unknown or already-settled id; ignored' });
+        continue;
+      }
+      settle(id, norm.decision === 'allow', norm.reason ?? '');
     }
   }
 
-  const sweepTimer = paths
-    ? setInterval(sweepStaleAnswers, poll)
+  const pollTimer = useFiles && paths
+    ? setInterval(pollAnswers, poll)
     : null;
-  if (sweepTimer && typeof sweepTimer.unref === 'function') sweepTimer.unref();
+  if (pollTimer && typeof pollTimer.unref === 'function') pollTimer.unref();
 
   const holds = {
     add({ agent, method, url, headers, body, sock, cres, note }) {
@@ -408,9 +402,6 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       void park(entry, ms, note ?? '');
       return id;
     },
-
-    approve(id) { return settle(id, true, ''); },
-    deny(id, reason) { return settle(id, false, reason || 'denied by user'); },
 
     // The client went away: drop its holds so no later answer can forward
     // a request nobody is listening for.
@@ -433,10 +424,9 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
     decide(req) { return decide(req); },
 
     pending() { return [...queue.values()].map(pub); },
-    size() { return queue.size; },
 
     close() {
-      if (sweepTimer) clearInterval(sweepTimer);
+      if (pollTimer) clearInterval(pollTimer);
       for (const [id] of [...queue]) settle(id, false, 'proxy closing');
     },
   };

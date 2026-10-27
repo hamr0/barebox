@@ -83,25 +83,6 @@ describe('shouldHoldForMode (no sandbox needed)', () => {
     assert.match(decide(get('http://x/payment')) ?? '', /floor/);
   });
 
-  it('an explicit match replaces the method default, and the floor still holds', () => {
-    const decide = shouldHoldForMode('auto', { match: '/hold' });
-    assert.match(decide(get('http://x/hold')) ?? '', /path matches \/hold/);
-    assert.equal(decide(post('http://x/other')), null);
-    assert.match(decide(post('http://x/orders')) ?? '', /floor/);
-  });
-
-  it('trust ignores an explicit match but keeps the floor', () => {
-    const decide = shouldHoldForMode('trust', { match: '/hold' });
-    assert.equal(decide(get('http://x/hold')), null);
-    assert.equal(decide(post('http://x/hold')), null);
-    assert.ok(decide(post('http://x/purchase')));
-  });
-
-  it('an explicit shouldHold replaces the method default, never the floor', () => {
-    const decide = shouldHoldForMode('auto', { shouldHold: () => null });
-    assert.equal(decide(post('http://x/')), null);
-    assert.ok(decide(post('http://x/checkout')));
-  });
 });
 
 describe('run validation (no sandbox needed)', () => {
@@ -112,9 +93,8 @@ describe('run validation (no sandbox needed)', () => {
       /mode must be ask\|auto\|trust/);
   });
 
-  it('rejects a misshapen onAsk and gate', async () => {
+  it('rejects a misshapen onAsk', async () => {
     await assert.rejects(run({ proj: tmpdir(), command: ['true'], onAsk: 'yes' }), /onAsk/);
-    await assert.rejects(run({ proj: tmpdir(), command: ['true'], gate: {} }), /gate/);
   });
 });
 
@@ -127,7 +107,7 @@ describe('run() closes the proxy when launch throws (no sandbox needed)', () => 
   // where unix bind is blocked (this sandbox) as where it works. No
   // process.exit in the child: it ends only when the event loop drains, so
   // a leaked proxy hangs the child and trips the parent timeout.
-  it('uncommitted overlay changes reject AND the process exits', async () => {
+  it('uncommitted overlay changes reject AND the process exits', { timeout: 60000 }, async () => {
     const testDir = dirname(fileURLToPath(import.meta.url));
     const root = mkdtempSync(join(tmpdir(), 'bb-runleak-'));
     try {
@@ -210,7 +190,7 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
     let seenAsk = null;
     const res = await run({
       proj, command: curlHold('RUNONASK'), runtime: rt,
-      allowLoopback: true, pollMs: 25, stdout: out.stream, stderr: err.stream,
+      unsafeTestOnly: { allowLoopback: true }, stdout: out.stream, stderr: err.stream,
       onAsk: async (ask) => {
         // Slow on purpose: while parked, no answer file may appear — the
         // decision below must arrive with the answers dir still empty.
@@ -236,13 +216,13 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
     assert.ok(existsSync(res.audit), 'audit log path is returned and kept');
   });
 
-  it('without onAsk the file channel decides and asks rebuild from the audit log', async () => {
+  it('without onAsk the file channel decides and asks arrive through events', async () => {
     const rt = join(root, 'rt-file');
     const out = capture();
     const err = capture();
     const pending = run({
       proj, command: curlHold('RUNFILE'), runtime: rt,
-      allowLoopback: true, pollMs: 25, timeoutMs: 15000,
+      unsafeTestOnly: { allowLoopback: true }, timeoutMs: 15000,
       stdout: out.stream, stderr: err.stream,
     });
     const id = await waitFor(() => {
@@ -259,21 +239,6 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
     assert.equal(res.asks[0].id, id);
     assert.equal(res.asks[0].decision, 'allow');
     assert.match(res.audit && readFileSync(res.audit, 'utf8'), /"ev":"decide"/);
-  });
-
-  it('a gate-shaped object is accepted (M3 wires it; M2.5 mode still decides)', async () => {
-    const rt = join(root, 'rt-gate');
-    const out = capture();
-    const err = capture();
-    const res = await run({
-      proj, command: curlHold('RUNGATE'), runtime: rt,
-      allowLoopback: true, pollMs: 25,
-      gate: { check: async () => 'allow' },
-      stdout: out.stream, stderr: err.stream,
-      onAsk: async () => ({ decision: 'allow' }),
-    });
-    assert.equal(res.exit, 0, err.text());
-    assert.equal(res.asks.length, 1, 'mode default still parked (gate not consulted yet)');
   });
 
   it('a command with no network creates a temp runtime and returns exit 0', async () => {

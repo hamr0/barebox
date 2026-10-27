@@ -42,7 +42,8 @@ describe('sbx usage (no runtime needed)', () => {
     const err = await run([]).then(() => null, (e) => e);
     assert.ok(err, 'must fail');
     assert.equal(err.code, 2);
-    assert.match(err.stdout, /usage: sbx/);
+    assert.match(err.stderr, /usage: sbx/);
+    assert.equal(err.stdout, '', 'usage writes nothing on stdout');
   });
 
   it('unknown command is a usage error (exit 2)', async () => {
@@ -50,30 +51,21 @@ describe('sbx usage (no runtime needed)', () => {
     assert.equal(err?.code, 2);
   });
 
-  it('SBX_SOCK is rejected (exit 2): the control socket is gone', async () => {
-    const err = await run(['pending'],
-      { SBX_SOCK: join(tmpdir(), 'bb-nowhere.sock') }).then(() => null, (e) => e);
-    assert.ok(err, 'must fail');
-    assert.equal(err.code, 2);
-    assert.match(err.stdout, /no longer supported/);
-  });
-
   it('missing SBX_RUNTIME is a usage error (exit 2)', async () => {
     const env = { ...process.env };
-    delete env.SBX_SOCK;
     delete env.SBX_RUNTIME;
     const err = await execA('node', [CLI, 'pending'],
       { encoding: 'latin1', env }).then(() => null, (e) => e);
     assert.ok(err, 'must fail');
     assert.equal(err.code, 2);
-    assert.match(err.stdout, /usage: sbx/);
+    assert.match(err.stderr, /usage: sbx/);
+    assert.equal(err.stdout, '', 'usage writes nothing on stdout');
   });
 
   it('pending on an empty runtime prints nothing held (exit 0)', async () => {
     const rt = mkdtempSync(join(tmpdir(), 'bb-c-empty-'));
     try {
       const env = { ...process.env };
-      delete env.SBX_SOCK;
       env.SBX_RUNTIME = rt;
       const r = await execA('node', [CLI, 'pending'],
         { encoding: 'latin1', env });
@@ -109,7 +101,8 @@ describe('sbx approve/deny id validation + pending sanitizing (no sandbox needed
           const err = await sbxCli([cmd, bad], { SBX_RUNTIME: rt }).then(() => null, (e) => e);
           assert.ok(err, `${cmd} ${bad} must fail`);
           assert.equal(err?.code, 2, `${cmd} ${bad}: want exit 2, got ${err?.code}`);
-          assert.match(err.stdout, /bad hold id/);
+          assert.match(err.stderr, /bad hold id/);
+          assert.equal(err.stdout, '', 'bad ids write nothing on stdout');
         }
       }
       assert.deepEqual(readdirSync(rt), [], 'no file written anywhere under the runtime');
@@ -131,6 +124,19 @@ describe('sbx approve/deny id validation + pending sanitizing (no sandbox needed
       assert.equal(readFileSync(join(rt, 'asks', 'h9.json'), 'utf8'), '{"id":"h9"}',
         'the ask file must be untouched');
       assert.ok(!existsSync(join(rt, 'answers')), 'no answer dir created either');
+    } finally {
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
+  it('approve of a path id writes nothing on stdout (exit 2)', async () => {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-c-ap-'));
+    try {
+      const err = await sbxCli(['approve', '../x'], { SBX_RUNTIME: rt })
+        .then(() => null, (e) => e);
+      assert.equal(err?.code, 2);
+      assert.equal(err.stdout, '', 'bad ids write nothing on stdout');
+      assert.match(err.stderr, /bad hold id/);
     } finally {
       rmSync(rt, { recursive: true, force: true });
     }
@@ -182,9 +188,9 @@ describe('sbx cli over the file channel', () => {
     const kc = await certFor(join(RT, 'certs'), '127.0.0.1');
     CA = join(RT, 'certs', 'ca.pem');
     tlsUp = await startHttps(kc);
-    proxy = createProxy({ port: 0, certDir: join(RT, 'certs'),
+    proxy = createProxy({ port: 0,
       logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-      clientIdleMs: 500, allowLoopback: true,
+      clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
       hold: { match: '/hold', timeoutMs: 30000, pollMs: 25 } });
     ({ port: PORT } = await proxy.ready);
   });
@@ -227,7 +233,8 @@ describe('sbx cli over the file channel', () => {
   it('approve of an unknown id exits 1', async () => {
     const err = await sbx('approve', 'h9999').then(() => null, (e) => e);
     assert.equal(err?.code, 1);
-    assert.match(err.stdout, /unknown h9999/);
+    assert.match(err.stderr, /unknown h9999/);
+    assert.equal(err.stdout, '', 'unknown ids write nothing on stdout');
   });
 
   it('log lines name the agent', async () => {
@@ -252,7 +259,8 @@ describe('sbx run usage (no sandbox needed)', () => {
   it('run without -- is a usage error (exit 2)', async () => {
     const err = await runCli(['run', '--mode', 'auto']).then(() => null, (e) => e);
     assert.equal(err?.code, 2);
-    assert.match(err.stdout, /usage: sbx/);
+    assert.match(err.stderr, /usage: sbx/);
+    assert.equal(err.stdout, '', 'usage writes nothing on stdout');
   });
 
   it('run with a bad mode is a usage error (exit 2)', async () => {
@@ -263,6 +271,18 @@ describe('sbx run usage (no sandbox needed)', () => {
   it('run with no command after -- is a usage error (exit 2)', async () => {
     const err = await runCli(['run', '--']).then(() => null, (e) => e);
     assert.equal(err?.code, 2);
+  });
+
+  it('diff with no overlay writes nothing on stdout (exit 1)', async () => {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-c-noov-'));
+    try {
+      const err = await runCli(['diff'], { SBX_RUNTIME: rt }).then(() => null, (e) => e);
+      assert.equal(err?.code, 1);
+      assert.equal(err.stdout, '', 'no-overlay writes nothing on stdout');
+      assert.match(err.stderr, /no overlay/);
+    } finally {
+      rmSync(rt, { recursive: true, force: true });
+    }
   });
 });
 
@@ -336,7 +356,7 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
   function spawnRun(extraArgs, command) {
     const child = spawn('node', [CLI, 'run', ...extraArgs, '--', ...command], {
       cwd: proj,
-      env: { ...process.env, HOME: home, SBX_RUNTIME: rt, SBX_ALLOW_LOOPBACK: '1' },
+      env: { ...process.env, HOME: home, SBX_RUNTIME: rt, SBX_UNSAFE_TEST_ALLOW_LOOPBACK: '1' },
     });
     let out = '', err = '';
     child.stdout.on('data', (c) => { out += c; });
@@ -349,7 +369,7 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
     return { child, out: () => out, err: () => err, closed };
   }
 
-  it('--json emits an ask line then a done line with the agent exit code', async (t) => {
+  it('--json emits an ask line then a done line with the agent exit code', { timeout: 120000 }, async (t) => {
     if (skipIfBlocked(t)) return;
     const r = spawnRun(['--mode', 'auto', '--json'],
       ['bash', '-c', `curl -s --max-time 10 --data m=CLIJSON http://127.0.0.1:${plainUp.port}/hold >/dev/null; exit 3`]);
@@ -367,7 +387,7 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
     assert.deepEqual(lines[1], { ev: 'done', exit: 3 });
   });
 
-  it('human mode prints ask and done lines and mirrors the exit code', async (t) => {
+  it('human mode prints ask and done lines and mirrors the exit code', { timeout: 120000 }, async (t) => {
     if (skipIfBlocked(t)) return;
     const r = spawnRun(['--mode', 'auto'],
       ['bash', '-c', `curl -s --max-time 10 --data m=CLIHUMAN http://127.0.0.1:${plainUp.port}/hold`]);
@@ -380,5 +400,37 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
     assert.equal(code, 0, `stderr: ${r.err()}`);
     assert.match(r.out(), new RegExp(`ask ${id} .*POST.*/hold`));
     assert.match(r.out(), /done exit 0/);
+  });
+
+  // 6.1: every line `sbx` prints goes through one sanitizer. The agent
+  // leaves an ESC + U+202E dir holding a non-UTF-8 file; the overlay
+  // refusal names that dir, so the `run failed:` line would carry raw
+  // terminal control without the `out`/`err` printers.
+  const EVIL_SH = 'd=$(printf "ev\\033[2K\\033[1Ail\\xe2\\x80\\xaeX"); mkdir "$d"; ' +
+    'touch "$d/$(printf "\\xff\\xfe")"';
+  const assertClean = (combined, where) => {
+    assert.match(combined, /run failed/, `the refusal surfaces (${where})`);
+    assert.doesNotMatch(combined, /[ -	-]/,
+      `no C0 control bytes incl. ESC reach the terminal (${where})`);
+    assert.ok(!combined.includes('\u202e'), `no bidi override reaches the terminal (${where})`);
+  };
+
+  it('run --overlay sanitizes agent-chosen bytes on the failure line', { timeout: 120000 }, async (t) => {
+    if (skipIfBlocked(t)) return;
+    const r = spawnRun(['--overlay'], ['bash', '-c', EVIL_SH]);
+    const code = await r.closed;
+    assert.equal(code, 1, `out=${r.out()} err=${r.err()}`);
+    assertClean(r.out() + r.err(), 'plain');
+  });
+
+  it('run --overlay --json sanitizes agent-chosen bytes on the failure line', { timeout: 120000 }, async (t) => {
+    if (skipIfBlocked(t)) return;
+    const r = spawnRun(['--overlay', '--json'], ['bash', '-c', EVIL_SH]);
+    const code = await r.closed;
+    assert.equal(code, 1, `out=${r.out()} err=${r.err()}`);
+    assertClean(r.out() + r.err(), 'json');
+    for (const line of r.out().trim().split('\n').filter(Boolean)) {
+      JSON.parse(line); // stdout stays parseable JSON lines
+    }
   });
 });
