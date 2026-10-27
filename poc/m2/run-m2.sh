@@ -28,6 +28,9 @@ start_proxy() { # start_proxy TIMEOUT_MS
 start_proxy 120000
 bash "$M2/hold.sh" approve || exit 1
 bash "$M2/hold.sh" two || exit 1
+bash "$M2/hold.sh" three || exit 1
+bash "$M2/hold.sh" redecide || exit 1
+bash "$M2/hold.sh" malformed || exit 1
 bash "$M2/hold.sh" cap || exit 1
 start_proxy 5000
 bash "$M2/hold.sh" timeout || exit 1

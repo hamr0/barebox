@@ -85,6 +85,41 @@ long)
   grep -q 'M2L' "$RT/l.out" \
     && echo "PASS long approves" || { echo "FAIL long body"; FAIL=1; }
   ;;
+redecide)
+  park M2R "$RT/r.out"; sleep 1
+  P="$($SBX pending)"
+  ID="$(echo "$P" | grep M2R | cut -d' ' -f1)"
+  $SBX approve "$ID" >/dev/null
+  wait
+  [ "$($SBX approve "$ID")" = "unknown $ID" ] \
+    && echo "PASS double-approve answered" || { echo "FAIL redecide"; FAIL=1; }
+  [ "$($SBX deny h999 x)" = "unknown h999" ] \
+    && echo "PASS unknown id answered" || { echo "FAIL unknown id"; FAIL=1; }
+  ;;
+malformed)
+  exec 3<>/dev/tcp/127.0.0.1/3129
+  printf 'GARBAGE\r\n\r\n' >&3
+  R="$(timeout 5 head -c 60 <&3 || true)"
+  exec 3<&-
+  echo "$R" | grep -q 400 \
+    && echo "PASS malformed denied" || { echo "FAIL malformed: $R"; FAIL=1; }
+  G="$(curl -s -o /dev/null -w '%{http_code}' -x "$PROXY" --cacert "$CA" "$ECHO/")"
+  [ "$G" = "200" ] \
+    && echo "PASS proxy survived" || { echo "FAIL proxy died"; FAIL=1; }
+  ;;
+three)
+  park M2A "$RT/a3.out"; sleep 1
+  park M2B "$RT/b3.out"; sleep 1
+  park M2C "$RT/c3.out"; sleep 1
+  P="$($SBX pending)"
+  echo "$P" | grep -c '^h' | grep -q 3 || { echo "FAIL depth != 3"; FAIL=1; }
+  echo "$P" | grep -o '^h[0-9]*' | while read -r ID; do $SBX approve "$ID" >/dev/null; done
+  wait
+  grep -q 'M2A' "$RT/a3.out" && grep -q 'M2B' "$RT/b3.out" && grep -q 'M2C' "$RT/c3.out" \
+    && echo "PASS depth 3 approved" || { echo "FAIL depth 3 bodies"; FAIL=1; }
+  [ "$($SBX pending)" = "nothing held" ] \
+    && echo "PASS queue empty" || { echo "FAIL queue not empty"; FAIL=1; }
+  ;;
 *) echo "unknown scenario $SCEN"; exit 2 ;;
 esac
 [ "$FAIL" = 0 ] && echo "HOLD $SCEN PASS" || { echo "HOLD $SCEN FAIL"; exit 1; }

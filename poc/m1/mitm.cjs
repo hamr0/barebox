@@ -155,7 +155,7 @@ function handleConnect(sock, head, client) {
 
 function handlePlain(sock, first, client) {
   const req = parseReq(first);
-  if (!req) { deny(sock, 400, 'bad plain request'); return; }
+  if (!req || !req.target) { deny(sock, 400, 'bad plain request'); return; }
   const u = new URL(req.target.startsWith('http') ? req.target : `http://${req.headers.host}${req.target}`);
   const up = net.connect(parseInt(u.port || '80', 10), u.hostname, () => {
     log({ ev: 'req', client, method: req.method, url: u.toString(),

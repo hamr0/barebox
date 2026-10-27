@@ -9,7 +9,7 @@
 ```
 
 > An agent runs on your machine with your real tools, every write is undoable, and nothing leaves the machine without passing a doorman. You're asked only when something irreversible is about to happen.
-> No root, no daemon, no image. One shared proxy, many thin sandboxes: ~8 MB each, 10 ms to start.
+> No root, no daemon, no image. One shared proxy, many thin sandboxes: ~8 MB each, 10 ms to start (M0 POC figure — unmeasured on the rewritten code, TODO re-measure).
 
 <p align="center">
   <img src="https://img.shields.io/github/package-json/v/hamr0/barebox?label=version&color=2a4f8c" alt="version (auto from package.json)">
@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/status-POC-c0841a" alt="status: POC">
 </p>
 
-> **Status:** POC. The walls (M0) and HTTPS inspection (M1) are proven and measured; hold-and-ask (M2) is next. The npm package is a name reservation — the API lands with the graduation rewrite after M2. Linux only.
+> **Status:** POC. The walls (M0), HTTPS inspection (M1), and hold-and-ask (M2) are proven and measured. The npm package is a name reservation — the API lands with the graduation rewrite next. Linux only.
 
 ## Why
 
@@ -84,10 +84,10 @@ Measured, not estimated. Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22.
 
 | | barebox (measured) | [srt](https://github.com/anthropic-experimental/sandbox-runtime) 0.0.81 (measured) |
 |---|---|---|
-| Memory per sandbox | **7.7 MB** mean, 7.9 MB max (20 concurrent) | ~100 MB |
-| Proxy | one shared, **56.7 MB** with TLS inspection | one per sandbox |
-| Start + exit | **10 ms** | 1.87–2.05 s |
-| 20 agents | ~215 MB (rough sum) | ~2 GB |
+| Memory per sandbox | **7.8 MB** mean, 7.9 MB max (20 concurrent) | ~100 MB |
+| Proxy | one shared, **~60 MB idle, ~72 MB loaded** (20 agents, within the ≤ 80 MB budget) | one per sandbox |
+| Start + exit | **10 ms** (M0 POC; unmeasured on the rewrite — TODO re-measure) | 1.87–2.05 s |
+| 20 agents | ~228 MB (rough sum: ~72 MB proxy + 20 × 7.8 MB) | ~2 GB |
 
 Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 GB VPS. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/product/findings.md).
 
@@ -97,7 +97,7 @@ Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 
 |---|---|---|
 | M0 | Walls + front door | **PASS** — 14/14, red-team 8/8 |
 | M1 | Proxy sees inside HTTPS (curl, node, python requests, git) | **PASS** — real-internet matrix + negatives, peak 63 MB |
-| M2 | Hold one `x` request, ask, keep everything else running | **PASS** — 6-scenario hold matrix, 120 s + never timeouts |
+| M2 | Hold one `x` request, ask, keep everything else running | **PASS** — 9-scenario hold matrix, 120 s + never timeouts |
 | M3 | Decide r/w/x deterministically (rwxmap + bareguard), audit log | |
 | M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging | |
 | M5 | Keys the agent never holds | |

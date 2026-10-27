@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
-> Working name: TBD (see Open questions).
-> Status: M2 PASS Oct 26 (local hold matrix, all six scenarios); M3 next. Scopes the idea note `agent-sandbox.md` in this folder.
+> Name: barebox (CLI `sbx`).
+> Status: M0–M2 PASS; graduation rewrite done and branch-reviewed (ready, Oct 27). Next: M2.5 integration seam, then M4 → M3 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 – Nov 4 2026 (10 days). Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -42,7 +42,7 @@ The hackathon gives a fixed 10-day window and a demo audience. The memory measur
 
 ### What it is and isn't
 
-- **Is:** a strong guardrail against mistakes and prompt-injected agents. No root, no daemon, no image. Millisecond-scale start for the walls (measured below).
+- **Is:** a strong guardrail against mistakes and prompt-injected agents. No root, no daemon, no image. Millisecond-scale start for the walls (M0 POC measurement; unmeasured on the rewritten code — TODO re-measure).
 - **Isn't:** a security boundary against a determined attacker. The kernel is shared. A kernel exploit escapes. Use a VM for that.
 
 ## 2. How it works (same model as the idea note)
@@ -88,9 +88,23 @@ The proxy sees requests, not intent, and sites use `POST` for both searching and
 1. **Card data in the body: always x.** Any 13–19 digit number that passes the Luhn check, or a CVV/expiry field.
 2. **Payment destinations: always x.** Known payment domains and paths such as `/checkout`, `/payment`, `/orders`, `/purchase`.
 3. **Known APIs: rwxmap labels.** For example, search = r, create order = x.
-4. **Unknown POST: mode default.** Strict: ask once per new domain, then remember for the run. Normal: allow and log.
+4. **Everything else:** `GET`/`HEAD` = r. Any other method without a label = **x** (bareguard's rule: "unsure? tag it x").
 
-The idea note's "personal data leaving" rule is out of scope.
+Rules 1–2 are the **floor**: they hold in every mode, including `trust`. The idea note's "personal data leaving" rule is out of scope.
+
+### Modes (decided Oct 27)
+
+One flag, three values, read like `chmod`. The mode decides only what happens to each letter. The letter comes from the rules above.
+
+| Mode | r | w | x | Floor (card, payment) | Closest Claude Code mode |
+|---|---|---|---|---|---|
+| `ask` | pass | **ask** | **ask** | ask | default (asks before edits and commands) |
+| **`auto`** (default) | pass | pass | **ask** | ask | acceptEdits (edits pass, commands ask) |
+| `trust` | pass | pass | pass, logged | **ask** | bypassPermissions |
+
+- **Why rwx, not tool types.** Claude Code classifies by tool (edit, bash, web fetch). barebox sees only HTTP requests, so it classifies by consequence: can this be undone? That is the same r/w/x bareguard and rwxmap already use, so one vocabulary runs through the suite.
+- **File writes are not in this table.** They land on the M4 overlay in every mode and are reviewed once, at the end (`diff`, then `commit` or `rollback`).
+- **A read-only mode** (Claude Code's `plan`) is a bareguard rwx ceiling of `"r--"`: w and x are denied without asking. It is available by passing a gate (M3) and is not a fourth built-in mode.
 
 ### Capability without custody
 
@@ -117,6 +131,22 @@ These are targets, not results. They get measured in M0, M1 and M6.
 | Shared proxy | <= 80 MB |
 | Each extra sandbox, on top of the agent itself | <= 10 MB |
 | Agents on a 2 GB VPS | 20 |
+
+### Rewrite bench (Oct 27): go/no-go (c) re-measured on the rewritten code
+
+`npm run bench` exit 0 PASS, measured 2026-10-27 in a real shell with 20 concurrent agents
+(`addAgent` + `launch`; per-sandbox RSS from exact `/proc` tree walks of each bwrap PID;
+agent `sleep` excluded per the PRD walls-only definition).
+
+| Item | Measured | Budget | Verdict |
+|---|---|---|---|
+| Per-sandbox overhead (two bwrap processes + socat each) | mean 7.8 MB, max 7.9 MB (range 7.7–7.9 across agents) | ≤ 10 MB each | PASS |
+| Proxy RSS idle | 60.1 MB | ≤ 80 MB | PASS |
+| Proxy RSS after minting 10 certs | 69.4 MB | ≤ 80 MB | PASS |
+| Proxy RSS with 20 parked holds | 71.9 MB | ≤ 80 MB | PASS |
+
+This supersedes the M0/M1 POC proxy figures (52.1 MB bare, 59.9–63.1 MB with TLS) for the
+rewritten code. Start timing remains unmeasured on the rewrite (TODO re-measure).
 
 ## 4. Evidence so far
 
@@ -159,10 +189,10 @@ srt starts a proxy per sandbox, so that is about 1 GB for 10 agents and about 2 
 
 | Setup | 20 agents |
 |---|---|
-| Own walls: 55 MB once + 20 x ~8 MB | ~215 MB |
+| Own walls (rewrite bench): ~72 MB proxy + 20 × 7.8 MB | ~228 MB |
 | srt | ~2 GB |
 
-The own-walls figure will grow. The proxy still has to load TLS handling, rwxmap and bareguard, and none of that is measured. Treat 215 MB as a floor to check, not a promise.
+The own-walls figure will grow. The proxy still has to load TLS handling, rwxmap and bareguard, and none of that is measured. Treat 228 MB as a floor to check, not a promise.
 
 ### M0 measured run (Oct 26, PASS 14/14)
 
@@ -172,7 +202,7 @@ Harness `poc/m0/run-m0.sh` (runtime `/tmp/sbx-m0`; throwaway POC, not shipped): 
 |---|---|---|---|
 | Walls-only overhead per sandbox (2×bwrap + socat, no agent) | mean 7.7 MB, max 7.9 MB | ≤ 10 MB each | PASS |
 | Bare proxy RSS, 22 sockets, no TLS | 52.1 MB | ≤ 80 MB with TLS (M1) | recorded, TLS unmeasured |
-| Cold start + exit, single sandbox | 10 ms (17 ms prior run) | ms-scale walls | PASS |
+| Cold start + exit, single sandbox | 10 ms M0 POC figure (17 ms prior run) — unmeasured on the rewrite, TODO re-measure | ms-scale walls | PASS (M0 POC only) |
 | Through-proxy HTTP | 200 | works | PASS |
 | CONNECT tunnel mechanics | 2 tunnels in log | works | PASS (opaque; inspection is M1) |
 | `~/.ssh` masked (host has 6 entries, non-vacuous) | 0 visible | empty | PASS |
@@ -210,17 +240,23 @@ Signed off by the user.
 | Area | Decision |
 |---|---|
 | Platforms | Linux first (hackathon). macOS and Windows (via WSL2, which reuses the Linux build) come after. |
-| Stack | Node. bareguard (action gate: allow / ask / deny + audit log) and rwxmap (labels API operations r/w/x) run in-process in the proxy. mitmproxy (Python) is dropped. |
+| Stack | Node. bareguard (action gate: allow / ask / deny + audit log) runs in-process in the proxy as barebox's one production dependency. rwxmap is never imported: its exported labels arrive as bareguard rwx config. mitmproxy (Python) is dropped. |
+| Policy engine (Oct 27) | **Two gateways, one channel.** Default: barebox builds a bareguard `Gate` from the mode. Bring your own: pass `gate` — a loop's existing bareguard `Gate` (one policy, budget, `humanChannel` and audit for the whole run), or any object with the same `check(action)` contract ("vanilla checks"). Matched by shape, never `instanceof`, so two installed bareguard versions still work. |
+| Ask channel (Oct 27) | **One channel:** a file checkpoint in the runtime dir, `asks/<id>.json` → `answers/<id>.json` (fwdloop's protocol). Agents, loops and humans all answer it the same way; `sbx pending/approve/deny` is a thin reader/writer over it. The control socket is removed. The runtime dir is masked from the sandbox, so an agent cannot answer its own ask. |
+| Modes (Oct 27) | `ask` / `auto` (default) / `trust`, with the card and payment floor holding in every mode. See section 2, "Modes". |
+| Audit (Oct 27) | One JSONL file in bareguard's line shape (`phase`, `decision`, `rule`, `run_id`, `agent`, `ts`), shared with the gate's audit. barebox adds transport lines only (request, response status, wall denials). Created `0600`, redacted with bareguard's `secrets` redaction. |
+| Suite reuse rule (Oct 27) | When a bare-suite library's primitive is missing or wrong for barebox, the fix goes into **that library**, not a wrapper or patch here. Within reason: a temporary adapter is allowed only with a link to the upstream issue and the condition for deleting it. See "Suite friction" under M3. |
 | Walls | Our own thin walls on bubblewrap, not Anthropic's sandbox-runtime. See "Why own walls" below. |
 | Dropped for v1 | Landlock and custom seccomp. bwrap's own isolation is enough for a guardrail. They can return later. |
 | Undo layer (Linux) | bwrap overlay. Lower = real project, read-only. Upper = per-run tracing paper. Commands: diff, commit, rollback. |
-| Approvals | Second-terminal CLI (`sbx pending`, `sbx approve <id>`, deny) over a local unix socket. Timeout means deny. No web UI. |
-| Governance v1 | Single operator, one policy file per agent, one audit log. |
+| Approvals | ~~Second-terminal CLI over a local unix socket~~ (M2 POC). Superseded Oct 27 by the file-checkpoint channel above; `sbx pending/approve/deny` keeps its commands. Timeout means deny. No web UI. |
+| Governance v1 | Single operator, one mode (or one gate) per agent, one audit log. |
 | Secrets v1 | Injected in request headers only, after approval. A placeholder sits inside the sandbox. Body placeholder swap (for example `{{CARD}}` in a form body) is not v1. |
 | Localhost sockets (M0) | Blocked entirely. The net namespace isolates localhost; revisit treat-as-x in M3 only if a demo needs a local DB. |
 | Locked paths (M0) | `~/.ssh`, `~/secrets`, `~/.mozilla`, `~/.config/chromium`, `~/.gnupg`. More later without changing the walls. |
 | Browser agents + Jev | Out of v1. Demo A uses an API, not a browser. |
 | M0 harness | 20× idle sandboxes (`sleep` + `socat`, no real agent) for walls-only overhead ≤ 10 MB each; bypass set = unset proxy env, `--noproxy`, direct curl to IP. Real-agent and TLS memory come in M1/M6. |
+| API surface | CLI for sure plus programmatic APIs for spawning sandboxed workflows (goal: spawn workflows in a sandbox easily). |
 
 ### Why own walls (option B)
 
@@ -229,7 +265,7 @@ Signed off by the user.
 | Memory per sandbox | ~100 MB (Node 82 + socat ~12 + bash ~8) | ~8 MB (socat 4.1 + walls peak ~3.8) |
 | Proxy | one per sandbox | one shared |
 | Start time | 1.87 / 2.05 / 1.98 s | 0.02–0.03 s (walls only) |
-| 20 agents | ~2 GB | ~215 MB rough sum, proxy unmeasured |
+| 20 agents | ~2 GB | ~228 MB rough sum (~72 MB proxy + 20 × 7.8 MB, rewrite bench) |
 | Blocks work | yes | yes |
 
 Memory is priority 1, and the per-sandbox proxy is the cost. We build the thin walls ourselves (a launcher of about 50 lines). srt stays as prior art. We borrow these ideas from it:
@@ -304,18 +340,81 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Done when | One request is held for a long approval while other requests from the same agent complete. Approve forwards it. Deny and timeout return the 403 with the reason. Tested with the M1 client set. |
 | Estimate | 1 day. |
 
-**Result (Oct 26): PASS.** Local hold matrix (`poc/m2/`, placeholder path trigger): approve forwards with echo intact while a meanwhile GET completes; 2 concurrent holds (approve one, deny other with reason, queue empties); 1 MB cap denied loud at the door, never queued; 5 s timeout denies with reason and frees the queue; `never` holds until decided; 30 s hold survives and approves. Go/no-go (b) met. All three go/no-go modules pass — graduation rewrite unblocked.
+**Result (Oct 26): PASS.** Local hold matrix (`poc/m2/`, placeholder path trigger, 9 scenarios): approve forwards with echo intact while a meanwhile GET completes; depth 2 and 3 concurrent holds (approve rest, deny with reason, queue empties); double-decide and unknown ids answered, never applied twice; malformed input denied 400 with the proxy surviving; 1 MB cap denied loud at the door, never queued; 5 s timeout denies with reason and frees the queue; `never` holds until decided; 30 s hold survives and approves. Go/no-go (b) met. All three go/no-go modules pass — graduation rewrite unblocked.
+
+### Order after M2 (decided Oct 27)
+
+**M2.5 → M4 → M3 → M5 → M6 → M7.**
+- **M2.5 comes first** because M3 plugs policy into the ask seam. Building M3 on the M2 shape (`shouldHold` + control socket) would mean building it twice.
+- **M4 comes before M3** because without the undo layer the project is read-only inside the sandbox. Loops that write files (bareloop, fwdloop) cannot use barebox at all until M4 lands. M3 is the safety story, but M4 is day-one usability.
+
+### M2.5. Integration seam
+
+| | |
+|---|---|
+| Goal | Any loop, agent or human can spawn a sandboxed run in one call and answer its asks through one channel. |
+| We use | Node, the M2 hold queue, bareguard's `humanChannel` shape. |
+| We build | See the list below. |
+| Riskiest assumption | One ask channel serves both a loop (callback / its own gate) and a human or agent in another process (files) without two code paths drifting. |
+| Done when | See the list below. |
+| Estimate | 1 day. |
+
+**We build:**
+1. **`onAsk(ask) → Promise<{ decision: "allow" | "deny", reason? }>`**, the same shape as bareguard's `humanChannel`. The default implementation is the file checkpoint.
+2. **The file checkpoint**:
+   - `<runtime>/asks/<id>.json` is written when a request parks, and `<runtime>/answers/<id>.json` is read once, then renamed away.
+   - A stale or late answer is ignored and logged, as in fwdloop.
+   - An `ASK OPEN <id>` line goes to stderr, so a human watching a terminal knows.
+   - The control socket and its server are deleted.
+3. **A decision-ready ask payload**: `id`, `agent`, `method`, `url`, `rule` (`payment`, `card-in-body`, `x:unlabelled-POST`), `letter`, a redacted body preview, `waitingSec`, `expiresAt`. barebox knows the request, not the intent; the caller adds its own context (step, goal).
+4. **`run({ proj, command, mode, gate, onAsk })`** → `{ exit, asks, audit }` (plus `diff` once M4 exists). It wraps `createProxy`, `addAgent` and `launch`, which stay public as the low-level parts.
+5. **`sbx run [--mode ask|auto|trust] [--json] -- <cmd>`**. With `--json`, stdout carries JSON lines (`{"ev":"ask",...}`, `{"ev":"done","exit":N}`), and the exit code mirrors the agent's.
+6. **Audit lines in bareguard's shape** (see Decisions, "Audit"), so M3 shares the file without a migration.
+
+**Done when:**
+- A loop answers a parked request through `onAsk` with no files involved.
+- A second process answers the same kind of request by writing `answers/<id>.json`, and `sbx approve` does the same.
+- A stale answer is ignored.
+- From inside the sandbox, writing an answer file fails.
+- `sbx run --json` emits an ask line, then a done line with the agent's exit code.
+- The control socket is gone, and the M2 hold tests pass on the new channel.
 
 ### M3. Decide
 
 | | |
 |---|---|
-| Goal | The proxy decides r / w / x deterministically and logs every decision. |
-| We use | rwxmap (labels), bareguard (allow / ask / deny + audit log). |
-| We build | The glue and the deterministic rules from section 2: Luhn card numbers, CVV/expiry, payment domains and paths, unknown POST by mode (strict / normal). One policy file per agent. One audit log. |
-| Riskiest assumption | rwxmap labels and bareguard run in-process in the proxy without breaking the memory target. |
-| Done when | A scripted request set gets the expected decision for each rule, including a case that should not match. The audit log shows each decision. Proxy RSS re-measured with both libraries loaded. |
+| Goal | Every request gets a letter and a decision through a gate; the mode decides what each letter does; every decision is in the one audit log. |
+| We use | bareguard (dependency: `Gate`, rwx, `isPrivateIp`, `secrets` redaction, audit). rwxmap output as bareguard rwx config. |
+| We build | See the list below. |
+| Riskiest assumption | **Proxy memory with bareguard loaded stays ≤ 80 MB.** The rewrite bench measured 71.9 MB with 20 parked holds, so the headroom is about 8 MB. Second: the "x asks" behaviour (see Suite friction). |
+| Done when | See the list below. |
 | Estimate | 1–1.5 days. |
+
+**We build:**
+1. **The action barebox hands the gate**: `{ type: "net", tool: <rwxmap key or null>, url, method, agent, letter }`.
+2. **The letter rules from section 2**: Luhn card numbers, CVV/expiry, payment domains and paths, rwxmap labels, then the GET/HEAD = r, other methods = x default.
+3. **`ask` / `auto` / `trust` as bareguard presets**, with the floor in every mode.
+4. **The `gate` option**: none means a preset; otherwise a passed bareguard `Gate` or any object with the same `check(action)` contract. Matched by shape.
+5. **Reuse instead of barebox's own copies**:
+   - bareguard's `isPrivateIp` replaces barebox's `denyReasonForIp`. bareguard's version already decodes the hex `::ffff:7f00:1` form that barebox's misses.
+   - bareguard's redaction replaces barebox's `SENSITIVE_HEADERS` scrub.
+
+**Done when:**
+- A scripted request set gets the expected decision in each of the three modes, for each rule, including a case that should not match.
+- The floor asks in `trust`.
+- A passed loop gate receives the asks (barebox's file channel stays silent).
+- A vanilla `check()` object works.
+- The audit log shows every decision in bareguard's shape.
+- The proxy RSS bench is re-run with bareguard loaded and the result recorded against ≤ 80 MB.
+
+**Suite friction**: per the suite reuse rule, these are fixed in the owning library, never patched here.
+
+| # | Library | Gap | Needed by | Status |
+|---|---|---|---|---|
+| F1 | bareguard | `rwx.askOn` accepts only `"none"` or `"loose"`. `auto` needs "x asks" and `ask` needs "w and x ask"; today a letter above the ceiling is **denied**, not asked. Proposal: `askOn` takes letters, e.g. `["x"]`. | M3 | to file |
+| F2 | rwxmap | Labels are keyed `<vendor>.<operationId>`, but the proxy sees `METHOD` + URL. Needs a matcher primitive: request → key + letter (OpenAPI path templates). barebox must not write its own matcher. | M3 | to file |
+| F3 | bareguard | barebox's transport lines (request, response status, wall denial) must land in the gate's audit file in its shape. Check in the POC whether `gate.record` covers this; if not, ask for an append API. | M2.5 / M3 | verify in POC |
+| F4 | bareguard | `isPrivateIp` coverage of NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) forms is unverified. If missing, fix it there; barebox imports it. | M3 | verify |
 
 ### M4. Undo layer
 
@@ -367,17 +466,18 @@ This is a plan, not a result. It shifts as POCs return.
 
 | Day | Date | Work | Gate |
 |---|---|---|---|
-| 1 | Oct 26 | M0 (and M6 numbers for 20 sandboxes if trivial) | Go/no-go (a) part 1: bypass fails closed; per-agent overhead measured |
-| 2 | Oct 27 | M1 start: CA, per-host certs | |
-| 3 | Oct 28 | M1 finish: client matrix, proxy memory with TLS | Go/no-go (a) and (c) |
-| 4 | Oct 29 | M2: hold and ask | Go/no-go (b). All three pass, or stop. |
-| 5 | Oct 30 | M3: labels, gate, rules | |
-| 6 | Oct 31 | M3 finish. M4 start. | |
-| 7 | Nov 1 | M4 finish. M5. | |
+| 1 | Oct 26 | M0, M1, M2 POCs (done: all three go/no-go PASS) | Go/no-go (a), (b), (c) met |
+| 2 | Oct 27 | Graduation rewrite, reviews, rewrite bench (done) | Branch review: ready |
+| 3 | Oct 28 | M2.5: ask seam, file channel, `run()`, `sbx run --json` | |
+| 4 | Oct 29 | M4: overlay, diff / commit / rollback | |
+| 5 | Oct 30 | M4 finish (deletions, conflicts). File F1/F2 upstream; settle Q7. | |
+| 6 | Oct 31 | M3: bareguard in-process, proxy RSS first, then modes + letter rules | Proxy ≤ 80 MB with bareguard |
+| 7 | Nov 1 | M3 finish. M5 (keys). | |
 | 8 | Nov 2 | M6 scale run. M7 start (demo A). | Memory targets measured |
 | 9 | Nov 3 | M7: demos A and B, numbers | |
 | 10 | Nov 4 | M7: README, final checks, submission | |
 
+Days 1–2 are results; days 3–10 are a plan. F1 (bareguard `askOn` letters) and F2 (rwxmap request matcher) land in their own repos and gate M3's `auto`/`ask` modes; if either slips, M3 ships `trust` + floor first.
 Nov 2 has room to spare and absorbs slips from earlier days. Nov 4 is the last day.
 
 ## 9. Later (after the hackathon)
@@ -414,9 +514,12 @@ None of these block M0. Nothing here is silently assumed.
 
 | # | Question | Decides |
 |---|---|---|
-| 1 | What is the real proxy memory with TLS, rwxmap and bareguard loaded? M0: bare proxy 52.1 MB (22 sockets, no TLS). TLS still unmeasured. | The <= 80 MB target. Measured in M1 and M3. |
+| 1 | What is the real proxy memory with bareguard loaded? Measured so far: TLS + on-demand certs + 20 holds = 71.9 MB (rewrite bench, Oct 27). bareguard still unmeasured; about 8 MB of headroom. | The ≤ 80 MB target. Measured first in M3. |
 | 2 | ~~`node-forge` or shelling out to `openssl` for certificates?~~ Decided Oct 26: `openssl` subprocess (sandbox keeps proxy RSS clean; platform coupling accepted, see M1). | — |
 | 3 | How should the undo layer handle large untracked dirs (`node_modules`) and build output? | M4 design. |
 | 4 | Localhost sockets (Postgres, Docker daemon) are writes the overlay can't see. Decided Oct 26 for M0: block. | M3 revisits only if a demo needs a local DB. |
 | 5 | Server-side timeouts while a request is held. How long can a hold last in practice? | The approval timeout value in M2. The idea note's sketch used 120 s; that is not tested. |
-| 6 | Working name. | Repo and CLI naming (`sbx` is a placeholder). |
+| 6 | ~~Working name.~~ Decided: **barebox** (npm + repo); CLI stays `sbx`. | — |
+| 7 | **The agent's own model calls.** An agent POSTs to its LLM API (`/v1/messages`, `/v1/chat/completions`) every turn. With "other methods = x", `auto` would ask on every turn. Recommendation: ship a small default rwx label set marking known inference endpoints (Anthropic, OpenAI-compatible, Baseten, local) as `r` (no outside side effect beyond cost), extendable by the user. Cost limits belong to bareguard's `budget`, not to an ask. | M3 rule set; must be settled before M3's POC or `auto` is unusable. |
+| 8 | **"Don't ask again for this run"** (Claude Code's option). Should an answer carry `remember: true`, scoped to agent + method + host for the rest of the run? It cuts repeat asks, but bareguard's `gate.add` only tightens, so widening needs support there (would be friction F5). Recommendation: leave it out of M2.5; decide in M3 after seeing how noisy `auto` is with Q7 in place. | M3. |
+| 9 | **Ask timeout with a file channel.** Polling adds latency; the M2 default deadline was 120 s. What poll interval and default deadline? Recommendation: 250 ms poll, 120 s deadline, configurable; timeout = deny. | M2.5. |

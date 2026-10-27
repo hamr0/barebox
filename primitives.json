@@ -1,0 +1,23 @@
+{
+  "package": "barebox",
+  "primitives": [
+    {
+      "name": "createProxy",
+      "category": "proxy",
+      "when": "Reach for this HARNESS-ONLY to run the front door: it terminates agent TLS, sees every request, and parks the ones a human must decide. It decides nothing itself; pair with the launcher for sandboxes and `sbx` for decisions.",
+      "import": "import { createProxy } from 'barebox'",
+      "signature": "createProxy(opts: ProxyOptions)",
+      "fails": "Throws synchronously on a missing `logFile` (or neither `certDir` nor `runtime`). At runtime, dead upstreams, malformed input, over-cap and timed-out holds all become loud logged HTTP errors, never silence and never a crash. A second proxy on the same port rejects `ready`, never crashes the process.",
+      "example": "import { createProxy } from \"barebox\";\nconst proxy = createProxy({ port: 0, certDir: \"./certs\", logFile: \"./mitm.log\" });\nconst { port } = await proxy.ready;\nawait proxy.close();"
+    },
+    {
+      "name": "launch",
+      "category": "launcher",
+      "when": "Reach for this to HARNESS-ONLY start one sandboxed agent run: it creates the sandbox the agent lives in. It does not decide anything; combine with the proxy for the front door and the gate (M3) for policy.",
+      "import": "import { launch } from 'barebox'",
+      "signature": "launch(opts: object) => ChildProcess",
+      "fails": "Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, or when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent). The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.",
+      "example": "import { launch } from \"barebox\";\nconst child = launch({ runtime: \"/tmp/sbx\", agent: \"fx\", proj: \"/tmp/proj\", command: [\"bash\", \"-c\", \"echo hi\"] });\nawait new Promise((r) => child.on(\"close\", r)); // child.exitCode === 0"
+    }
+  ]
+}
