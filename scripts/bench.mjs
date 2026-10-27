@@ -137,7 +137,7 @@ try {
   });
   const { port: tcpPort } = await proxy.ready;
 
-  const proxyMb = () => process.memoryUsage().rss() / 1024 / 1024;
+  const proxyMb = () => process.memoryUsage.rss() / 1024 / 1024;
   const idleMb = proxyMb();
 
   const certDir = path.dirname(proxy.caFile);
@@ -155,11 +155,31 @@ try {
     child.on('error', () => {});
     children.push(child);
   }
-  // Every tree settled: bwrap + bash + socat + sleep visible in /proc.
+  // Steady-state sampling: the launch flow's inner door-probe loop
+  // (`echo > /dev/tcp/127.0.0.1/<door>` x50 in src/launcher.js) proves the
+  // socat front door accepts before `exec "$@"` replaces bash with the
+  // payload. The host-side observable of that readiness is the payload
+  // (`sleep`) present with the transient pre-exec `bash` gone in each bwrap
+  // tree. Sampling earlier catches the short-lived bash (~3.7 MB) and the
+  // probe's forked socat child (~2.1 MB), so a run passes/fails on timing
+  // alone. Wait for that steady state per agent, then one short bounded
+  // settle for the probe-forked socat child to exit — the settle follows
+  // readiness, it is not the readiness mechanism.
   await waitFor(() => {
     const kids = pidChildren();
-    return children.every((c) => c.pid && (kids[String(c.pid)] || []).length > 0) || false;
-  }, 'all 20 sandbox trees to fork socat');
+    return children.every((c) => {
+      if (!c.pid) return false;
+      const comms = new Set();
+      const stack = [String(c.pid)];
+      while (stack.length) {
+        const p = /** @type {string} */ (stack.pop());
+        comms.add(comm(p));
+        for (const k of kids[p] || []) stack.push(k);
+      }
+      return comms.has('sleep') && !comms.has('bash');
+    }) || false;
+  }, 'all 20 sandboxes to reach steady state (payload up, transient bash gone)');
+  await new Promise((r) => setTimeout(r, 500));
 
   const kids = pidChildren();
   const trees = children.map((c) => treeRss(c.pid, kids));

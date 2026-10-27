@@ -129,7 +129,14 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     // connections that never send data. An accepted-but-paused socket sits
     // in CLOSE_WAIT after the sandbox dies and blocks server 'close' forever.
     const srv = net.createServer((s) => {
-      if (got) s.on('data', (c) => got.push(c.toString()));
+      // Ack-after-receipt: the inner socat bridge (backgrounded, separate PID
+      // namespace, --die-with-parent) is killed when the sandboxed command
+      // exits, so a fire-and-forget echo can lose trailing bytes. The inner
+      // command below waits for this ack before exiting, which proves the
+      // marker reached the host. The ack is sent only AFTER data arrives on
+      // this connection (never on connect), so reading it confirms delivery
+      // of this connection's bytes.
+      if (got) s.on('data', (c) => { got.push(c.toString()); s.write('ok\n'); });
       else s.resume();
     });
     await new Promise((resolve, reject) => {
@@ -177,8 +184,12 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
 
   it('bridges localhost:3128 to the agent socket', async () => {
     const got = await listenSock('t5', true);
+    // Delivery-confirmed write: the shell holds a bidirectional fd open,
+    // sends the marker, and only exits after reading the host's ack (sent
+    // after receipt). Exiting earlier would kill the backgrounded socat
+    // before it flushes. No sleep involved; `read -t` bounds the ack wait.
     const c = launch({ runtime: rt, agent: 't5', proj,
-      command: ['bash', '-c', 'echo marker > /dev/tcp/127.0.0.1/3128'] });
+      command: ['bash', '-c', 'exec 3<>/dev/tcp/127.0.0.1/3128; echo marker >&3; read -t 5 ack <&3; [ "$ack" = ok ]'] });
     assert.equal((await run(c)).code, 0);
     const t0 = Date.now();
     while (!/marker/.test(got.join(''))) {
@@ -224,7 +235,9 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     try { rmSync(sock); } catch {}
     const got = [];
     const srv = net.createServer((s) => {
-      s.on('data', (c) => got.push(c.toString()));
+      // Same ack-after-receipt as listenSock: reply only after data arrives,
+      // so the inner read confirms this connection's marker was delivered.
+      s.on('data', (c) => { got.push(c.toString()); s.write('ok\n'); });
     });
     await new Promise((resolve, reject) => {
       srv.on('error', reject);
@@ -233,7 +246,7 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     servers.push(srv);
     const c = launch({ runtime: rtHome, agent: 't8', proj,
       command: ['bash', '-c',
-        'test ! -e "$HOME/rt/socks/t8.sock" && echo marker > /dev/tcp/127.0.0.1/3128'] });
+        'test ! -e "$HOME/rt/socks/t8.sock" && exec 3<>/dev/tcp/127.0.0.1/3128 && echo marker >&3 && read -t 5 ack <&3 && [ "$ack" = ok ]'] });
     assert.equal((await run(c)).code, 0);
     const t0 = Date.now();
     while (!/marker/.test(got.join(''))) {
@@ -254,7 +267,9 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     try { rmSync(sock); } catch {}
     const got = [];
     const srv = net.createServer((s) => {
-      s.on('data', (c) => got.push(c.toString()));
+      // Same ack-after-receipt as listenSock: reply only after data arrives,
+      // so the inner read confirms this connection's marker was delivered.
+      s.on('data', (c) => { got.push(c.toString()); s.write('ok\n'); });
     });
     await new Promise((resolve, reject) => {
       srv.on('error', reject);
@@ -267,7 +282,7 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     try {
       const c = launch({ runtime: lnk, agent: 't9', proj,
         command: ['bash', '-c',
-          'test ! -e "$HOME/real-rt/socks/t9.sock" && echo marker9 > /dev/tcp/127.0.0.1/3128'] });
+          'test ! -e "$HOME/real-rt/socks/t9.sock" && exec 3<>/dev/tcp/127.0.0.1/3128 && echo marker9 >&3 && read -t 5 ack <&3 && [ "$ack" = ok ]'] });
       assert.equal((await run(c)).code, 0);
       const t0 = Date.now();
       while (!/marker9/.test(got.join(''))) {
