@@ -64,6 +64,7 @@ deny and timeout answer 403 with the reason.
   `GIT_SSL_CAINFO`. Without it every HTTPS call from inside fails
   verification. Only `ca.pem` enters the sandbox, never the key.
 - `sbx` exits 0 ok, 1 unknown id / refused / socket failure, 2 usage.
+- Any listening unix socket under `$HOME` (IDE IPC, rootless-container sockets) is reachable from inside the sandbox: a read-only bind does not block `connect(2)`; the locked-paths list is the lever.
 
 ## What this package does not do
 
