@@ -42,7 +42,7 @@ Three letters, each handled differently — the same `r`/`w`/`x` as [bareguard](
 The agent works in your house:
 
 - **Tracing paper (w).** The agent sees your real files, but every change lands on an overlay laid over them. At the end you commit it or roll it back.
-- **Locked drawers (r).** It reads most things. `~/.ssh`, `~/secrets`, `~/.gnupg`, browser profiles stay shut.
+- **Locked drawers (r).** It reads most things. Keys and password stores (`~/.ssh`, `~/secrets`, `~/.gnupg`, `~/.password-store`, keyrings), browser profiles, cloud and cluster credentials (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/op`) and token files (`~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.cargo/credentials.toml`) stay shut. The agent's own model credentials (`~/.claude`) do not; moving those out is M5.
 - **One front door with a doorman (x).** No network of its own. Lookups pass; anything that sends, pays, or publishes waits for your yes.
 - **Keys it never holds.** The agent types a placeholder; the doorman puts the real API key in the request header only after you approve that request.
 
@@ -60,7 +60,7 @@ The agent works in your house:
   +-----+--------------- bwrap sandbox (unprivileged) ---------------+
   |  files:   overlay   lower = real project (read only)             |
   |                     upper = per-run tracing paper                |
-  |  locked paths (~/.ssh etc.) -> empty tmpfs                       |
+  |  locked paths (~/.ssh etc.) -> empty tmpfs or /dev/null          |
   |  network: none of its own                                        |
   |  socat inside: 127.0.0.1:3128 -> per-agent unix socket           |
   +-----+------------------------------------------------------------+

@@ -212,6 +212,63 @@ describe('mount order for a project under $HOME (no sandbox needed)', () => {
   });
 });
 
+describe('locked file masks (no sandbox needed)', () => {
+  // Fake bwrap again: a file is masked with a /dev/null bind (never --tmpfs),
+  // a symlinked file at its real target, and both land after the project mount.
+  let binDir, prevPath, prevArgsFile, savedHome, root;
+  before(() => {
+    binDir = mkdtempSync(join(tmpdir(), 'bb-fakebin-'));
+    writeFileSync(join(binDir, 'bwrap'),
+      '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$BB_ARGS_FILE"\nexit 0\n');
+    chmodSync(join(binDir, 'bwrap'), 0o755);
+    prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${prevPath}`;
+    prevArgsFile = process.env.BB_ARGS_FILE;
+    process.env.BB_ARGS_FILE = join(binDir, 'args');
+    savedHome = process.env.HOME;
+    root = mkdtempSync(join(tmpdir(), 'bb-lf-'));
+  });
+  after(() => {
+    process.env.PATH = prevPath;
+    if (prevArgsFile === undefined) delete process.env.BB_ARGS_FILE;
+    else process.env.BB_ARGS_FILE = prevArgsFile;
+    process.env.HOME = savedHome;
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('masks a file with /dev/null, a symlink at its target, a dir with tmpfs; skips absent and outside-link', async () => {
+    const home = join(root, 'home'); const proj = join(root, 'proj'); const rt = join(root, 'rt');
+    mkdirSync(join(home, '.aws'), { recursive: true });
+    mkdirSync(join(home, 'dotfiles'));
+    mkdirSync(proj);
+    writeFileSync(join(home, '.netrc'), 'n');
+    writeFileSync(join(home, 'dotfiles', 'npmrc'), 't');
+    symlinkSync('dotfiles/npmrc', join(home, '.npmrc'));
+    const outside = join(root, 'outside-pypirc');
+    writeFileSync(outside, 'o');
+    symlinkSync(outside, join(home, '.pypirc'));     // target outside HOME and project
+    symlinkSync(join(home, 'nowhere'), join(home, '.git-credentials')); // dangling
+    process.env.HOME = home;
+    rmSync(process.env.BB_ARGS_FILE, { force: true });
+    const child = launch({ runtime: rt, agent: 'lf', proj, command: ['true'] });
+    await new Promise((res, rej) => { child.on('error', rej); child.on('close', res); });
+    const args = readFileSync(process.env.BB_ARGS_FILE, 'utf8').split('\n').filter((l) => l !== '');
+    const at = (...seq) => args.findIndex((_, i) => seq.every((s, k) => args[i + k] === s));
+    const projIdx = at('--ro-bind', proj, proj);
+    assert.ok(projIdx >= 0);
+    for (const f of [join(home, '.netrc'), join(home, 'dotfiles', 'npmrc')]) {
+      const i = at('--dev-bind', '/dev/null', f);
+      assert.ok(i > projIdx, `file mask for ${f} missing or before the project mount: ${args.join(' ')}`);
+    }
+    assert.ok(at('--tmpfs', join(home, '.aws')) > projIdx, '.aws dir mask missing');
+    assert.equal(at('--tmpfs', join(home, '.netrc')), -1, 'a file must never get --tmpfs');
+    assert.equal(at('--dev-bind', '/dev/null', join(home, '.npmrc')), -1, 'symlink spelling is not bound');
+    assert.ok(!args.includes(outside) && !args.includes(join(home, '.pypirc')), 'outside link masked');
+    assert.ok(!args.includes(join(home, '.git-credentials')), 'dangling link masked');
+  });
+});
+
 describe('buildCaBundle (no sandbox needed)', () => {
   it('combines system roots with the barebox CA, key never involved', () => {
     const root = mkdtempSync(join(tmpdir(), 'bb-ca-'));
@@ -272,6 +329,14 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     home = join(root, 'home'); proj = join(root, 'proj'); rt = join(root, 'rt');
     mkdirSync(join(home, '.ssh'), { recursive: true });
     writeFileSync(join(home, '.ssh', 'secret.txt'), 'x');
+    // credential-store fixtures: a dir, a file, a symlinked file, a control
+    mkdirSync(join(home, '.aws'));
+    writeFileSync(join(home, '.aws', 'credentials'), 'aws-secret\n');
+    writeFileSync(join(home, '.netrc'), 'machine x password netrc-secret\n');
+    mkdirSync(join(home, 'dotfiles'));
+    writeFileSync(join(home, 'dotfiles', 'npmrc'), '_authToken=npm-secret\n');
+    symlinkSync('dotfiles/npmrc', join(home, '.npmrc'));
+    writeFileSync(join(home, 'notes.txt'), 'plain notes\n');
     mkdirSync(proj, { recursive: true });
     writeFileSync(join(proj, 'ro.txt'), 'x');
     savedHome = process.env.HOME;
@@ -337,6 +402,20 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     const c = launch({ runtime: rt, agent: 't1', proj,
       command: ['bash', '-c', 'test ! -e "$HOME/.ssh/secret.txt"'] });
     assert.equal((await run(c)).code, 0);
+  });
+
+  it('masks credential stores: dirs empty, files read empty, symlinked file shut at both spellings', async () => {
+    await listenSock('t1b');
+    const script = [
+      '[ -z "$(ls -A "$HOME/.aws")" ] || exit 11',
+      '[ "$(wc -c < "$HOME/.netrc")" = 0 ] || exit 12',
+      '[ "$(wc -c < "$HOME/.npmrc")" = 0 ] || exit 13',
+      '[ "$(wc -c < "$HOME/dotfiles/npmrc")" = 0 ] || exit 14',
+      '[ "$(cat "$HOME/notes.txt")" = "plain notes" ] || exit 15',
+    ].join('\n');
+    const c = launch({ runtime: rt, agent: 't1b', proj, command: ['bash', '-c', script] });
+    const r = await run(c);
+    assert.equal(r.code, 0, `exit ${r.code} (11 .aws, 12 .netrc, 13 .npmrc, 14 dotfiles/npmrc, 15 notes): ${r.err}`);
   });
 
   it('binds project read-only', async () => {
