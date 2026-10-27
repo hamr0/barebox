@@ -382,14 +382,28 @@ function bwrapWalk({ lower, upper, work, ignore, scratch, stageDir = null, upper
     // No output cap (stdout carries no data) and no time limit: the walk
     // is finite (`lstat`, never following symlinks), and killing a commit's
     // extraction halfway helps nobody.
+    // Mount order is the design, stated once here. bwrap applies mounts in
+    // argument order, so a later mount lands on top of an earlier one:
+    //   a. host paths at their own paths, read-only — /usr (+ the /lib64
+    //      symlink), srcDir, and nodePrefix when node isn't under /usr;
+    //   b. then everything the walk creates — the overlay over <merged>,
+    //      and the output folders.
+    // A host bind placed after the overlay would hide it whenever the
+    // prefix contains the runtime (nvm under $HOME, ~/bin/node) or the
+    // runtime sits under src/: the walker would see the bare mountpoint and
+    // read every file as deleted, and a commit would delete real files.
+    // Keep node's prefix at its own path: Linuxbrew's node carries an
+    // absolute interpreter and rpath under its prefix, and moving it to a
+    // fixed path like /sbx-node breaks loading. No prefix is refused: even
+    // `/` is correct, merely exposing the host read-only to our own walker.
     const res = spawnSync('bwrap',
       ['--die-with-parent', '--unshare-all', '--new-session',
         '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib64', '/lib64',
-        '--overlay-src', lower, '--overlay', upper, work, merged,
         '--ro-bind', srcDir, srcDir,
+        ...(underUsr ? [] : ['--ro-bind', nodePrefix, nodePrefix]),
+        '--overlay-src', lower, '--overlay', upper, work, merged,
         '--bind', outDir, '/sbx-out',
         ...(stageDir ? ['--bind', stageDir, '/sbx-new'] : []),
-        ...(underUsr ? [] : ['--ro-bind', nodePrefix, nodePrefix]),
         '--', node, join(srcDir, 'overlay-walk.js'),
         merged, JSON.stringify([...ignore]),
         join('/sbx-out', 'manifest.json'),

@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["scripts/bench.mjs", "src/**/*.js"],
+  "exclude": ["types", "node_modules"]
+}

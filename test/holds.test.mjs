@@ -3,7 +3,7 @@
 // runtime dir; the `onAsk` channel needs no runtime at all.
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHolds, normalizeDecision } from '../src/holds.js';
@@ -216,5 +216,68 @@ describe('hold queue events (2.1, 2.2, 2.4)', () => {
       log: () => {}, runtime: join(root, 'rt-x'), onEvent: 'yes',
       onApprove: () => {}, onDeny: () => {},
     }), /onEvent/);
+  });
+});
+
+describe('no answer outlives its queue (r1 item 2)', () => {
+  // One queue per runtime: ids restart at h1, so a dead queue's leftover
+  // answer must never decide the next queue's hold.
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-hstale-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const freshAnswer = (rt, id, obj) => {
+    const tmp = join(rt, 'answers', `.${id}.${process.pid}.tmp`);
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, join(rt, 'answers', `${id}.json`));
+  };
+
+  it('a leftover answer never decides the next hold', async () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    // The previous queue died after `sbx approve h1` landed its answer.
+    mkdirSync(join(rt, 'answers'), { recursive: true });
+    writeFileSync(join(rt, 'answers', 'h1.json'), JSON.stringify({ decision: 'allow' }));
+    const logs = [];
+    const approved = [];
+    const q = createHolds({
+      log: (o) => logs.push(o), runtime: rt, timeoutMs: 5000, pollMs: 10,
+      onApprove: (h) => approved.push(h.id), onDeny: () => {},
+    });
+    try {
+      const stale = logs.filter((l) => l.ev === 'stale-answer' && l.id === 'h1');
+      assert.equal(stale.length, 1, 'the leftover answer is logged once');
+      const id = q.add({
+        agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
+        body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'test hold',
+      });
+      assert.equal(id, 'h1');
+      await new Promise((r) => setTimeout(r, 700));
+      assert.deepEqual(approved, [], 'no forwarding on the dead answer');
+      // The hold stayed parked: a fresh answer still decides it.
+      freshAnswer(rt, 'h1', { decision: 'allow' });
+      await waitFor(() => approved.length === 1, 'fresh answer settles');
+      assert.deepEqual(approved, ['h1']);
+    } finally {
+      q.close();
+    }
+  });
+
+  it('close removes its parked asks', async () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const q = createHolds({
+      log: () => {}, runtime: rt, timeoutMs: 5000, pollMs: 10,
+      onApprove: () => {}, onDeny: () => {},
+    });
+    q.add({
+      agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
+      body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'test hold',
+    });
+    await waitFor(() => readdirSync(join(rt, 'asks')).length >= 1, 'ask file parked');
+    q.close();
+    assert.deepEqual(readdirSync(join(rt, 'asks')), [], 'no ask files survive close');
   });
 });

@@ -658,6 +658,38 @@ describe('node outside /usr, 6.6 (needs bwrap)', { skip: BWRAP_OK ? false : BWRA
     assert.deepEqual(JSON.parse(res.stdout), [['added', 'new.txt']]);
     rollbackOverlay({ runtime: rt, agent: 'n' });
   });
+
+  it('a node prefix containing the runtime still walks and commits', { timeout: 120000 }, () => {
+    // Mount order: the nb prefix holds the runtime and the project, so a
+    // host bind placed after the overlay would hide the merged view and
+    // read every file as deleted (then commit those deletions for real).
+    mkdirSync(join(root, 'nb', 'bin'), { recursive: true });
+    const nodeCopy = join(root, 'nb', 'bin', 'node');
+    copyFileSync(realpathSync(process.execPath), nodeCopy);
+    chmodSync(nodeCopy, 0o755);
+    const proj = join(root, 'nb', 'proj');
+    mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, 'a.txt'), 'orig\n');
+    const rt = join(root, 'nb', 'rt');
+    mkdirSync(rt, { recursive: true });
+    const { upper } = setupOverlay({ runtime: rt, agent: 'nb', proj });
+    writeFileSync(join(upper, 'a.txt'), 'agent\n');
+    writeFileSync(join(upper, 'b.txt'), 'added\n');
+    const script = join(root, 'nb-diff.mjs');
+    writeFileSync(script,
+      `import { diffOverlay, commitOverlay } from ${JSON.stringify(join(ROOT, 'src', 'overlay.js'))};\n` +
+      `const diffed = diffOverlay({ runtime: ${JSON.stringify(rt)}, agent: 'nb' });\n` +
+      `process.stdout.write(JSON.stringify(diffed.map((c) => [c.status, c.path])) + '\\n');\n` +
+      `const res = commitOverlay({ runtime: ${JSON.stringify(rt)}, agent: 'nb' });\n` +
+      `process.stdout.write(JSON.stringify(res.committed) + '\\n');\n`);
+    const res = spawnSync(nodeCopy, [script], { encoding: 'utf8', timeout: 60000 });
+    assert.equal(res.status, 0, `the prefix copy must walk (stderr: ${res.stderr})`);
+    const [diffed, committed] = res.stdout.trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepEqual(diffed, [['modified', 'a.txt'], ['added', 'b.txt']]);
+    assert.deepEqual(committed, ['a.txt', 'b.txt']);
+    assert.equal(readFileSync(join(proj, 'a.txt'), 'utf8'), 'agent\n');
+    assert.equal(readFileSync(join(proj, 'b.txt'), 'utf8'), 'added\n');
+  });
 });
 
 describe('the mid-commit project check, 6.7 (no sandbox needed)', () => {

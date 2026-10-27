@@ -198,7 +198,9 @@ export function normalizeDecision(input, { approveAlias = false } = {}) {
 }
 
 /**
- * Create the hold queue.
+ * Create the hold queue. One queue per runtime: on the file channel the
+ * queue owns `asks/` and `answers/` for its runtime, clearing both at
+ * start and removing its asks on close, so no answer outlives its queue.
  *
  * @param {object} opts
  * @param {(o: Record<string, unknown>) => void} opts.log audit-log writer
@@ -244,6 +246,29 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   if (paths) {
     fs.mkdirSync(paths.asksDir, { recursive: true });
     fs.mkdirSync(paths.answersDir, { recursive: true });
+  }
+  // A dead queue's leftovers must never decide the next queue's holds
+  // (ids restart at h1): clear both folders at start, logging one audit
+  // line per removed answer.
+  if (useFiles && paths) {
+    for (const [dir, isAnswers] of /** @type {[string, boolean][]} */ ([[paths.asksDir, false], [paths.answersDir, true]])) {
+      let names;
+      try {
+        names = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        try {
+          fs.unlinkSync(path.join(dir, name));
+        } catch {
+          continue;
+        }
+        if (isAnswers) {
+          log({ ev: 'stale-answer', id: name.endsWith('.json') ? name.slice(0, -'.json'.length) : name, note: 'leftover from a dead queue; removed at start' });
+        }
+      }
+    }
   }
 
   let n = 0;
@@ -427,7 +452,17 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
 
     close() {
       if (pollTimer) clearInterval(pollTimer);
+      const parked = [...queue.keys()];
       for (const [id] of [...queue]) settle(id, false, 'proxy closing');
+      // The queue's asks die with it: remove their files explicitly, so
+      // `sbx pending` can never list holds of a dead queue.
+      if (paths) {
+        for (const id of parked) {
+          try {
+            fs.unlinkSync(paths.askFile(id));
+          } catch {}
+        }
+      }
     },
   };
 
