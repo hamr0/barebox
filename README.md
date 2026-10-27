@@ -84,10 +84,10 @@ Measured, not estimated. Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22.
 
 | | barebox (measured) | [srt](https://github.com/anthropic-experimental/sandbox-runtime) 0.0.81 (measured) |
 |---|---|---|
-| Memory per sandbox | **7.7 MB** mean, 7.9 MB max (20 concurrent) | ~100 MB |
+| Memory per sandbox | **7.8 MB** mean, 7.9 MB max (20 concurrent) | ~100 MB |
 | Proxy | one shared, **~60 MB idle, ~72 MB loaded** (20 agents, within the ≤ 80 MB budget) | one per sandbox |
 | Start + exit | **10 ms** (M0 POC; unmeasured on the rewrite — TODO re-measure) | 1.87–2.05 s |
-| 20 agents | ~215 MB (rough sum) | ~2 GB |
+| 20 agents | ~228 MB (rough sum: ~72 MB proxy + 20 × 7.8 MB) | ~2 GB |
 
 Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 GB VPS. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/product/findings.md).
 
