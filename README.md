@@ -99,7 +99,7 @@ Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 
 | M1 | Proxy sees inside HTTPS (curl, node, python requests, git) | **PASS** — real-internet matrix + negatives, peak 63 MB |
 | M2 | Hold one `x` request, ask, keep everything else running | **PASS** — 9-scenario hold matrix, 120 s + never timeouts |
 | M3 | Decide r/w/x deterministically (rwxmap + bareguard), audit log | |
-| M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging | |
+| M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging | **IN PROGRESS** — paper + review flow implemented, 8 ship-blockers fixed this pass; full bwrap+unix proof pending |
 | M5 | Keys the agent never holds | |
 | M6 | Scale run: 20 agents + shared proxy | |
 | M7 | Demos: payment held for approval; prompt-injected `~/.ssh` exfil blocked | |

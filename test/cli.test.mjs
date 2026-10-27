@@ -7,12 +7,13 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile as execFileCb, execFileSync, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtempSync, mkdirSync, writeFileSync, renameSync, existsSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, renameSync, existsSync, rmSync, readFileSync, readdirSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { createProxy } from '../src/proxy.js';
+import { writeFileAtomic } from '../src/holds.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
 
@@ -77,6 +78,83 @@ describe('sbx usage (no runtime needed)', () => {
       const r = await execA('node', [CLI, 'pending'],
         { encoding: 'latin1', env });
       assert.equal(r.stdout.trim(), 'nothing held');
+    } finally {
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
+  it('ask/answer files are owner-only (0600)', () => {
+    // Asks carry the audit trail and unredacted body previews; the default
+    // 0644-minus-umask would expose them. Setup-independent: pure fs.
+    const dir = mkdtempSync(join(tmpdir(), 'bb-mode-'));
+    try {
+      const f = join(dir, 'asks', 'h1.json');
+      writeFileAtomic(f, '{"id":"h1"}');
+      assert.equal(lstatSync(f).mode & 0o777, 0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('sbx approve/deny id validation + pending sanitizing (no sandbox needed)', () => {
+  const sbxCli = (args, env = {}) => execA('node', [CLI, ...args],
+    { encoding: 'latin1', env: { ...process.env, ...env } });
+
+  it('approve/deny reject non-h<n> ids with exit 2 before touching any file', async () => {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-id-'));
+    try {
+      for (const bad of ['../asks/h9', '..', 'h', 'h1x', 'H1', 'h-1', 'h1.json', 'h1 h2']) {
+        for (const cmd of ['approve', 'deny']) {
+          const err = await sbxCli([cmd, bad], { SBX_RUNTIME: rt }).then(() => null, (e) => e);
+          assert.ok(err, `${cmd} ${bad} must fail`);
+          assert.equal(err?.code, 2, `${cmd} ${bad}: want exit 2, got ${err?.code}`);
+          assert.match(err.stdout, /bad hold id/);
+        }
+      }
+      assert.deepEqual(readdirSync(rt), [], 'no file written anywhere under the runtime');
+    } finally {
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
+  it('a traversal id cannot overwrite the ask file it names', async () => {
+    // Pre-fix the id went straight into a file path: with asks/h9.json
+    // present, `approve ../asks/h9` overwrote it with an answer payload.
+    const rt = mkdtempSync(join(tmpdir(), 'bb-idt-'));
+    try {
+      mkdirSync(join(rt, 'asks'), { recursive: true });
+      writeFileSync(join(rt, 'asks', 'h9.json'), '{"id":"h9"}');
+      const err = await sbxCli(['approve', '../asks/h9'], { SBX_RUNTIME: rt })
+        .then(() => null, (e) => e);
+      assert.equal(err?.code, 2);
+      assert.equal(readFileSync(join(rt, 'asks', 'h9.json'), 'utf8'), '{"id":"h9"}',
+        'the ask file must be untouched');
+      assert.ok(!existsSync(join(rt, 'answers')), 'no answer dir created either');
+    } finally {
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
+  it('pending strips escape sequences from agent-controlled fields', async () => {
+    // Body previews and URLs print raw to the approver's terminal: an
+    // agent-controlled ESC could rewrite the line before approval.
+    const rt = mkdtempSync(join(tmpdir(), 'bb-esc-'));
+    try {
+      mkdirSync(join(rt, 'asks'), { recursive: true });
+      writeFileSync(join(rt, 'asks', 'h1.json'), JSON.stringify({
+        id: 'h1', agent: 'agent', method: 'POST',
+        url: 'http://x/evil\x1b[2K\x1b[1A',
+        rule: 'hold\x07me',
+        bodyPreview: 'm=\x1b]0;pwned\x07done',
+      }));
+      const r = await sbxCli(['pending'], { SBX_RUNTIME: rt });
+      assert.doesNotMatch(r.stdout, //);
+      assert.doesNotMatch(r.stdout, //);
+      assert.match(r.stdout, /http:\/\/x\/evil/, 'printable content survives');
+      // The OSC sequence (`ESC ] 0 ; pwned BEL`) is consumed whole — only
+      // the printable text around it remains.
+      assert.match(r.stdout, /m=done/, 'printable content survives');
     } finally {
       rmSync(rt, { recursive: true, force: true });
     }

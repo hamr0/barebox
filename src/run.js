@@ -207,7 +207,7 @@ function collectAsks(auditFile, seen) {
  * @param {string[]} [opts.overlayIgnore] path segments invisible to the overlay (default `node_modules`; see overlay.js Q3)
  * @returns {Promise<{ exit: number, asks: AskRecord[], audit: string, diff: import('./overlay.js').OverlayChange[], runtime: string }>} the agent process exit code, the collected ask records, the JSONL audit log path, the run's overlay diff (M4), and the runtime dir addressing it
  * @when Reach for this to HARNESS-ONLY run one sandboxed agent start-to-finish in a single call: it starts the proxy, sandboxes the command, answers holds, and returns the exit code with the ask and audit trail (plus the overlay diff once M4 exists).
- * @fails Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `gate`/`onAsk`, a proxy that never becomes ready, or an overlay diff that cannot be read. The agent's own nonzero exit is returned as `exit`, never thrown.
+ * @fails Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `gate`/`onAsk`, a proxy that never becomes ready, a `launch` that throws (uncommitted overlay changes, a runtime inside the project — the proxy is closed first), or an overlay diff that cannot be read. The agent's own nonzero exit is returned as `exit`, never thrown.
  * @example
  * import { run } from "barebox";
  * const { exit, asks, audit } = await run({ proj: "/tmp/proj", command: ["bash", "-c", "echo hi"] });
@@ -274,18 +274,21 @@ export async function run({ proj, command, mode = 'auto', gate = null, onAsk = n
     throw e;
   }
   const sock = proxy.addAgent(agent);
-  const child = launch({
-    runtime: rt, agent, proj, command,
-    socket: sock, caFile: proxy.caFile, proxyPort, extraEnv,
-    overlay, overlayIgnore,
-  });
-  const out = stdout ?? process.stdout;
-  const err = stderr ?? process.stderr;
-  child.stdout?.on('data', (c) => { try { out.write(c); } catch {} });
-  child.stderr?.on('data', (c) => { try { err.write(c); } catch {} });
+  // `launch` runs INSIDE the try: a synchronous throw there (uncommitted
+  // overlay changes, a runtime inside the project) must still close the
+  // proxy — otherwise its listening sockets keep this process alive forever.
   /** @type {number} */
   let exit;
   try {
+    const child = launch({
+      runtime: rt, agent, proj, command,
+      socket: sock, caFile: proxy.caFile, proxyPort, extraEnv,
+      overlay, overlayIgnore,
+    });
+    const out = stdout ?? process.stdout;
+    const err = stderr ?? process.stderr;
+    child.stdout?.on('data', (c) => { try { out.write(c); } catch {} });
+    child.stderr?.on('data', (c) => { try { err.write(c); } catch {} });
     exit = await new Promise((resolve, reject) => {
       child.on('error', reject);
       child.on('close', (code) => resolve(code ?? 1));

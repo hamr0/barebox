@@ -8,14 +8,16 @@ for (const v of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
 }
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { Writable } from 'node:stream';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync,
   existsSync, renameSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { run, shouldHoldForMode } from '../src/run.js';
+import { setupOverlay } from '../src/overlay.js';
 import { startHttp } from './fixtures/upstream.mjs';
 
 function canUnix() {
@@ -113,6 +115,56 @@ describe('run validation (no sandbox needed)', () => {
   it('rejects a misshapen onAsk and gate', async () => {
     await assert.rejects(run({ proj: tmpdir(), command: ['true'], onAsk: 'yes' }), /onAsk/);
     await assert.rejects(run({ proj: tmpdir(), command: ['true'], gate: {} }), /gate/);
+  });
+});
+
+describe('run() closes the proxy when launch throws (no sandbox needed)', () => {
+  // The repro: uncommitted overlay changes make launch() throw AFTER the
+  // proxy is listening. Pre-fix the throw skipped proxy.close(), and the
+  // listening sockets kept the process alive forever (the 6.5h orphan).
+  // Setup-independent: the child runs under fixtures/unix-to-tcp.mjs, which
+  // redirects unix listens to 127.0.0.1 TCP — the same live-listener shape
+  // where unix bind is blocked (this sandbox) as where it works. No
+  // process.exit in the child: it ends only when the event loop drains, so
+  // a leaked proxy hangs the child and trips the parent timeout.
+  it('uncommitted overlay changes reject AND the process exits', async () => {
+    const testDir = dirname(fileURLToPath(import.meta.url));
+    const root = mkdtempSync(join(tmpdir(), 'bb-runleak-'));
+    try {
+      const proj = join(root, 'proj');
+      const rt = join(root, 'rt');
+      mkdirSync(proj, { recursive: true });
+      writeFileSync(join(proj, 'f.txt'), 'x\n');
+      setupOverlay({ runtime: rt, agent: 'a', proj });
+      writeFileSync(join(rt, 'overlay', 'a', 'upper', 'stray.txt'), 'agent\n');
+      const childPath = join(root, 'child.mjs');
+      writeFileSync(childPath, [
+        `import { run } from ${JSON.stringify(join(testDir, '..', 'src', 'run.js'))};`,
+        `await run({ proj: ${JSON.stringify(proj)}, command: ['true'],`,
+        `  runtime: ${JSON.stringify(rt)}, agent: 'a', overlay: true }).then(`,
+        `  () => { console.log('RESOLVED-UNEXPECTED'); process.exitCode = 1; },`,
+        `  (e) => { console.log('REJECTED:' + (e && e.message)); process.exitCode = 2; });`,
+        '',
+      ].join('\n'));
+      const child = spawn(process.execPath,
+        ['--import', join(testDir, 'fixtures', 'unix-to-tcp.mjs'), childPath],
+        { stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '', err = '';
+      child.stdout.on('data', (c) => { out += c; });
+      child.stderr.on('data', (c) => { err += c; });
+      const code = await new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+          child.kill('SIGKILL');
+          reject(new Error(`run() hung after launch failure (proxy left open): out=${out} err=${err}`));
+        }, 20000);
+        child.on('error', (e) => { clearTimeout(t); reject(e); });
+        child.on('close', (c) => { clearTimeout(t); resolve(c); });
+      });
+      assert.equal(code, 2, `expected the launch rejection (exit 2), got ${code}: out=${out} err=${err}`);
+      assert.match(out, /REJECTED:.*uncommitted/, `the rejection must name the cause: ${out} ${err}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

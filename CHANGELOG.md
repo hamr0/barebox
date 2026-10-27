@@ -6,9 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
-### Changed
+### Added
 
-- Planned for M2.5 (in the PRD, not built): three modes, `ask`, `auto` (the default) and `trust`, with cards and payments asking in every mode. A file-checkpoint ask channel (`asks/<id>.json` → `answers/<id>.json`) will replace the control socket. bareguard becomes the policy gate, and any `check(action)` gate can be passed in instead. One 0600 JSONL audit log will use bareguard's line format.
+- M2.5 integration seam: `ask`, `auto` (the default) and `trust` modes with the card/payment floor in every mode; the `onAsk` seam plus the file-checkpoint ask channel (`asks/<id>.json` → `answers/<id>.json`, control socket deleted); `run()` wrapping proxy + launch; `sbx run [--mode ask|auto|trust] [--json] [--overlay]`; a 0600 JSONL audit log (bareguard's line shape deferred to M3).
+- M4 undo layer: per-run overlay tracing paper with `sbx diff` / `commit` / `rollback`, conflict flagging (refuse by default, `--skip-conflicts`), and `node_modules` invisibility (Q3). `commit` preflights every destination and restores originals if a write fails mid-way; it strips setuid/setgid bits, and committed files get fresh mtimes. `rollback` works even when the project is gone.
+- The agent always starts in the project dir.
+
+### Security
+
+- Ask and answer files are owner-only (0600); `sbx approve`/`deny` accept only `h<n>` ids; `sbx pending` and `sbx run` strip terminal control sequences from agent-controlled fields before printing.
 
 ## [0.2.0] - 2026-10-27
 

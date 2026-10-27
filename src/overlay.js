@@ -17,7 +17,10 @@
 // portably reconstruct what the agent saw. Re-mounting and walking the merged
 // view always shows exactly that, using only bwrap + coreutils — the same
 // dependencies `launch` already needs. `sbx diff`/`commit` need userns for
-// the same reason `launch` does; `rollback` never mounts (it only unlinks).
+// the same reason `launch` does. `rollback` never mounts: it lists the upper
+// dir directly and unlinks it, so it works with no userns and even when the
+// project itself is gone (added/modified there is relative to the run-start
+// snapshot; whiteouts report as deleted).
 //
 // Known limitation: host-side walks run as you, while the agent runs as
 // in-namespace root past file modes — a mode-000 dir in the project reads
@@ -45,8 +48,8 @@ import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   existsSync, mkdirSync, mkdtempSync, readdirSync, lstatSync, statSync,
-  readFileSync, writeFileSync, rmSync, rmdirSync, copyFileSync, chmodSync,
-  readlinkSync, symlinkSync,
+  readFileSync, writeFileSync, rmSync, rmdirSync, copyFileSync, cpSync, chmodSync,
+  readlinkSync, symlinkSync, renameSync, accessSync, constants,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { assertAgentName } from './proxy.js';
@@ -294,6 +297,13 @@ export function setupOverlay({ runtime, agent, proj, ignore = DEFAULT_IGNORE }) 
   return { upper, work };
 }
 
+function noOverlayError(runtime, agent) {
+  return Object.assign(
+    new Error(`sbx: no overlay for agent '${agent}' in ${runtime} ` +
+      `(no overlay record: no run with overlay here, or its changes were rolled back)`),
+    { code: 'SBX_NO_OVERLAY' });
+}
+
 function loadOverlay({ runtime, agent }) {
   assertAgentName(agent);
   const { base: scratch, upper, work, manifest } = overlayPaths(runtime, agent);
@@ -301,9 +311,7 @@ function loadOverlay({ runtime, agent }) {
   try {
     m = JSON.parse(readFileSync(manifest, 'utf8'));
   } catch {
-    throw Object.assign(
-      new Error(`sbx: no overlay for agent '${agent}' in ${runtime} (nothing was launched with overlay here)`),
-      { code: 'SBX_NO_OVERLAY' });
+    throw noOverlayError(runtime, agent);
   }
   if (!m || m.version !== MANIFEST_VERSION || typeof m.proj !== 'string' || typeof m.base !== 'object' || !m.base) {
     throw new Error(`sbx: overlay record for agent '${agent}' is corrupt (${manifest}); remove it and retry`);
@@ -572,6 +580,234 @@ export function diffOverlay({ runtime, agent }) {
 }
 
 /**
+ * One destination stashed aside before the commit overwrites it, for the
+ * mid-commit restore.
+ *
+ * @typedef {object} StashRecord
+ * @property {string} kind `absent` | `absentDir` (we created it: remove it) | `moved` | `copiedDir` (aside copy: put it back) | `file` | `symlink` (in-memory EXDEV fallback) | `dirMode` (chmod back) | `deleted` | `unrestorable` (cannot come back: honestly reported)
+ * @property {string} [slot] backup path holding the moved/copied original
+ * @property {Buffer} [bytes] in-memory file content (EXDEV fallback)
+ * @property {string} [target] in-memory symlink target (EXDEV fallback)
+ * @property {number} [mode] original mode for `file`/`dirMode`
+ */
+
+/**
+ * Permission bits the commit carries into the project: the merged-view mode
+ * minus setuid/setgid. The agent runs as in-namespace root past file modes,
+ * so a setuid/setgid plant inside the sandbox must never become a host
+ * privilege — the low 12 bits (rwx + sticky) pass through unchanged.
+ *
+ * @param {number} mode merged-view mode
+ * @returns {number} mode safe to chmod onto a host file
+ */
+function stripCommitMode(mode) {
+  return mode & 0o1777;
+}
+
+/**
+ * The nearest existing ancestor of `dest` must be a writable directory.
+ * Climbing (never creating) keeps the preflight side-effect free; `statSync`
+ * follows symlinks, so a symlinked parent dir is judged by its target.
+ *
+ * @param {string} dest project path about to be written or removed
+ * @returns {void} throws when nothing writable leads to `dest`
+ */
+function writableAncestor(dest) {
+  let dir = dirname(dest);
+  while (!existsSync(dir)) {
+    const parent = dirname(dir);
+    if (parent === dir) throw new Error(`no existing ancestor for ${dest}`);
+    dir = parent;
+  }
+  if (!statSync(dir).isDirectory()) throw new Error(`${dir} is not a directory`);
+  accessSync(dir, constants.W_OK | constants.X_OK);
+}
+
+/**
+ * Fail closed before a single byte is written: every destination the commit
+ * is about to touch must already be reachable through writable directories,
+ * with no file in the way. An unwritable destination (the chmod-500 case)
+ * throws here with the project untouched, instead of failing half-way and
+ * hiding the half-applied files from the next `sbx diff`. Carries
+ * `applied: []` plus the full `unapplied` list, like the mid-commit error.
+ *
+ * @param {{ proj: string }} ov loaded overlay
+ * @param {OverlayChange[]} apply changes about to be written
+ * @returns {void} throws `SBX_COMMIT_FAILED` naming every blocked path
+ */
+function preflightCommitDests(ov, apply) {
+  /** @type {string[]} */
+  const blocked = [];
+  for (const c of apply) {
+    try {
+      writableAncestor(join(ov.proj, c.path));
+    } catch (e) {
+      blocked.push(`${c.path} (${e instanceof Error ? e.message : String(e)})`);
+    }
+  }
+  if (blocked.length) {
+    throw Object.assign(
+      new Error(`sbx: cannot commit: ${blocked.length} destination(s) not writable ` +
+        `(nothing was applied): ${blocked.join('; ')}`),
+      { code: 'SBX_COMMIT_FAILED', applied: [], restored: [], unrestored: [], unapplied: apply.map((c) => c.path) });
+  }
+}
+
+/**
+ * Stash one destination aside before the commit overwrites it. Rename-aside
+ * is O(1), and the restore renames back over the same dir pair, so EXDEV
+ * cannot strike one way only; where the runtime and the project live on
+ * different filesystems, fall back to an in-memory copy for files and
+ * symlink targets and a recursive copy for dirs. Throws on anything else —
+ * the preflight should have caught it, and the commit must stop.
+ *
+ * @param {string} dest project path about to be overwritten
+ * @param {string} slot backup path for the aside move
+ * @returns {StashRecord} restore record (`absent` when there was nothing there)
+ */
+function stashForReplace(dest, slot) {
+  let st;
+  try {
+    st = lstatSync(dest);
+  } catch (e) {
+    if (/** @type {NodeJS.ErrnoException} */ (e).code === 'ENOENT') return { kind: 'absent' };
+    throw e;
+  }
+  if (st.isFile() || st.isSymbolicLink()) {
+    try {
+      renameSync(dest, slot);
+      return { kind: 'moved', slot };
+    } catch (e) {
+      if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EXDEV') throw e;
+      return st.isFile()
+        ? { kind: 'file', bytes: readFileSync(dest), mode: st.mode & 0o7777 }
+        : { kind: 'symlink', target: readlinkSync(dest) };
+    }
+  }
+  if (st.isDirectory()) {
+    try {
+      renameSync(dest, slot);
+      return { kind: 'moved', slot };
+    } catch (e) {
+      if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EXDEV') throw e;
+      cpSync(dest, slot, { recursive: true });
+      rmSync(dest, { recursive: true, force: true });
+      return { kind: 'copiedDir', slot };
+    }
+  }
+  // Fifos, sockets, device nodes: removeExisting can take them, but no
+  // faithful copy exists to put back — reported, not restored.
+  return { kind: 'unrestorable' };
+}
+
+/**
+ * Undo one applied change from its stash record. Best effort by design —
+ * callers report a failed restore, never throw it.
+ *
+ * @param {string} dest project path to put back
+ * @param {StashRecord} rec record from {@link stashForReplace} (or the dir cases)
+ * @returns {void} throws when this path cannot be restored
+ */
+function restoreCommitDest(dest, rec) {
+  switch (rec.kind) {
+    case 'absent':
+      removeExisting(dest); // we created it: take it back out
+      break;
+    case 'absentDir':
+      // A dir we created: rmdir throws when a later change put files under
+      // it — but restore runs newest-first, so those are gone already.
+      rmdirSync(dest);
+      break;
+    case 'moved':
+      removeExisting(dest);
+      renameSync(/** @type {string} */ (rec.slot), dest);
+      break;
+    case 'copiedDir':
+      removeExisting(dest);
+      cpSync(/** @type {string} */ (rec.slot), dest, { recursive: true });
+      rmSync(/** @type {string} */ (rec.slot), { recursive: true, force: true });
+      break;
+    case 'file':
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, /** @type {Buffer} */ (rec.bytes));
+      chmodSync(dest, /** @type {number} */ (rec.mode));
+      break;
+    case 'symlink':
+      removeExisting(dest);
+      mkdirSync(dirname(dest), { recursive: true });
+      symlinkSync(/** @type {string} */ (rec.target), dest);
+      break;
+    case 'dirMode':
+      // Same-kind dirs keep their contents through the commit (only the mode
+      // is taken), so chmodding back is a complete restore.
+      if (lstatSync(dest).isDirectory()) chmodSync(dest, /** @type {number} */ (rec.mode));
+      break;
+    default:
+      throw new Error('nothing stashed for restore');
+  }
+}
+
+/**
+ * Build the mid-commit failure: put back every stashed original (newest
+ * first, best effort) and report exactly which paths were applied, which
+ * came back, and which never landed. Unrestored originals stay listed in
+ * the message AND survive in the backup dir under the overlay record until
+ * the next setup sweeps them — never silently dropped.
+ *
+ * @param {{ proj: string }} ov loaded overlay
+ * @param {OverlayChange} at change being applied when the failure struck
+ * @param {number} idx index of `at` in `apply`
+ * @param {OverlayChange[]} apply changes the commit attempted, in order
+ * @param {string[]} applied paths already written, in order
+ * @param {Map<string, StashRecord>} stashed originals by path
+ * @param {Error} cause the failure that stopped the commit
+ * @returns {Error} `SBX_COMMIT_FAILED` with `applied` / `restored` / `unrestored` / `unapplied`
+ */
+function commitFailed(ov, at, idx, apply, applied, stashed, cause) {
+  /** @type {string[]} */
+  const restored = [];
+  /** @type {string[]} */
+  const unrestored = [];
+  // The failed change first (newest): its op may have partially written
+  // before throwing (a fully-copied file with a failed chmod, a partial
+  // copy), so its stash is restored the same way. No record means the
+  // failure struck before anything was written for it — purely unapplied.
+  const atRec = stashed.get(at.path);
+  if (atRec && atRec.kind !== 'deleted' && atRec.kind !== 'unrestorable') {
+    try {
+      restoreCommitDest(join(ov.proj, at.path), atRec);
+      restored.push(at.path);
+    } catch {
+      unrestored.push(at.path);
+    }
+  } else if (atRec) {
+    unrestored.push(at.path); // a partial delete cannot come back
+  }
+  for (let k = applied.length - 1; k >= 0; k--) {
+    const p = /** @type {string} */ (applied[k]);
+    const rec = stashed.get(p);
+    if (!rec || rec.kind === 'deleted' || rec.kind === 'unrestorable') {
+      unrestored.push(p); // deletions and exotic originals cannot come back
+      continue;
+    }
+    try {
+      restoreCommitDest(join(ov.proj, p), rec);
+      restored.push(p);
+    } catch {
+      unrestored.push(p);
+    }
+  }
+  const unapplied = [at.path, ...apply.slice(idx + 1).map((x) => x.path)];
+  return Object.assign(
+    new Error(`sbx: commit failed at ${at.path} (${cause.message}): ` +
+      `applied [${applied.join(', ')}]` +
+      (restored.length ? `, restored [${restored.join(', ')}]` : ', nothing could be restored') +
+      (unrestored.length ? `, NOT restored [${unrestored.join(', ')}]` : '') +
+      `; not applied: [${unapplied.join(', ')}]`),
+    { code: 'SBX_COMMIT_FAILED', applied: [...applied], restored, unrestored, unapplied });
+}
+
+/**
  * Press one run's tracing paper down: copy the sandbox's added and modified
  * files into the project and apply its deletions, then start a fresh sheet.
  *
@@ -581,7 +817,7 @@ export function diffOverlay({ runtime, agent }) {
  * @param {string} [opts.onConflict] `refuse` (default) throws before writing anything; `skip` commits the rest and reports the skipped paths
  * @returns {{committed: string[], skipped: {path: string, reason: string}[]}} committed project-relative paths, plus conflicts left uncommitted under `skip`
  * @when Reach for this to press one run's tracing paper down: it copies the sandbox's added and modified files into the project and applies its deletions, refusing loudly on mid-run conflicts.
- * @fails Throws (writing nothing) when any changed file was also changed in the project mid-run, unless onConflict is `skip`; throws on unsupported file kinds and on a project that moved mid-commit.
+ * @fails Throws (writing nothing) when any changed file was also changed in the project mid-run, unless onConflict is `skip`; throws on unsupported file kinds and on a project that moved mid-commit. Unwritable destinations fail the preflight (writing nothing); a failure that still strikes mid-commit restores every stashed original and throws `SBX_COMMIT_FAILED` carrying exactly which paths were `applied`, `restored`, and `unapplied`. Setuid/setgid bits are stripped from committed modes; mtimes are not preserved (fresh on commit — conflict detection uses content hashes, never mtimes).
  * @example
  * import { commitOverlay } from "barebox";
  * const { committed, skipped } = commitOverlay({ runtime: "/tmp/sbx-abc", agent: "agent" });
@@ -605,7 +841,18 @@ export function commitOverlay({ runtime, agent, onConflict = 'refuse' }) {
         'created inside the sandbox (remove it there and retry)');
     }
   }
+  // Preflight BEFORE any write (see preflightCommitDests).
+  preflightCommitDests(ov, apply);
   let stage = null;
+  // Originals stashed aside before each overwrite (see stashForReplace).
+  // The backup dir keeps the `stage-` prefix so a crashed commit's leftovers
+  // are swept by the next setupOverlay like any other staging debris.
+  /** @type {Map<string, StashRecord>} */
+  const stashed = new Map();
+  const backupRoot = mkdtempSync(join(ov.scratch, 'stage-backup-'));
+  /** @type {string[]} */
+  const applied = [];
+  let failed = false;
   try {
     const needFiles = apply.filter((c) => c.status !== 'deleted' && c.type === 'f').map((c) => c.path);
     stage = extractToStage({
@@ -624,42 +871,69 @@ export function commitOverlay({ runtime, agent, onConflict = 'refuse' }) {
     }
     /** @type {string[]} */
     const goneDirs = [];
-    for (const c of apply) {
+    for (let idx = 0; idx < apply.length; idx++) {
+      const c = /** @type {OverlayChange} */ (apply[idx]);
       if (goneDirs.some((d) => c.path.startsWith(`${d}/`))) continue; // removed with its parent
       const dest = join(ov.proj, c.path);
-      if (c.status === 'deleted') {
-        rmLowerRecursive(dest, c.path, ov.ignore);
-        goneDirs.push(c.path);
-      } else if (c.type === 'd') {
-        // Same-kind dir: take the mode, keep the contents — an rm + mkdir
-        // would wipe ignored subtrees (Q3) the layer must never touch. Only
-        // a genuine type change clears the path (see removeExisting).
-        let st = null;
-        try {
-          st = lstatSync(dest);
-        } catch (e) {
-          if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'ENOENT') throw e;
-        }
-        if (!st) {
-          mkdirSync(dest, { recursive: true });
-        } else if (!st.isDirectory()) {
+      const slot = join(backupRoot, `b${idx}`);
+      try {
+        if (c.status === 'deleted') {
+          // No stash: rmLowerRecursive spares ignored subtrees, so a
+          // rename-aside would wrongly move ignored content too. A deletion
+          // that precedes a later failure is honestly reported as
+          // applied-but-not-restored (see commitFailed).
+          stashed.set(c.path, { kind: 'deleted' });
+          rmLowerRecursive(dest, c.path, ov.ignore);
+          goneDirs.push(c.path);
+        } else if (c.type === 'd') {
+          // Same-kind dir: take the mode, keep the contents — an rm + mkdir
+          // would wipe ignored subtrees (Q3) the layer must never touch. Only
+          // a genuine type change clears the path (see removeExisting).
+          let st = null;
+          try {
+            st = lstatSync(dest);
+          } catch (e) {
+            if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'ENOENT') throw e;
+          }
+          if (!st) {
+            stashed.set(c.path, { kind: 'absentDir' });
+            mkdirSync(dest, { recursive: true });
+          } else if (!st.isDirectory()) {
+            stashed.set(c.path, stashForReplace(dest, slot));
+            removeExisting(dest);
+            mkdirSync(dest, { recursive: true });
+          } else {
+            stashed.set(c.path, { kind: 'dirMode', mode: st.mode & 0o7777 });
+          }
+          chmodSync(dest, stripCommitMode(/** @type {number} */ (c.mode)));
+        } else if (c.type === 'l') {
+          stashed.set(c.path, stashForReplace(dest, slot));
           removeExisting(dest);
-          mkdirSync(dest, { recursive: true });
+          mkdirSync(dirname(dest), { recursive: true });
+          symlinkSync(/** @type {string} */ (c.target), dest);
+        } else {
+          stashed.set(c.path, stashForReplace(dest, slot));
+          mkdirSync(dirname(dest), { recursive: true });
+          removeExisting(dest);
+          copyFileSync(join(/** @type {string} */ (stage), c.path), dest);
+          chmodSync(dest, stripCommitMode(/** @type {number} */ (c.mode)));
+          // Modification times are deliberately NOT preserved: the commit
+          // lands with fresh mtimes (copyFileSync's default). That is safe
+          // because conflict detection compares content hashes, never mtimes
+          // — a fresh mtime can never confuse a later diff.
         }
-        chmodSync(dest, /** @type {number} */ (c.mode));
-      } else if (c.type === 'l') {
-        removeExisting(dest);
-        mkdirSync(dirname(dest), { recursive: true });
-        symlinkSync(/** @type {string} */ (c.target), dest);
-      } else {
-        mkdirSync(dirname(dest), { recursive: true });
-        removeExisting(dest);
-        copyFileSync(join(/** @type {string} */ (stage), c.path), dest);
-        chmodSync(dest, /** @type {number} */ (c.mode));
+        applied.push(c.path);
+      } catch (e) {
+        failed = true;
+        throw commitFailed(ov, c, idx, apply, applied, stashed,
+          e instanceof Error ? e : new Error(String(e)));
       }
     }
   } finally {
     if (stage) rmSync(stage, { recursive: true, force: true });
+    // On a mid-commit failure the backup dir stays: unrestored originals
+    // survive there for forensics (and the next setup sweeps the dir).
+    if (!failed) rmSync(backupRoot, { recursive: true, force: true });
   }
   // A skipped conflict stays on the paper (clearing it would drop work
   // silently); a full commit starts a fresh sheet, including the no-op case.
@@ -671,7 +945,66 @@ export function commitOverlay({ runtime, agent, onConflict = 'refuse' }) {
 }
 
 /**
+ * List what one run wrote, straight from the upper dir: files, dirs and
+ * symlinks the agent created or copied up, plus whiteouts (overlayfs char
+ * 0:0 nodes) for what it deleted. No mount, no project — this is what lets
+ * rollback work when the project is gone. Added vs modified is read off the
+ * run-start snapshot (`base`); without the live project that is the closest
+ * true answer. Ignored segments stay invisible, like everywhere else.
+ *
+ * @param {string} upper per-run upper dir
+ * @param {Set<string>} ignore path segments invisible to the layer
+ * @param {Map<string, string|null>} base run-start fingerprints by relpath
+ * @returns {OverlayChange[]} what the upper holds, sorted by path
+ */
+function listUpper(upper, ignore, base) {
+  /** @type {OverlayChange[]} */
+  const out = [];
+  /** @type {string[]} */
+  const stack = [''];
+  while (stack.length) {
+    const dir = /** @type {string} */ (stack.pop());
+    let names;
+    try {
+      names = readdirSync(join(upper, dir));
+    } catch (e) {
+      // A missing upper (hand-deleted) is nothing to discard, not an error.
+      if (dir === '' && /** @type {NodeJS.ErrnoException} */ (e).code === 'ENOENT') return out;
+      throw e;
+    }
+    for (const name of names) {
+      const rel = dir ? `${dir}/${name}` : name;
+      if (isIgnored(rel, ignore)) continue;
+      const abs = join(upper, rel);
+      const st = lstatSync(abs);
+      if (st.isCharacterDevice() && st.rdev === 0) {
+        // Overlayfs whiteout: the agent deleted this path.
+        out.push({ path: rel, status: 'deleted', conflict: false, reason: null });
+        continue;
+      }
+      const type = kindOf(st);
+      out.push({
+        path: rel, status: base.has(rel) ? 'modified' : 'added',
+        conflict: false, reason: null,
+        type, mode: st.mode & 0o7777,
+        ...(type === 'l' ? { target: readlinkSync(abs) } : {}),
+      });
+      if (type === 'd') stack.push(rel);
+    }
+  }
+  out.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return out;
+}
+
+/**
  * Throw one run's tracing paper away: drop every sandboxed change and leave the project exactly as it was.
+ *
+ * Reads the upper dir directly — no diff, no mount — so this works with no
+ * userns and even when the project itself is gone: what the run wrote is
+ * reported from the upper listing (added/modified relative to the run-start
+ * snapshot, whiteouts as deleted) and then removed along with the work dir
+ * and the overlay record, so the next run starts fresh. Never touches the
+ * project.
  *
  * @param {object} opts
  * @param {string} opts.runtime runtime dir holding the run's overlay (`<runtime>/overlay/<agent>`)
@@ -685,9 +1018,35 @@ export function commitOverlay({ runtime, agent, onConflict = 'refuse' }) {
  * console.log(`discarded ${discarded.length} change(s)`);
  */
 export function rollbackOverlay({ runtime, agent }) {
-  const ov = loadOverlay({ runtime, agent });
-  const { changes } = diffLoaded(ov);
-  emptyDir(ov.upper);
-  emptyDir(ov.work);
-  return { discarded: changes };
+  assertAgentName(agent);
+  const { base: basedir, upper, work, manifest } = overlayPaths(runtime, agent);
+  let m;
+  try {
+    m = JSON.parse(readFileSync(manifest, 'utf8'));
+  } catch {
+    throw noOverlayError(runtime, agent);
+  }
+  if (!m || m.version !== MANIFEST_VERSION || typeof m.proj !== 'string' || typeof m.base !== 'object' || !m.base) {
+    throw new Error(`sbx: overlay record for agent '${agent}' is corrupt (${manifest}); remove it and retry`);
+  }
+  const ignore = new Set(/** @type {string[]} */ (m.ignore ?? []));
+  const base = new Map(Object.entries(/** @type {Record<string, string|null>} */ (m.base)));
+  const discarded = listUpper(upper, ignore, base);
+  emptyDir(upper);
+  emptyDir(work);
+  rmSync(manifest, { force: true });
+  // Sweep our own crash debris so the record dir vanishes when empty; a
+  // half-cleared dir is left behind rather than losing track of it.
+  for (const name of readdirSync(basedir)) {
+    if (name.startsWith('stage-') || name.startsWith('merged-')) {
+      rmSync(join(basedir, name), { recursive: true, force: true });
+    }
+  }
+  try {
+    rmdirSync(basedir);
+  } catch (e) {
+    const code = /** @type {NodeJS.ErrnoException} */ (e).code ?? '';
+    if (!['ENOTEMPTY', 'EEXIST', 'ENOENT'].includes(code)) throw e;
+  }
+  return { discarded };
 }

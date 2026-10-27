@@ -2,9 +2,9 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, delimiter } from 'node:path';
 import net from 'node:net';
 import { launch, buildCaBundle } from '../src/launcher.js';
 
@@ -69,6 +69,115 @@ describe('launch validation (no sandbox needed)', () => {
         /must not be the project dir/);
     } finally {
       process.env.HOME = saved;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('mount order for a project under $HOME (no sandbox needed)', () => {
+  // Setup-independent: a fake `bwrap` on PATH records its argv and exits 0,
+  // so the mount ORDER is asserted without any sandbox. bwrap mounts cover
+  // what is below them (later wins), so $HOME read-only must come FIRST,
+  // then the project (overlay or read-only), then locked-path tmpfs masks,
+  // then runtime masks.
+  let binDir, prevPath, prevArgsFile, savedHome;
+  const argsFile = () => process.env.BB_ARGS_FILE;
+  before(() => {
+    binDir = mkdtempSync(join(tmpdir(), 'bb-fakebin-'));
+    const out = join(binDir, 'args');
+    writeFileSync(join(binDir, 'bwrap'),
+      '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$BB_ARGS_FILE"\nexit 0\n');
+    chmodSync(join(binDir, 'bwrap'), 0o755);
+    prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${prevPath}`;
+    prevArgsFile = process.env.BB_ARGS_FILE;
+    process.env.BB_ARGS_FILE = out;
+    savedHome = process.env.HOME;
+  });
+  after(() => {
+    process.env.PATH = prevPath;
+    if (prevArgsFile === undefined) delete process.env.BB_ARGS_FILE;
+    else process.env.BB_ARGS_FILE = prevArgsFile;
+    process.env.HOME = savedHome;
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  async function launchArgs(opts) {
+    rmSync(argsFile(), { force: true });
+    const child = launch(opts);
+    await new Promise((resolve, reject) => {
+      child.on('error', reject);
+      child.on('close', resolve);
+    });
+    return readFileSync(argsFile(), 'utf8').split('\n').filter((l) => l !== '');
+  }
+
+  /** Index of a consecutive argv run, or -1. */
+  const idxOf = (args, ...seq) =>
+    args.findIndex((_, i) => seq.every((s, k) => args[i + k] === s));
+
+  it('overlay: $HOME read-only lands before the project overlay', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bb-mo-'));
+    try {
+      const home = join(root, 'home');
+      const proj = join(home, 'proj');
+      const rt = join(root, 'rt');
+      mkdirSync(proj, { recursive: true });
+      writeFileSync(join(proj, 'f.txt'), 'x\n');
+      process.env.HOME = home;
+      const args = await launchArgs({ runtime: rt, agent: 'mo', proj, command: ['true'], overlay: true });
+      const homeIdx = idxOf(args, '--ro-bind', home, home);
+      const ovIdx = idxOf(args, '--overlay-src', proj);
+      assert.ok(homeIdx >= 0, `home bind missing in ${args.join(' ')}`);
+      assert.ok(ovIdx >= 0, `project overlay missing in ${args.join(' ')}`);
+      assert.ok(homeIdx < ovIdx, `home bind must precede the project overlay (got ${homeIdx} vs ${ovIdx})`);
+    } finally {
+      process.env.HOME = savedHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('no overlay: $HOME read-only lands before the project read-only bind', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bb-mo-'));
+    try {
+      const home = join(root, 'home');
+      const proj = join(home, 'proj');
+      const rt = join(root, 'rt');
+      mkdirSync(proj, { recursive: true });
+      process.env.HOME = home;
+      const args = await launchArgs({ runtime: rt, agent: 'mp', proj, command: ['true'] });
+      const homeIdx = idxOf(args, '--ro-bind', home, home);
+      const projIdx = idxOf(args, '--ro-bind', proj, proj);
+      assert.ok(homeIdx >= 0 && projIdx >= 0, `binds missing in ${args.join(' ')}`);
+      assert.ok(homeIdx < projIdx, `home bind must precede the project bind (got ${homeIdx} vs ${projIdx})`);
+    } finally {
+      process.env.HOME = savedHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('a locked path inside the project stays masked after the project mount', async () => {
+    // The project IS $HOME here and holds its own `.ssh`: the locked tmpfs
+    // must land on top of the project mount, or the real drawer leaks
+    // through the overlay.
+    const root = mkdtempSync(join(tmpdir(), 'bb-mo-'));
+    try {
+      const home = join(root, 'home');
+      const rt = join(root, 'rt');
+      mkdirSync(join(home, '.ssh'), { recursive: true });
+      writeFileSync(join(home, '.ssh', 'id_test'), 'secret\n');
+      writeFileSync(join(home, 'f.txt'), 'x\n');
+      process.env.HOME = home;
+      const args = await launchArgs({ runtime: rt, agent: 'ml', proj: home, command: ['true'], overlay: true });
+      const homeIdx = idxOf(args, '--ro-bind', home, home);
+      const ovIdx = idxOf(args, '--overlay-src', home);
+      const lockIdx = idxOf(args, '--tmpfs', join(home, '.ssh'));
+      assert.ok(homeIdx >= 0 && ovIdx >= 0, `binds missing in ${args.join(' ')}`);
+      assert.ok(lockIdx >= 0, `locked mask missing in ${args.join(' ')}`);
+      assert.ok(homeIdx < ovIdx, 'home bind must precede the project mount');
+      assert.ok(lockIdx > ovIdx, `locked mask must follow the project mount (got ${lockIdx} vs ${ovIdx})`);
+    } finally {
+      process.env.HOME = savedHome;
       rmSync(root, { recursive: true, force: true });
     }
   });

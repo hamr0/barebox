@@ -319,6 +319,56 @@ describe('commit and rollback (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_S
     rollbackOverlay({ runtime: rt, agent: 'c' });
   });
 
+  it('an unwritable destination fails before writing anything (chmod-500)', () => {
+    // The repro: `sub` is read-only from the start (500 keeps r-x, so the
+    // snapshot and the diff still read it). The commit must refuse with the
+    // project untouched — never apply the earlier-sorting files and hide
+    // them from the next `sbx diff`.
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    chmodSync(join(proj, 'sub'), 0o500);
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const { upper } = setupOverlay({ runtime: rt, agent: 'c', proj });
+    writeFileSync(join(upper, 'edit.txt'), 'agent\n');
+    mkdirSync(join(upper, 'sub'), { recursive: true });
+    writeFileSync(join(upper, 'sub', 'x.txt'), 'agent\n');
+    chmodSync(join(upper, 'sub'), 0o500); // no mode-only change on `sub` itself
+    try {
+      let err = null;
+      try {
+        commitOverlay({ runtime: rt, agent: 'c' });
+      } catch (e) {
+        err = e;
+      }
+      assert.ok(err, 'commit must throw');
+      assert.equal(err.code, 'SBX_COMMIT_FAILED');
+      assert.match(err.message, /not writable/);
+      assert.match(err.message, /sub\/x\.txt/);
+      assert.deepEqual(err.applied, [], 'nothing may be applied');
+      assert.ok(err.unapplied.includes('sub/x.txt'));
+      assert.equal(readFileSync(join(proj, 'edit.txt'), 'utf8'), 'orig\n',
+        'the earlier-sorting file must not slip through a refused commit');
+      assert.ok(!existsSync(join(proj, 'sub', 'x.txt')));
+    } finally {
+      chmodSync(join(proj, 'sub'), 0o700);
+      rollbackOverlay({ runtime: rt, agent: 'c' });
+    }
+  });
+
+  it('commit strips setuid/setgid bits but keeps the low bits', () => {
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const { upper } = setupOverlay({ runtime: rt, agent: 'c', proj });
+    writeFileSync(join(upper, 'suid.txt'), 's\n');
+    chmodSync(join(upper, 'suid.txt'), 0o4755);
+    mkdirSync(join(upper, 'sgiddir'));
+    chmodSync(join(upper, 'sgiddir'), 0o2755);
+    const res = commitOverlay({ runtime: rt, agent: 'c' });
+    assert.deepEqual(res, { committed: ['sgiddir', 'suid.txt'], skipped: [] });
+    assert.equal(lstatSync(join(proj, 'suid.txt')).mode & 0o7777, 0o755);
+    assert.equal(lstatSync(join(proj, 'sgiddir')).mode & 0o7777, 0o755);
+    rollbackOverlay({ runtime: rt, agent: 'c' });
+  });
+
   it('a user-created file colliding with an add is a conflict', () => {
     const proj = mkproj(mkdtempSync(join(root, 'p-')));
     const rt = mkdtempSync(join(root, 'rt-'));
@@ -351,6 +401,69 @@ describe('commit and rollback (needs bwrap)', { skip: BWRAP_OK ? false : BWRAP_S
     const rt = mkdtempSync(join(root, 'rt-'));
     assert.throws(() => rollbackOverlay({ runtime: rt, agent: 'ghost' }), /no overlay/);
   });
+});
+
+describe('rollback without the project (no sandbox needed)', () => {
+  // Setup-independent: hand-built uppers, no mounts, no sockets — rollback
+  // only lists the upper dir and unlinks it, so it must work with the
+  // project gone (and with bwrap hidden, proving no mount is involved).
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-or-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('rollback with the project missing succeeds, empties the overlay, next run allowed', () => {
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    setupOverlay({ runtime: rt, agent: 'gone', proj });
+    mkdirSync(join(rt, 'overlay', 'gone', 'upper', 'sub'), { recursive: true });
+    writeFileSync(join(rt, 'overlay', 'gone', 'upper', 'sub', 'x.txt'), 'agent\n');
+    writeFileSync(join(rt, 'overlay', 'gone', 'upper', 'edit.txt'), 'agent-edit\n');
+    symlinkSync('keep.txt', join(rt, 'overlay', 'gone', 'upper', 'link.txt'));
+    rmSync(proj, { recursive: true, force: true }); // the project is gone
+    const { discarded } = withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'gone' }));
+    const byPath = new Map(discarded.map((c) => [c.path, c]));
+    assert.ok(byPath.has('sub/x.txt'), `agent file reported, got ${JSON.stringify(discarded)}`);
+    assert.ok(byPath.has('edit.txt'));
+    assert.ok(byPath.has('link.txt'));
+    assert.equal(byPath.get('edit.txt').status, 'modified', 'in the run-start snapshot');
+    assert.equal(byPath.get('sub/x.txt').status, 'added', 'not in the run-start snapshot');
+    // The overlay record is fully gone: upper, work and manifest.
+    assert.ok(!existsSync(join(rt, 'overlay', 'gone', 'manifest.json')));
+    assert.ok(!existsSync(join(rt, 'overlay', 'gone', 'upper', 'edit.txt')));
+    // The next run starts fresh on a re-created project.
+    mkdirSync(proj, { recursive: true });
+    writeFileSync(join(proj, 'keep.txt'), 'keep\n');
+    setupOverlay({ runtime: rt, agent: 'gone', proj }); // must not throw
+    rollbackOverlay({ runtime: rt, agent: 'gone' });
+  });
+
+  it('rollback with the project present lists the upper with no mount (bwrap hidden)', () => {
+    const proj = mkproj(mkdtempSync(join(root, 'p-')));
+    const rt = mkdtempSync(join(root, 'rt-'));
+    setupOverlay({ runtime: rt, agent: 'still', proj });
+    writeFileSync(join(rt, 'overlay', 'still', 'upper', 'new.txt'), 'agent\n');
+    const { discarded } = withoutBwrap(() => rollbackOverlay({ runtime: rt, agent: 'still' }));
+    assert.deepEqual(discarded.map((c) => [c.status, c.path]), [['added', 'new.txt']]);
+    assert.ok(!existsSync(join(rt, 'overlay', 'still', 'manifest.json')));
+    assert.equal(readFileSync(join(proj, 'keep.txt'), 'utf8'), 'keep\n', 'project untouched');
+  });
+
+  it('rollback reports a real whiteout as deleted (needs bwrap)',
+    { skip: BWRAP_OK ? false : BWRAP_SKIP }, () => {
+      const proj = mkproj(mkdtempSync(join(root, 'p-')));
+      const rt = mkdtempSync(join(root, 'rt-'));
+      const ov = setupOverlay({ runtime: rt, agent: 'white', proj });
+      agentWrite({ ...ov, lower: proj, script: 'rm "$M/del.txt"; echo agent > "$M/edit.txt"' });
+      rmSync(proj, { recursive: true, force: true });
+      const { discarded } = rollbackOverlay({ runtime: rt, agent: 'white' });
+      const byPath = new Map(discarded.map((c) => [c.path, c.status]));
+      assert.equal(byPath.get('del.txt'), 'deleted', `whiteout listed, got ${JSON.stringify(discarded)}`);
+      assert.equal(byPath.get('edit.txt'), 'modified');
+    });
 });
 
 describe('ignored dirs are invisible (Q3)', () => {
@@ -471,7 +584,8 @@ describe('end-to-end through a real mount (needs bwrap)', { skip: BWRAP_OK ? fal
     const { discarded } = rollbackOverlay({ runtime: rt, agent: 'e' });
     assert.ok(discarded.length >= 5, `expected the chaos listed, got ${JSON.stringify(discarded)}`);
     assert.deepEqual(readTree(proj), before, 'rollback must restore content, modes and links exactly');
-    assert.deepEqual(diffOverlay({ runtime: rt, agent: 'e' }), []);
+    // The record is gone with the paper: nothing left to diff.
+    assert.throws(() => diffOverlay({ runtime: rt, agent: 'e' }), /no overlay/);
   });
 
   it('mid-run user changes are flagged, never overwritten', () => {

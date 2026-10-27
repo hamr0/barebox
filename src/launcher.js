@@ -115,14 +115,21 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     '--ro-bind', '/usr', '/usr',
     '--symlink', 'usr/lib64', '/lib64',
     '--ro-bind', '/etc', '/etc',
+    // $HOME first, the project second: a project under $HOME would otherwise
+    // vanish under the home bind (bwrap mounts cover what is below them —
+    // the later mount wins where they overlap). The project mount (overlay
+    // or read-only) therefore lands on top of the read-only home.
+    '--ro-bind', home, home,
     // Tracing paper (M4): lower = real project, upper = this run's sheet.
     // Without it the project stays a read-only bind and writes fail.
     ...(ov
       ? ['--overlay-src', proj, '--overlay', ov.upper, ov.work, proj]
       : ['--ro-bind', proj, proj]),
     '--chdir', proj,
-    '--ro-bind', home, home,
   ];
+  // Locked drawers AFTER the project mount: the tmpfs mask must land on top,
+  // or a project that contains one of these paths (a project that IS $HOME,
+  // or holds its own `.ssh`) would leak the real drawer through the overlay.
   for (const p of LOCKED_PATHS) {
     if (existsSync(`${home}/${p}`)) args.push('--tmpfs', `${home}/${p}`);
   }
@@ -136,7 +143,8 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   // the runtime is outside home/proj and hence not bound in at all), never
   // on the host tree the proxy polls. (The agent's own socket is bound from
   // the host side to /run/sbx/agent.sock, so masking the sandbox-side
-  // runtime path does not close the front door.)
+  // runtime path does not close the front door.) These masks stay after the
+  // project and locked mounts: where paths overlap, the later mount wins.
   {
     // Lexical on purpose: bwrap sees these same spellings, so the mask
     // lands on the path the sandbox actually shows. (`resolve` would

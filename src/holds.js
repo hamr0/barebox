@@ -114,7 +114,10 @@ export function askPaths(runtime) {
 export function writeFileAtomic(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
-  fs.writeFileSync(tmp, text);
+  // 0600, not the 0644 default: asks carry the audit trail and unredacted
+  // body previews, and answers carry the decision. (Umask can only remove
+  // bits from 0600, never add group/other access.)
+  fs.writeFileSync(tmp, text, { mode: 0o600 });
   fs.renameSync(tmp, file);
 }
 

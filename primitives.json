@@ -7,7 +7,7 @@
       "when": "Reach for this to press one run's tracing paper down: it copies the sandbox's added and modified files into the project and applies its deletions, refusing loudly on mid-run conflicts.",
       "import": "import { commitOverlay } from 'barebox'",
       "signature": "commitOverlay(opts: object) => {committed: string[], skipped: {path: string, reason: string}[]}",
-      "fails": "Throws (writing nothing) when any changed file was also changed in the project mid-run, unless onConflict is `skip`; throws on unsupported file kinds and on a project that moved mid-commit.",
+      "fails": "Throws (writing nothing) when any changed file was also changed in the project mid-run, unless onConflict is `skip`; throws on unsupported file kinds and on a project that moved mid-commit. Unwritable destinations fail the preflight (writing nothing); a failure that still strikes mid-commit restores every stashed original and throws `SBX_COMMIT_FAILED` carrying exactly which paths were `applied`, `restored`, and `unapplied`. Setuid/setgid bits are stripped from committed modes; mtimes are not preserved (fresh on commit — conflict detection uses content hashes, never mtimes).",
       "example": "import { commitOverlay } from \"barebox\";\nconst { committed, skipped } = commitOverlay({ runtime: \"/tmp/sbx-abc\", agent: \"agent\" });\nconsole.log(`committed ${committed.length} file(s), skipped ${skipped.length}`);"
     },
     {
@@ -52,7 +52,7 @@
       "when": "Reach for this to HARNESS-ONLY run one sandboxed agent start-to-finish in a single call: it starts the proxy, sandboxes the command, answers holds, and returns the exit code with the ask and audit trail (plus the overlay diff once M4 exists).",
       "import": "import { run } from 'barebox'",
       "signature": "run(opts: object) => Promise<{ exit: number, asks: AskRecord[], audit: string, diff: OverlayChange[], runtime: string }>",
-      "fails": "Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `gate`/`onAsk`, a proxy that never becomes ready, or an overlay diff that cannot be read. The agent's own nonzero exit is returned as `exit`, never thrown.",
+      "fails": "Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `gate`/`onAsk`, a proxy that never becomes ready, a `launch` that throws (uncommitted overlay changes, a runtime inside the project — the proxy is closed first), or an overlay diff that cannot be read. The agent's own nonzero exit is returned as `exit`, never thrown.",
       "example": "import { run } from \"barebox\";\nconst { exit, asks, audit } = await run({ proj: \"/tmp/proj\", command: [\"bash\", \"-c\", \"echo hi\"] });"
     }
   ]

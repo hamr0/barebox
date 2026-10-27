@@ -29,12 +29,28 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
 import { askPaths, writeFileAtomic } from './holds.js';
 import { run as sandboxRun } from './run.js';
 import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
 import { assertAgentName } from './proxy.js';
 
 const USAGE = 'usage: sbx [--help] | pending | approve <id> | deny <id> [reason] | diff [--agent <name>] | commit [--agent <name>] [--skip-conflicts] | rollback [--agent <name>] | run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]';
+
+/** Hold ids the CLI accepts: `h<n>` only. Anything else is a usage error, never a path. */
+const HOLD_ID_RE = /^h\d+$/;
+
+/**
+ * Strip terminal control before printing agent-controlled bytes (ask URLs,
+ * rules, body previews): an escape sequence smuggled into a preview could
+ * otherwise rewrite the approver's terminal line before approval.
+ *
+ * @param {unknown} s value to print
+ * @returns {string} printable text with no VT sequences or C0/C1 controls
+ */
+function safe(s) {
+  return stripVTControlCharacters(String(s ?? '')).replace(/[\x00-\x1f\x7f]/g, '');
+}
 // Exit codes: 0 ok, 1 unknown id / refused / run failure, 2 usage.
 // `sbx run` mirrors the agent's exit code instead (usage errors stay 2).
 const [cmd, ...args] = process.argv.slice(2);
@@ -107,8 +123,15 @@ async function cliRun({ mode, json, overlay, command }) {
   const paths = askPaths(runtime);
   const seen = new Set();
   const emitAsk = (h) => {
-    if (json) console.log(JSON.stringify({ ev: 'ask', ...h }));
-    else console.log(`ask ${h.id} ${h.agent} ${h.method} ${h.url} rule=${h.rule ?? ''}`);
+    // Agent-controlled bytes, sanitized before they reach a terminal.
+    const clean = {
+      ...h,
+      id: safe(h.id), agent: safe(h.agent), method: safe(h.method),
+      url: safe(h.url), rule: safe(h.rule),
+      ...(h && typeof h === 'object' && 'bodyPreview' in h ? { bodyPreview: safe(h.bodyPreview) } : {}),
+    };
+    if (json) console.log(JSON.stringify({ ev: 'ask', ...clean }));
+    else console.log(`ask ${clean.id} ${clean.agent} ${clean.method} ${clean.url} rule=${clean.rule}`);
   };
   const sweepOnce = () => {
     let names;
@@ -311,13 +334,22 @@ async function cliDecide(decisionCmd, rest) {
         const st = fs.statSync(paths.askFile(h.id));
         waiting = Math.max(0, Math.round((Date.now() - st.mtimeMs) / 1000));
       } catch {}
-      const body = String(h.bodyPreview ?? '').replace(/\s+/g, ' ').slice(0, 200);
-      console.log(`${h.id} ${h.agent} ${h.method} ${h.url} (${waiting}s) rule=${h.rule ?? ''} body=${body}`);
+      // Agent-controlled bytes (URL, rule, body preview): sanitized before
+      // they reach the approver's terminal (see `safe`).
+      const body = safe(h.bodyPreview).replace(/\s+/g, ' ').slice(0, 200);
+      console.log(`${safe(h.id)} ${safe(h.agent)} ${safe(h.method)} ${safe(h.url)} (${waiting}s) rule=${safe(h.rule)} body=${body}`);
     }
     process.exit(0);
   }
 
   const [id, ...ids] = rest;
+  // The id goes straight into `asks/<id>.json` and `answers/<id>.json`:
+  // anything but `h<n>` is rejected here (exit 2) before any file is
+  // touched, so `sbx approve ../asks/h9` cannot write outside `answers/`.
+  if (!HOLD_ID_RE.test(id)) {
+    console.log(`bad hold id ${JSON.stringify(id)} (want h<n>, e.g. h1)`);
+    process.exit(2);
+  }
   // Unknown (never parked, or already settled and swept) is exit 1, never a
   // stray answer file: writing one would linger as stale until the sweeper
   // removes it, and could be misread as a decision that counted.
