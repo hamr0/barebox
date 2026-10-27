@@ -162,32 +162,20 @@ jobs:
           cat > tsconfig.json <<'JSON'
           { "compilerOptions": { "strict": true, "module": "nodenext",
             "moduleResolution": "nodenext", "target": "es2022",
-            "noEmit": true, "types": ["node"] } }
+            "noEmit": true, "types": ["node"], "resolveJsonModule": true } }
           JSON
-          # ── PER-REPO: replace this quickstart with YOUR package's minimal usage ──
-          # Three rules, each of them load-bearing:
-          #
-          #  1. Import from the package NAME (as an adopter does), never a path.
-          #  2. DEREFERENCE what the API returns (`res.ok`, `res.reason`), don't just
-          #     call it. A call-only check still compiles when a return is annotated
-          #     `object` — the exact bug class this gate exists to catch (a shipped
-          #     package gave TS adopters TS2339 on `verdict.ok` while its own
-          #     `tsc --noEmit` stayed green).
-          #  3. If `exports` has SUBPATHS, import at least one — a root-only quickstart
-          #     on a multi-subpath package tests a fraction of the surface. A subpath
-          #     that ships no .d.ts fails (`TS7016`) only once imported, in ANY layout.
-          #     A subpath merely MISSING its `types` condition depends on layout, and
-          #     both were measured: with .d.ts in a separate `types/` dir it breaks
-          #     (nothing to fall back to); with .d.ts co-located beside the .js, TS
-          #     finds the sibling and it still resolves. Co-located layouts are more
-          #     forgiving here — that is not a reason to skip the subpath import,
-          #     since the unshipped-.d.ts case bites either way.
-          #
-          # Mirror the README's documented minimal usage, and keep it RUNTIME-valid
-          # (real option values the library actually accepts), not merely type-valid.
+          # ── PER-REPO: barebox minimal usage (mirrors README quickstart) ──
+          # resolveJsonModule is required: adopters import the primitives
+          # manifest subpath as JSON, and the gate must prove that resolves.
           cat > app.ts <<EOF
-          import * as lib from "$NAME";
-          const _check: unknown = lib;
+          import { launch, createProxy } from "barebox";
+          import manifest from "barebox/primitives.json";
+          const child = launch({ runtime: "/tmp/sbx", agent: "fx", proj: "/tmp/proj", command: ["true"] });
+          const code: number | null = child.exitCode;
+          const proxy = createProxy({ port: 3129, certDir: "./certs", logFile: "./mitm.log" });
+          const queued: number = proxy.holds.size;
+          const names: string[] = manifest.primitives.map((p) => p.name);
+          proxy.close();
           EOF
           # ── end PER-REPO ──
           # `--ignore-scripts` is REQUIRED here, not hygiene. This job holds
