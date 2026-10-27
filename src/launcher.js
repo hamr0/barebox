@@ -3,19 +3,76 @@
 // defaults are baked in, not switchable. The project bind is read-only unless
 // `overlay:true` mounts the M4 tracing paper over it (see overlay.js).
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative, dirname } from 'node:path';
 import { assertAgentName, isInside, realPathOf, runtimePaths } from './runtime.js';
 import { setupOverlay } from './overlay.js';
 
-// Locked drawers: masked with an empty tmpfs wherever they exist.
+// Locked drawers (relative to $HOME): masked wherever they exist — a folder
+// with an empty tmpfs, a file with /dev/null (bwrap cannot mount a tmpfs on
+// a file; `--dev-bind`, because `--ro-bind` makes the mount nodev and the
+// read fails EACCES instead of reading empty). The real kind on disk picks the
+// mask; `kind` documents intent.
+// Deliberately NOT here: the agent's own model credentials (`~/.claude`,
+// `~/.claude.json`, `~/.config/anthropic`, ...). A sandboxed coding agent
+// needs them to run at all; moving keys out of the agent's reach is M5
+// ("keys the agent never holds"), not a mask.
 const LOCKED_PATHS = [
-  '.ssh',
-  'secrets',
-  '.mozilla',
-  '.config/chromium',
-  '.gnupg',
+  // keys, password stores, keyrings
+  { path: '.ssh', kind: 'dir' },
+  { path: 'secrets', kind: 'dir' },
+  { path: '.gnupg', kind: 'dir' },
+  { path: '.password-store', kind: 'dir' },
+  { path: '.local/share/keyrings', kind: 'dir' },
+  // browser profiles (cookies, saved passwords)
+  { path: '.mozilla', kind: 'dir' },
+  { path: '.config/chromium', kind: 'dir' },
+  { path: '.config/google-chrome', kind: 'dir' },
+  { path: '.config/BraveSoftware', kind: 'dir' },
+  // cloud, cluster and container credentials
+  { path: '.aws', kind: 'dir' },
+  { path: '.azure', kind: 'dir' },
+  { path: '.config/gcloud', kind: 'dir' },
+  { path: '.kube', kind: 'dir' },
+  { path: '.docker', kind: 'dir' },
+  // forge and password-manager CLIs
+  { path: '.config/gh', kind: 'dir' },
+  { path: '.config/op', kind: 'dir' },
+  // token files
+  { path: '.netrc', kind: 'file' },
+  { path: '.npmrc', kind: 'file' },
+  { path: '.pypirc', kind: 'file' },
+  { path: '.git-credentials', kind: 'file' },
+  { path: '.cargo/credentials.toml', kind: 'file' },
 ];
+
+/**
+ * The bwrap args that mask one locked path, or none when it does not exist.
+ * A symlinked drawer (dotfile managers) is masked at its real target, which
+ * is where bwrap lands a mount anyway, so the content is shut at both
+ * spellings; a target outside `$HOME` and the project is not bound into the
+ * sandbox at all, so there is nothing to mask.
+ *
+ * @param {string} abs the locked path under `$HOME`
+ * @param {string} home `$HOME`
+ * @param {string} proj project dir
+ * @returns {string[]} `--tmpfs <dir>` or `--dev-bind /dev/null <file>`, or `[]`
+ */
+function lockMask(abs, home, proj) {
+  let target = abs;
+  let st;
+  try {
+    st = lstatSync(abs);
+    if (st.isSymbolicLink()) {
+      target = realPathOf(abs);
+      if (!isInside(home, target) && !isInside(proj, target)) return [];
+      st = statSync(target);
+    }
+  } catch {
+    return []; // absent, or a dangling link: nothing readable to mask
+  }
+  return st.isDirectory() ? ['--tmpfs', target] : ['--dev-bind', '/dev/null', target];
+}
 
 // System bundle locations the combined CA file is built from (first hit wins).
 const SYSTEM_BUNDLES = [
@@ -139,9 +196,7 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   // Locked drawers AFTER the project mount: the tmpfs mask must land on top,
   // or a project that contains one of these paths (a project that IS $HOME,
   // or holds its own `.ssh`) would leak the real drawer through the overlay.
-  for (const p of LOCKED_PATHS) {
-    if (existsSync(`${home}/${p}`)) args.push('--tmpfs', `${home}/${p}`);
-  }
+  for (const { path: p } of LOCKED_PATHS) args.push(...lockMask(`${home}/${p}`, home, proj));
   // The runtime tree holds the file-checkpoint dirs (`asks/`, `answers/`
   // — the approve/deny capability) and every agent's socket (identity). A
   // read-only bind does NOT stop connect(2) to a unix socket, so wherever
