@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Name: barebox (CLI `sbx`).
-> Status: M0–M2 PASS; graduation rewrite done and branch-reviewed (ready, Oct 27). Next: M2.5 integration seam, then M4 → M3 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M0–M2 PASS; graduation rewrite shipped as **barebox 0.2.0** on npm (Oct 27, provenance-signed). Next: M2.5 integration seam, then M4 → M3 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 – Nov 4 2026 (10 days). Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -147,6 +147,16 @@ agent `sleep` excluded per the PRD walls-only definition).
 
 This supersedes the M0/M1 POC proxy figures (52.1 MB bare, 59.9–63.1 MB with TLS) for the
 rewritten code. Start timing remains unmeasured on the rewrite (TODO re-measure).
+
+### Release v0.2.0 (Oct 27)
+
+Published to npm from `main` at `d6c67f5` (tag `v0.2.0`), with SLSA provenance. A fresh install exports `createProxy` and `launch`, and `sbx --help` exits 0. The tarball has 18 files and nothing from `poc/`, `docs/`, `test/` or `scripts/`. Before it could ship, the publish path needed three fixes, each found by its own gate:
+
+| PR | Gate that failed | Cause | Lesson |
+|---|---|---|---|
+| #2 | Test (`spawn socat ENOENT`) | `publish.yml` lacked the bubblewrap/socat install and userns sysctl that `ci.yml` has | Runner deps must be identical in every workflow that runs `npm test` |
+| #3 | Adopter type check (TS2339, TS1543) | The gate's quickstart still used `proxy.holds` and a JSON import without `with { type: "json" }` | Update the adopter quickstart whenever the public API changes |
+| #4 | npm `E422` at publish | `package.json` had no `repository`; provenance requires it to match the repo | Every suite package needs `repository`; bin paths written without `./` avoid npm 11's misleading "invalid and removed" warning |
 
 ## 4. Evidence so far
 
