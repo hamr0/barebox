@@ -42,7 +42,7 @@ The hackathon gives a fixed 10-day window and a demo audience. The memory measur
 
 ### What it is and isn't
 
-- **Is:** a strong guardrail against mistakes and prompt-injected agents. No root, no daemon, no image. Millisecond-scale start for the walls (measured below).
+- **Is:** a strong guardrail against mistakes and prompt-injected agents. No root, no daemon, no image. Millisecond-scale start for the walls (M0 POC measurement; unmeasured on the rewritten code — TODO re-measure).
 - **Isn't:** a security boundary against a determined attacker. The kernel is shared. A kernel exploit escapes. Use a VM for that.
 
 ## 2. How it works (same model as the idea note)
@@ -117,6 +117,22 @@ These are targets, not results. They get measured in M0, M1 and M6.
 | Shared proxy | <= 80 MB |
 | Each extra sandbox, on top of the agent itself | <= 10 MB |
 | Agents on a 2 GB VPS | 20 |
+
+### Rewrite bench (Oct 27): go/no-go (c) re-measured on the rewritten code
+
+`npm run bench` exit 0 PASS, measured 2026-10-27 in a real shell with 20 concurrent agents
+(`addAgent` + `launch`; per-sandbox RSS from exact `/proc` tree walks of each bwrap PID;
+agent `sleep` excluded per the PRD walls-only definition).
+
+| Item | Measured | Budget | Verdict |
+|---|---|---|---|
+| Per-sandbox overhead (two bwrap processes + socat each) | mean 7.8 MB, max 7.9 MB (range 7.7–7.9 across agents) | ≤ 10 MB each | PASS |
+| Proxy RSS idle | 60.1 MB | ≤ 80 MB | PASS |
+| Proxy RSS after minting 10 certs | 69.4 MB | ≤ 80 MB | PASS |
+| Proxy RSS with 20 parked holds | 71.9 MB | ≤ 80 MB | PASS |
+
+This supersedes the M0/M1 POC proxy figures (52.1 MB bare, 59.9–63.1 MB with TLS) for the
+rewritten code. Start timing remains unmeasured on the rewrite (TODO re-measure).
 
 ## 4. Evidence so far
 

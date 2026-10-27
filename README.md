@@ -9,7 +9,7 @@
 ```
 
 > An agent runs on your machine with your real tools, every write is undoable, and nothing leaves the machine without passing a doorman. You're asked only when something irreversible is about to happen.
-> No root, no daemon, no image. One shared proxy, many thin sandboxes: ~8 MB each, 10 ms to start.
+> No root, no daemon, no image. One shared proxy, many thin sandboxes: ~8 MB each, 10 ms to start (M0 POC figure — unmeasured on the rewritten code, TODO re-measure).
 
 <p align="center">
   <img src="https://img.shields.io/github/package-json/v/hamr0/barebox?label=version&color=2a4f8c" alt="version (auto from package.json)">
@@ -85,8 +85,8 @@ Measured, not estimated. Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22.
 | | barebox (measured) | [srt](https://github.com/anthropic-experimental/sandbox-runtime) 0.0.81 (measured) |
 |---|---|---|
 | Memory per sandbox | **7.7 MB** mean, 7.9 MB max (20 concurrent) | ~100 MB |
-| Proxy | one shared, **56.7 MB** with TLS inspection | one per sandbox |
-| Start + exit | **10 ms** | 1.87–2.05 s |
+| Proxy | one shared, **~60 MB idle, ~72 MB loaded** (20 agents, within the ≤ 80 MB budget) | one per sandbox |
+| Start + exit | **10 ms** (M0 POC; unmeasured on the rewrite — TODO re-measure) | 1.87–2.05 s |
 | 20 agents | ~215 MB (rough sum) | ~2 GB |
 
 Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 GB VPS. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/product/findings.md).
