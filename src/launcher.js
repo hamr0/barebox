@@ -3,7 +3,7 @@
 // defaults are baked in, not switchable. No overlay (M4).
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, relative, isAbsolute } from 'node:path';
 import { socketPathForAgent, assertAgentName } from './proxy.js';
 
 // Locked drawers: masked with an empty tmpfs wherever they exist.
@@ -66,7 +66,7 @@ export function buildCaBundle(runtime, caFile) {
  * @param {string|null} [opts.caFile] barebox CA cert path (from `proxy.caFile`); when set, the sandbox trusts it for HTTPS alongside the system roots
  * @returns {import('node:child_process').ChildProcess} the bwrap child (stdio piped); `close` gives its exit code
  * @when Reach for this to HARNESS-ONLY start one sandboxed agent run: it creates the sandbox the agent lives in. It does not decide anything; combine with the proxy for the front door and the gate (M3) for policy.
- * @fails Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on an over-long socket path, or when `socket` disagrees with `<runtime>/socks/<agent>.sock`. The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.
+ * @fails Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, or when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent). The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.
  * @example
  * import { launch } from "barebox";
  * const child = launch({ runtime: "/tmp/sbx", agent: "fx", proj: "/tmp/proj", command: ["bash", "-c", "echo hi"] });
@@ -97,6 +97,28 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   ];
   for (const p of LOCKED_PATHS) {
     if (existsSync(`${home}/${p}`)) args.push('--tmpfs', `${home}/${p}`);
+  }
+  // The runtime tree holds the control socket (approve/deny) and every
+  // agent's socket (identity). A read-only bind does NOT stop connect(2)
+  // to a unix socket, so wherever the runtime would show through the home
+  // or project binds, mask it with an empty tmpfs. (The agent's own socket
+  // is bound from the host side to /run/sbx/agent.sock, so masking the
+  // sandbox-side runtime path does not close the front door.)
+  {
+    // Lexical on purpose: bwrap sees these same spellings, so the mask
+    // lands on the path the sandbox actually shows. (`resolve` would
+    // follow symlinks and can name a path the sandbox never displays.)
+    const rt = join(runtime);
+    const hm = join(home);
+    const pr = join(proj);
+    if (rt === hm || rt === pr) {
+      throw new Error(`launch: runtime must not be ${rt === hm ? 'HOME' : 'the project dir'} itself (its sockets cannot be hidden there)`);
+    }
+    const inside = (base) => {
+      const rel = relative(base, rt);
+      return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+    };
+    if (inside(hm) || inside(pr)) args.push('--tmpfs', rt);
   }
   args.push(
     '--dir', '/run',

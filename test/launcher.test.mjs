@@ -55,6 +55,23 @@ describe('launch validation (no sandbox needed)', () => {
     assert.throws(() => launch({ runtime: rt, agent: 'agent', proj: '/y', command: ['true'] }),
       /too long \(\d+ > 107\)/);
   });
+
+  it('refuses a runtime that IS HOME or the project dir', () => {
+    const saved = process.env.HOME;
+    const root = mkdtempSync(join(tmpdir(), 'bb-rt-'));
+    try {
+      process.env.HOME = root;
+      const proj = join(root, 'p');
+      mkdirSync(proj, { recursive: true });
+      assert.throws(() => launch({ runtime: root, agent: 'a', proj, command: ['true'] }),
+        /must not be HOME/);
+      assert.throws(() => launch({ runtime: proj, agent: 'a', proj, command: ['true'] }),
+        /must not be the project dir/);
+    } finally {
+      process.env.HOME = saved;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('buildCaBundle (no sandbox needed)', () => {
@@ -194,6 +211,35 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     const c = launch({ runtime: rt, agent: 't7', proj,
       command: ['bash', '-c', '[ -z "$SSL_CERT_FILE" ] && [ -z "$CURL_CA_BUNDLE" ]'] });
     assert.equal((await run(c)).code, 0);
+  });
+
+  it('hides runtime sockets that show through $HOME, front door still works', async () => {
+    // Production layout: the runtime lives under $HOME, so the ro-bind of
+    // home would expose every agent socket (identity) and the control
+    // socket (approve/deny) — and a read-only bind does NOT stop
+    // connect(2). The launch must mask the runtime dir inside.
+    const rtHome = join(home, 'rt');
+    mkdirSync(join(rtHome, 'socks'), { recursive: true });
+    const sock = join(rtHome, 'socks', 't8.sock');
+    try { rmSync(sock); } catch {}
+    const got = [];
+    const srv = net.createServer((s) => {
+      s.on('data', (c) => got.push(c.toString()));
+    });
+    await new Promise((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(sock, resolve);
+    });
+    servers.push(srv);
+    const c = launch({ runtime: rtHome, agent: 't8', proj,
+      command: ['bash', '-c',
+        'test ! -e "$HOME/rt/socks/t8.sock" && echo marker > /dev/tcp/127.0.0.1/3128'] });
+    assert.equal((await run(c)).code, 0);
+    const t0 = Date.now();
+    while (!/marker/.test(got.join(''))) {
+      if (Date.now() - t0 > 10000) throw new Error('front door broke under a masked runtime');
+      await new Promise((r) => setTimeout(r, 50));
+    }
   });
 });
 
