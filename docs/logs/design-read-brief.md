@@ -12,7 +12,7 @@
 - The brief wins. Any deviation is named in the report with its reason.
 - Leave no bwrap, socat or `node --test` processes running.
 
-**Order:** item 3 (security, must), item 1 (must), item 2 (must). Finish each one completely before the next. If credit runs short, stop after a finished item and report.
+**Order:** item 3 is done. Then item 4 (claim races), item 1, item 2. Finish each one completely before the next. If credit runs short, stop after a finished item and report.
 
 ---
 
@@ -94,6 +94,35 @@ Foundations §2.4's "outcomes are reported, never reconstructed" is only half do
 - **Mutations:**
   - Use `--tmpfs` for the file entries: launch fails, or the test goes red. Show which.
   - Drop the symlink-target mask, and the `dotfiles/npmrc` assertion goes red.
+
+## 4. `claimRuntime` startup races (must; added after the runtime claim landed)
+
+**Status:** item 3 is done and merged (`f2ecebb`, via `ebe984d`). Items 1, 2 and 4 remain.
+
+`claimRuntime` (`src/runtime.js`) is the single enforcer of "one proxy per runtime". Two narrow races let two proxies start on one runtime when they start within microseconds of each other:
+1. **The claim file is briefly empty.**
+   - `writeMine` does `openSync(owner, 'wx')`, then writes the JSON.
+   - A second starter reading in that gap gets `readClaim() === null`, treats the claim as garbage, takes it over, and both proceed.
+   - **Fix:** write the claim to a temp file in the runtime first, then `fs.linkSync(tmp, owner)`. That atomically creates `owner` with its full content, or fails with `EEXIST`. Remove the temp file in `finally`. `owner` then can never be seen empty.
+   - Keep treating a truly garbage or empty file as stale. Once `owner` can only be created whole, an unreadable one is leftover debris.
+2. **Takeover steals a fresh claim.**
+   - Two starters both judge the same dead owner stale.
+   - A renames it away and links its own claim.
+   - B's `renameSync(owner, stale)` then moves **A's fresh claim** away, and B links its own. Both proceed.
+   - **Fix:** after renaming `owner` to the stale name, read the renamed file and compare it with the claim judged stale (same pid and start, or both unreadable).
+     - **If it differs,** someone else's fresh claim was moved. Rename it back (`fs.linkSync(stale, owner)`, which fails if a third claim landed meanwhile), then throw the in-use error naming that pid.
+     - **If it matches,** delete it and link our own claim.
+
+**Tests** (`test/runtime.test.mjs`). They exercise the decision logic. Don't try to win real scheduling races, and don't add sleeps.
+- A claim never leaves an empty `owner`: after a successful claim, the file parses with our pid and start time, and no temp file is left in the runtime.
+- Takeover refuses a fresh claim. Plant a dead owner, then simulate "another process won the takeover" by replacing `owner` with a live claim (`process.pid` with the real start time).
+  - Exercise this through a small internal step function that takes the judged-stale content as an argument. Export it from `runtime.js` for the test, the way `changedSince` is exported from `overlay.js`.
+  - That function must restore the live claim and throw `in use by pid`.
+- **Mutations:**
+  - Back to `openSync(owner, 'wx')` + write. The test asserting no `wx`-then-write gap can't observe a microsecond gap, so instead assert that the claim is created via `link` (no partially written owner on an injected write failure). Make the write throw, for example by passing an unserializable claim through the same step function, and `owner` must not exist afterwards.
+  - Drop the post-rename comparison, and the fresh-claim test goes red.
+
+Also, two stale doc rows from item 3: `docs/product/agent-sandbox-prd.md:266` (the decision row "Locked paths (M0)") and `docs/product/agent-sandbox.md:172` still list the old 5 paths. Update both to "21 credential stores; see `LOCKED_PATHS` in `src/launcher.js`", and say `~/.claude` stays readable until M5.
 
 ---
 
