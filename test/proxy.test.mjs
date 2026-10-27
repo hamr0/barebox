@@ -22,7 +22,7 @@ import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
 import os from 'node:os';
-import { createProxy } from '../src/proxy.js';
+import { createProxy, denyReasonForIp } from '../src/proxy.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
 
@@ -256,18 +256,74 @@ describe('positives', () => {
 });
 
 describe('negatives', () => {
-  it('any hostname gets a minted cert (no pre-made certs needed)', async () => {
-    const t = await connectTunnel('minted.invalid:443');
+  it('unresolvable names fail closed at the door (403, never dialed)', async () => {
+    const head = await new Promise((resolve, reject) => {
+      const s = net.connect(PORT, '127.0.0.1');
+      let out = '';
+      s.on('connect', () => s.write('CONNECT minted.invalid:443 HTTP/1.1\r\nHost: minted.invalid\r\n\r\n'));
+      s.on('data', (c) => {
+        out += c.toString('latin1');
+        if (out.includes('\r\n\r\n')) { s.destroy(); resolve(out); }
+      });
+      s.on('error', reject);
+      setTimeout(() => { s.destroy(); reject(new Error('unresolvable deny took too long')); }, 5000);
+    });
+    assert.match(head, /^HTTP\/1\.1 403 /m);
+    assert.match(head, /unresolvable upstream denied: minted\.invalid/);
+  });
+
+  it('certs are minted on demand (no pre-made certs needed)', async () => {
+    const kc = await certFor(join(RT, 'certs'), 'minted.invalid');
+    assert.ok(kc.key.length > 0 && kc.cert.length > 0);
+  });
+
+  it('upstream with an unknown-CA cert is 502 and never forwarded', async () => {
+    // The proxy re-encrypts toward the real server, so it must verify like
+    // a client: default trust (system roots + upstreamCa) only. This locks
+    // in that no `rejectUnauthorized: false` ever sneaks in for a fixture.
+    const dir = mkdtempSync(join(tmpdir(), 'bb-rogue-'));
+    let rogue = null;
     try {
-      t.write('GET / HTTP/1.1\r\nHost: minted.invalid\r\nConnection: close\r\n\r\n');
-      const r = await readOneResponse(t);
-      // TLS verified against our CA (else no response at all); upstream DNS
-      // fails loudly as 502, never "no cert".
-      assert.equal(r.status, 502);
-      assert.match(r.body, /upstream minted\.invalid failed/);
+      await execA('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+        '-keyout', join(dir, 'key.pem'), '-out', join(dir, 'cert.pem'),
+        '-days', '1', '-subj', '/CN=rogue', '-addext', 'subjectAltName=IP:127.0.0.1']);
+      rogue = await startHttps({ key: readFileSync(join(dir, 'key.pem')),
+        cert: readFileSync(join(dir, 'cert.pem')) });
+      const before = rogue.hits.get('/') ?? 0;
+      const r = await curl('--cacert', CA, `${rogue.url}?m=rogue`);
+      assert.match(r.stdout, /upstream 127\.0\.0\.1 failed/);
+      assert.equal(rogue.hits.get('/') ?? 0, before, 'rejected TLS must never reach the upstream handler');
     } finally {
-      t.destroy();
+      await rogue?.close();
+      rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('malformed inputs are loud 400s, never silence', async () => {
+    const connectHead = await new Promise((resolve, reject) => {
+      const s = net.connect(PORT, '127.0.0.1');
+      let out = '';
+      s.on('connect', () => s.write('CONNECT !!bad!! HTTP/1.1\r\nHost: x\r\n\r\n'));
+      s.on('data', (c) => {
+        out += c.toString('latin1');
+        if (out.includes('\r\n\r\n')) { s.destroy(); resolve(out); }
+      });
+      s.on('error', reject);
+      setTimeout(() => { s.destroy(); reject(new Error('bad CONNECT line took too long')); }, 3000);
+    });
+    assert.match(connectHead, /^HTTP\/1\.1 400 /m);
+    assert.match(connectHead, /bad connect line/);
+    const badTarget = await new Promise((resolve, reject) => {
+      const s = net.connect(PORT, '127.0.0.1');
+      let buf = Buffer.alloc(0);
+      s.on('connect', () => s.write('GET http:// HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'));
+      s.on('data', (c) => { buf = Buffer.concat([buf, c]); });
+      s.on('close', () => resolve(buf.toString('latin1')));
+      s.on('error', reject);
+      setTimeout(() => reject(new Error('bad target took too long')), 3000);
+    });
+    assert.match(badTarget, /^HTTP\/1\.1 400 /m);
+    assert.match(badTarget, /bad request target/);
   });
 
   it('dead upstream is 502 with reason', async () => {
@@ -420,6 +476,86 @@ describe('loopback wall: default deny after DNS resolution', () => {
     assert.match(r.stdout, /link-local upstream denied: 169\.254\.169\.254/);
     assert.ok(ms < 1000, `metadata wall must answer fast, took ${ms}ms`);
   });
+
+  it('private LAN literals are denied by default (no allow-list)', async () => {
+    for (const host of ['10.0.0.1', '172.16.5.4', '172.31.255.255', '192.168.1.1', '100.64.0.1']) {
+      const r = await execA('curl', ['-s', '--max-time', '3', '-x', DPROXY,
+        `http://${host}/`], { encoding: 'latin1' });
+      assert.match(r.stdout, new RegExp(`private upstream denied: ${host.replace(/\./g, '\\.')}`));
+    }
+    assert.equal(denyReasonForIp('10.1.2.3', false), 'private');
+    assert.equal(denyReasonForIp('172.16.0.1', false), 'private');
+    assert.equal(denyReasonForIp('172.31.9.9', false), 'private');
+    assert.equal(denyReasonForIp('172.32.0.1', false), null);
+    assert.equal(denyReasonForIp('192.168.0.1', false), 'private');
+    assert.equal(denyReasonForIp('100.64.0.1', false), 'private');
+    assert.equal(denyReasonForIp('100.127.255.255', false), 'private');
+    assert.equal(denyReasonForIp('100.128.0.1', false), null);
+    assert.equal(denyReasonForIp('8.8.8.8', false), null);
+    assert.equal(denyReasonForIp('fc00::1', false), 'private');
+    assert.equal(denyReasonForIp('fd00::1', false), 'private');
+    assert.equal(denyReasonForIp('::ffff:10.0.0.1', false), 'private');
+    assert.equal(denyReasonForIp('2001:db8::1', false), null);
+  });
+});
+
+describe('dns rebinding wall (stubbed resolver)', () => {
+  async function stubProxy(stub, extra = {}) {
+    const p = createProxy({ port: 0, certDir: join(RT, 'certs'),
+      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
+      resolveUpstream: stub, ...extra });
+    const { port } = await p.ready;
+    return { p, url: `http://127.0.0.1:${port}` };
+  }
+
+  it('denies when ANY answer is walled (check-first-only would pass)', async () => {
+    const seen = [];
+    const { p, url } = await stubProxy(async (host) => {
+      seen.push(host);
+      assert.equal(host, 'rebind.test');
+      return ['93.184.216.34', '127.0.0.1'];
+    });
+    try {
+      const r = await execA('curl', ['-s', '--max-time', '3', '-x', url,
+        'http://rebind.test/'], { encoding: 'latin1' });
+      assert.match(r.stdout, /loopback upstream denied: rebind\.test \(127\.0\.0\.1\)/);
+      assert.ok(seen.length >= 1, 'wall must consult DNS');
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('unresolvable names fail closed (NXDOMAIN is 403, never dialed)', async () => {
+    const { p, url } = await stubProxy(async () => null);
+    try {
+      const r = await execA('curl', ['-s', '--max-time', '3', '-x', url,
+        'http://gone.invalid/'], { encoding: 'latin1' });
+      assert.match(r.stdout, /unresolvable upstream denied: gone\.invalid/);
+    } finally {
+      await p.close();
+    }
+  });
+
+  it('the dial is pinned to the checked IP: later DNS answers are never used', async () => {
+    let calls = 0;
+    const before = plainUp.hits.get('/') ?? 0;
+    const { p, url } = await stubProxy(async () => {
+      calls += 1;
+      // Door + forward checks see the fixture; anything after would be a re-dial.
+      if (calls <= 2) return ['127.0.0.1'];
+      return ['93.184.216.34'];
+    }, { allowLoopback: true });
+    try {
+      const r = await execA('curl', ['-s', '--max-time', '5', '-x', url,
+        `${plainUp.url}?m=pin`.replace('http://127.0.0.1', 'http://pinned.test')],
+        { encoding: 'latin1' });
+      assert.equal(r.stdout, 'local-ok');
+      assert.equal(calls, 2, `dial must not re-resolve (saw ${calls} lookups)`);
+      assert.ok((plainUp.hits.get('/') ?? 0) > before, 'pinned dial reached the fixture');
+    } finally {
+      await p.close();
+    }
+  });
 });
 
 describe('holds', () => {
@@ -567,6 +703,28 @@ describe('holds', () => {
     idle.destroy();
   });
 
+  it('other requests complete while one is parked (go/no-go b)', { skip: NEED_UNIX }, async () => {
+    const P2 = await holdProxy();
+    try {
+      const held = execA('curl', ['-s', '--max-time', '8', '-x', P2,
+        '--cacert', CA, '--data', 'm=BUSY1', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const parked = await waitFor(() => hp.pending().find((h) => /BUSY1/.test(h.body)),
+        'hold on m=BUSY1 to park');
+      // Same agent, separate connection, non-matching path: answers while
+      // the first request is still parked — holds never gate the agent.
+      const free = await execA('curl', ['-s', '--max-time', '8', '-x', P2,
+        '--cacert', CA, `${tlsUp.url}?m=free`], { encoding: 'latin1' });
+      assert.equal(free.stdout, 'local-ok');
+      assert.ok(hp.pending().some((h) => h.id === parked.id), 'first request still parked');
+      assert.equal(await ctl(`approve ${parked.id}`), `approved ${parked.id}`);
+      assert.match((await held).stdout, /BUSY1/);
+      assert.equal(hp.pending().length, 0);
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
   // CONNECT to an arbitrary proxy base (used by the abandon test).
   async function connectTunnelVia(base, target) {
     const { port: bp } = new URL(base);
@@ -595,4 +753,77 @@ describe('holds', () => {
       s.on('error', reject);
     });
   }
+});
+
+describe('two agents keep identity under interleave', () => {
+  const CTL2 = join(tmpdir(), `bb-ctl2-${process.pid}.sock`);
+  const NEED_UNIX2 = UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI';
+  const ctl2 = (cmd) => new Promise((resolve, reject) => {
+    const s = net.connect(CTL2, () => s.write(cmd + '\n'));
+    let out = '';
+    s.on('data', (c) => { out += c; });
+    s.on('end', () => resolve(out.trim()));
+    s.on('error', reject);
+  });
+
+  it('holds, responses and log lines name the right agent',
+    { skip: NEED_UNIX2 }, async () => {
+      const tp = createProxy({ port: 0, certDir: join(RT, 'certs'),
+        logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
+        clientIdleMs: 1000, allowLoopback: true,
+        hold: { match: '/hold', timeoutMs: 15000 }, controlSocket: CTL2 });
+      await tp.ready;
+      const sa = [];
+      try {
+        const fa = tp.addAgent('fa');
+        const fb = tp.addAgent('fb');
+        const upHost = `127.0.0.1:${plainUp.port}`;
+        const open = async (sockPath, raw) => {
+          const s = net.connect(sockPath);
+          sa.push(s);
+          await once(s, 'connect');
+          s.write(raw);
+          return s;
+        };
+        // Both agents park a POST; neither response may arrive yet.
+        const sA = await open(fa,
+          `POST http://${upHost}/hold HTTP/1.1\r\nHost: ${upHost}\r\nContent-Length: 5\r\nConnection: close\r\n\r\nm=FA1`);
+        const rAP = readOneResponse(sA);
+        const sB = await open(fb,
+          `POST http://${upHost}/hold HTTP/1.1\r\nHost: ${upHost}\r\nContent-Length: 5\r\nConnection: close\r\n\r\nm=FB1`);
+        const rBP = readOneResponse(sB);
+        const both = await waitFor(() => {
+          const p = tp.pending();
+          return p.length === 2 ? p : null;
+        }, 'both agents to park');
+        const gotA = both.find((h) => h.agent === 'fa');
+        const gotB = both.find((h) => h.agent === 'fb');
+        assert.ok(gotA && /FA1/.test(gotA.body), 'fa hold carries fa');
+        assert.ok(gotB && /FB1/.test(gotB.body), 'fb hold carries fb');
+        // A free request on fa's door answers while both holds are parked.
+        const sF = await open(fa,
+          `GET http://${upHost}/?m=free HTTP/1.1\r\nHost: ${upHost}\r\nConnection: close\r\n\r\n`);
+        const free = await readOneResponse(sF);
+        assert.equal(free.status, 200);
+        assert.equal(free.body, 'local-ok');
+        assert.equal(tp.pending().length, 2, 'holds still parked');
+        assert.equal(await ctl2(`approve ${gotA.id}`), `approved ${gotA.id}`);
+        assert.equal(await ctl2(`approve ${gotB.id}`), `approved ${gotB.id}`);
+        const rA = await rAP;
+        const rB = await rBP;
+        assert.equal(rA.status, 200);
+        assert.match(rA.body, /FA1/);
+        assert.equal(rB.status, 200);
+        assert.match(rB.body, /FB1/);
+        await waitFor(() => /"agent":"fb"/.test(log()) && /m=FB1/.test(log()),
+          'log to name fb');
+        assert.match(log(), /"agent":"fa"/);
+      } finally {
+        for (const s of sa) { try { s.destroy(); } catch {} }
+        try { tp.removeAgent('fa'); } catch {}
+        try { tp.removeAgent('fb'); } catch {}
+        await tp.close();
+        try { rmSync(CTL2, { force: true }); } catch {}
+      }
+    });
 });

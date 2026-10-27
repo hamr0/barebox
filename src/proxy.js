@@ -32,11 +32,14 @@ const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
   'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
 
 // --- upstream wall ---------------------------------------------------------
- // Default-deny for loopback, link-local (incl. cloud metadata 169.254/16)
- // and the host's own addresses. The check runs AFTER DNS resolution, so a
+ // Default-deny for loopback, link-local (incl. cloud metadata 169.254/16),
+ // the host's own addresses, and private LAN ranges (RFC 1918, CGNAT
+ // 100.64/10, IPv6 ULA fc00::/7). The check runs AFTER DNS resolution, so a
  // hostname that resolves to 127.0.0.1 is denied exactly like the literal.
+ // Unresolvable names are denied too (fail closed, never 502-then-dial).
 // Only `allowLoopback` (loopback + unspecified) or `allowUpstream(host, ip)`
-// lets a denied destination through; only tests pass those.
+// lets a denied destination through; only tests pass those. There is no
+// allowPrivate flag: a private destination passes only via `allowUpstream`.
 
 /** Strip brackets/scope, lowercase: one spelling per address. */
 function normIp(ip) {
@@ -81,7 +84,7 @@ function localIps() {
  *
  * @param {string} rawIp resolved destination IP
  * @param {boolean} allowLoopback test-only opt-in for loopback + unspecified
- * @returns {string|null} `loopback` / `unspecified` / `link-local` / `host-local`, or null
+ * @returns {string|null} `loopback` / `unspecified` / `link-local` / `host-local` / `private`, or null
  */
 export function denyReasonForIp(rawIp, allowLoopback) {
   const ip = normIp(rawIp);
@@ -91,6 +94,10 @@ export function denyReasonForIp(rawIp, allowLoopback) {
     if (a === 127) return allowLoopback ? null : 'loopback';
     if (a === 0) return allowLoopback ? null : 'unspecified';
     if (a === 169 && b === 254) return 'link-local';
+    if (a === 10) return 'private';
+    if (a === 172 && b >= 16 && b <= 31) return 'private';
+    if (a === 192 && b === 168) return 'private';
+    if (a === 100 && b >= 64 && b <= 127) return 'private';
     if (localIps().has(v4)) return 'host-local';
     return null;
   }
@@ -99,6 +106,7 @@ export function denyReasonForIp(rawIp, allowLoopback) {
     if (ip === '::') return allowLoopback ? null : 'unspecified';
     const first = parseInt(ip.split(':')[0] || '0', 16);
     if (first >= 0xfe80 && first <= 0xfebf) return 'link-local';
+    if (first >= 0xfc00 && first <= 0xfdff) return 'private';
     if (localIps().has(ip)) return 'host-local';
     return null;
   }
@@ -106,42 +114,59 @@ export function denyReasonForIp(rawIp, allowLoopback) {
 }
 
 /**
- * Resolve `host` to an IP for the wall. Literals need no DNS; anything that
- * does not resolve is NOT the wall's business (it surfaces later as a loud
- * 502 upstream failure, never silence).
+ * Resolve `host` to every IP for the wall. Literals need no DNS.
+ * Fail closed: anything that does not resolve is denied, never dialed.
  *
  * @param {string} host CONNECT/request hostname
- * @returns {Promise<string|null>} resolved IP, or null when unresolvable
+ * @param {(host: string) => Promise<string[] | string | null>} [stub] test-only DNS stub
+ * @returns {Promise<string[] | null>} all resolved IPs, or null when unresolvable
  */
-async function resolveUpstream(host) {
-  if (net.isIP(host)) return host;
+async function resolveAllUpstream(host, stub) {
+  if (net.isIP(host)) return [host];
   try {
-    return (await dnsLookup(host)).address;
+    if (typeof stub === 'function') {
+      const r = await stub(host);
+      if (!r) return null;
+      if (Array.isArray(r)) return r.length ? [...r] : null;
+      if (typeof r === 'string') return [r];
+      return null;
+    }
+    const all = await dnsLookup(host, { all: true });
+    if (!all || !all.length) return null;
+    return all.map((a) => a.address);
   } catch {
     return null;
   }
 }
 
 /**
- * The wall: resolve, then default-deny loopback/link-local/host-local
- * unless the test-only opt-ins allow it.
+ * The wall: resolve every answer, then default-deny loopback/link-local/
+ * host-local/private unless the test-only opt-ins allow it. Denies when ANY
+ * answer is walled, denies unresolvable names, and pins the first checked IP
+ * so the dial below cannot resolve the name a second time (no rebinding).
  *
  * @param {string} host CONNECT/request hostname
- * @param {{ allowLoopback: boolean, allowUpstream: ((host: string, ip: string) => boolean) | null }} gate
- * @returns {Promise<{ ok: true, ip: string | null } | { ok: false, ip: string, reason: string }>}
+ * @param {{ allowLoopback: boolean, allowUpstream: ((host: string, ip: string) => boolean) | null, resolveUpstream?: (host: string) => Promise<string[] | string | null> }} gate
+ * @returns {Promise<{ ok: true, ip: string } | { ok: false, ip: string, reason: string }>}
  */
 async function checkUpstream(host, gate) {
-  const ip = await resolveUpstream(host);
-  if (!ip) return { ok: true, ip };
-  if (typeof gate.allowUpstream === 'function') {
-    let pass = false;
-    try { pass = gate.allowUpstream(host, ip) === true; } catch { pass = false; }
-    if (pass) return { ok: true, ip };
+  const ips = await resolveAllUpstream(host, gate.resolveUpstream);
+  if (!ips || !ips.length) {
+    return { ok: false, ip: host, reason: `unresolvable upstream denied: ${host}` };
   }
-  const kind = denyReasonForIp(ip, gate.allowLoopback);
-  if (!kind) return { ok: true, ip };
-  const where = ip === host ? host : `${host} (${ip})`;
-  return { ok: false, ip, reason: `${kind} upstream denied: ${where}` };
+  for (const ip of ips) {
+    if (typeof gate.allowUpstream === 'function') {
+      let pass = false;
+      try { pass = gate.allowUpstream(host, ip) === true; } catch { pass = false; }
+      if (pass) continue;
+    }
+    const kind = denyReasonForIp(ip, gate.allowLoopback);
+    if (kind) {
+      const where = ip === host ? host : `${host} (${ip})`;
+      return { ok: false, ip, reason: `${kind} upstream denied: ${where}` };
+    }
+  }
+  return { ok: true, ip: ips[0] };
 }
 
 /**
@@ -189,8 +214,10 @@ export function socketPathForAgent(runtime, name) {
  *   destinations through (default false). Fixture servers listen on 127.0.0.1,
  *   so tests pass this; production never should.
  * @property {(host: string, ip: string) => boolean} [allowUpstream] escape hatch,
- *   consulted after DNS with the resolved IP: return true to let through a
+ *   consulted after DNS with each resolved IP: return true to let through a
  *   destination the default wall would deny. Only tests use this.
+ * @property {(host: string) => Promise<string[] | string | null>} [resolveUpstream] TEST-ONLY
+ *   DNS stub: replaces the wall's resolver so rebinding is testable. Production omits it.
  * @property {number} [clientIdleMs] kill a client tunnel idle this long; never fires mid-request (default 60000)
  * @property {number} [maxLogBody] log at most this many request-body bytes, then `truncated: true` (default 1048576)
  * @property {(entry: Record<string, unknown>) => Record<string, unknown>} [redact] log redaction hook (default: identity)
@@ -244,9 +271,9 @@ export function createProxy(opts) {
   const { logFile, certDir: certDirOpt, runtime: runtimeOpt, port = null,
     upstreamCa = null, hold = null, controlSocket = null,
     upstreamTimeoutMs = 120000, clientIdleMs = 60000,
-    allowLoopback = false, allowUpstream = null,
+    allowLoopback = false, allowUpstream = null, resolveUpstream = null,
     maxLogBody = 1048576, redact = (e) => e } = opts ?? {};
-  const gate = { allowLoopback, allowUpstream };
+  const gate = { allowLoopback, allowUpstream, resolveUpstream: resolveUpstream ?? undefined };
   if (!logFile) throw new Error('createProxy: logFile is required');
   const runtime = runtimeOpt ?? (certDirOpt ? path.dirname(path.resolve(certDirOpt)) : null);
   const dirOpt = certDirOpt ?? (runtime ? path.join(runtime, 'certs') : null);
@@ -313,16 +340,17 @@ export function createProxy(opts) {
     }
     // Sync from here: forwardInner answers every failure itself, but a
     // throw before it can answer must still be loud, never a floating reject.
+    // The dial is pinned to the checked IP: no second DNS resolution.
     try {
-      forwardInner({ agent, method, url, headers, body, stream, cres, u });
+      forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIp: verdict.ip });
     } catch (e) {
       log({ ev: 'deny', agent, code: 502, note: `upstream failed: ${e.message}` });
       denyRes(cres, 502, `upstream failed: ${e.message}`);
     }
   }
 
-  /** @param {ForwardArgs & { u: URL }} args */
-  function forwardInner({ agent, method, url, headers, body, stream, cres, u }) {
+  /** @param {ForwardArgs & { u: URL, upstreamIp?: string }} args */
+  function forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIp }) {
     const sock = cres.socket;
     if (!sock) return; // no transport left to answer on
     const secure = u.protocol === 'https:';
@@ -331,10 +359,22 @@ export function createProxy(opts) {
     for (const [k, v] of Object.entries(headers)) {
       if (!HOP_REQ.has(k.toLowerCase())) fwdHeaders[k] = v;
     }
+    const pinned = upstreamIp && net.isIP(upstreamIp) ? upstreamIp : null;
     const mod = secure ? https : http;
     const up = mod.request({
       host: u.hostname,
       port: u.port ? parseInt(u.port, 10) : (secure ? 443 : 80),
+      // Pinned dial: answer from the checked IP, never DNS again. Node asks
+      // with `{ all: true }`, which wants an array back (not the triple).
+      ...(pinned ? { lookup: (h, o, cb) => {
+        const fn = typeof o === 'function' ? o : cb;
+        const opts = typeof o === 'function' ? {} : (o ?? {});
+        const fam = net.isIP(pinned);
+        try {
+          if (opts && opts.all) fn(null, [{ address: pinned, family: fam }]);
+          else fn(null, pinned, fam);
+        } catch (e) { try { /** @type {(err: unknown) => void} */ (fn)(e); } catch {} }
+      } } : {}),
       ...(secure && !IP_RE.test(u.hostname) ? { servername: u.hostname } : {}),
       ...(secure && trust ? { ca: trust } : {}),
       method, path: u.pathname + u.search, headers: fwdHeaders,
