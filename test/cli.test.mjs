@@ -65,12 +65,25 @@ describe('sbx usage (no socket needed)', () => {
     assert.match(err.stdout, /ctl failed/);
     assert.ok(Date.now() - t0 < 10000, 'must fail fast');
   });
+
+  it('missing SBX_SOCK and SBX_RUNTIME is a usage error (exit 2)', async () => {
+    const env = { ...process.env };
+    delete env.SBX_SOCK;
+    delete env.SBX_RUNTIME;
+    const err = await execA('node', [CLI, 'pending'],
+      { encoding: 'latin1', env }).then(() => null, (e) => e);
+    assert.ok(err, 'must fail');
+    assert.equal(err.code, 2);
+    assert.match(err.stdout, /usage: sbx/);
+  });
 });
 
 describe('sbx cli (needs unix control socket)',
   { skip: UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI' }, () => {
   let RT, CA, tlsUp, proxy, PORT;
-  const CTL = join(tmpdir(), `bb-ctl-cli-${process.pid}.sock`);
+  // The control socket lives inside the runtime dir (createProxy enforces
+  // this: the launcher masks exactly that dir from sandboxed agents).
+  let CTL;
   const sbx = (...args) => execA('node', [CLI, ...args],
     { encoding: 'latin1', env: { ...process.env, SBX_SOCK: CTL } });
 
@@ -86,6 +99,7 @@ describe('sbx cli (needs unix control socket)',
 
   before(async () => {
     RT = mkdtempSync(join(tmpdir(), 'bb-c-'));
+    CTL = join(RT, 'ctl.sock');
     await ensureCA(join(RT, 'certs'));
     const kc = await certFor(join(RT, 'certs'), '127.0.0.1');
     CA = join(RT, 'certs', 'ca.pem');

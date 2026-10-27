@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { execFile as execFileCb, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
@@ -559,12 +559,14 @@ describe('dns rebinding wall (stubbed resolver)', () => {
 });
 
 describe('holds', () => {
-  const CTL = join(tmpdir(), `bb-ctl-${process.pid}.sock`);
+  // The control socket lives inside the runtime dir (createProxy enforces
+  // this: the launcher masks exactly that dir from sandboxed agents).
+  const ctlPath = () => join(RT, 'ctl.sock');
   const NEED_UNIX = UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI';
   let hp = null;
   let hport = 0;
   const ctl = (cmd) => new Promise((resolve, reject) => {
-    const s = net.connect(CTL, () => s.write(cmd + '\n'));
+    const s = net.connect(ctlPath(), () => s.write(cmd + '\n'));
     let out = '';
     s.on('data', (c) => { out += c; });
     s.on('end', () => resolve(out.trim()));
@@ -579,7 +581,7 @@ describe('holds', () => {
       logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
       clientIdleMs: 500, allowLoopback: true,
       hold: { match: '/hold', timeoutMs: 1500, ...holdExtra },
-      ...(UNIX_OK ? { controlSocket: CTL } : {}) });
+      ...(UNIX_OK ? { controlSocket: ctlPath() } : {}) });
     ({ port: hport } = await hp.ready);
     return `http://127.0.0.1:${hport}`;
   }
@@ -589,8 +591,17 @@ describe('holds', () => {
       await hp?.close();
     } finally {
       hp = null;
-      try { rmSync(CTL, { force: true }); } catch {}
+      try { if (RT) rmSync(join(RT, 'ctl.sock'), { force: true }); } catch {}
     }
+  });
+
+  it('controlSocket outside the runtime throws, before any side effect', async () => {
+    // No unix bind needed: createProxy must refuse synchronously.
+    const outside = join(tmpdir(), `bb-outside-${process.pid}.sock`);
+    assert.throws(() => createProxy({ port: 0, certDir: join(RT, 'certs'),
+      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
+      controlSocket: outside }), /inside the runtime/);
+    assert.ok(!existsSync(outside), 'refused socket must not be created');
   });
 
   it('approve forwards, deny refuses with reason', { skip: NEED_UNIX }, async () => {
@@ -756,10 +767,10 @@ describe('holds', () => {
 });
 
 describe('two agents keep identity under interleave', () => {
-  const CTL2 = join(tmpdir(), `bb-ctl2-${process.pid}.sock`);
+  const ctl2Path = () => join(RT, 'ctl2.sock');
   const NEED_UNIX2 = UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI';
   const ctl2 = (cmd) => new Promise((resolve, reject) => {
-    const s = net.connect(CTL2, () => s.write(cmd + '\n'));
+    const s = net.connect(ctl2Path(), () => s.write(cmd + '\n'));
     let out = '';
     s.on('data', (c) => { out += c; });
     s.on('end', () => resolve(out.trim()));
@@ -771,7 +782,7 @@ describe('two agents keep identity under interleave', () => {
       const tp = createProxy({ port: 0, certDir: join(RT, 'certs'),
         logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
         clientIdleMs: 1000, allowLoopback: true,
-        hold: { match: '/hold', timeoutMs: 15000 }, controlSocket: CTL2 });
+        hold: { match: '/hold', timeoutMs: 15000 }, controlSocket: ctl2Path() });
       await tp.ready;
       const sa = [];
       try {
@@ -823,7 +834,7 @@ describe('two agents keep identity under interleave', () => {
         try { tp.removeAgent('fa'); } catch {}
         try { tp.removeAgent('fb'); } catch {}
         await tp.close();
-        try { rmSync(CTL2, { force: true }); } catch {}
+        try { rmSync(ctl2Path(), { force: true }); } catch {}
       }
     });
 });

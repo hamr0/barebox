@@ -2,18 +2,25 @@
 // sbx — second-terminal CLI for the hold queue:
 // sbx pending | approve <id> | deny <id> [reason]
 // Talks to the proxy over its unix control socket. The socket path comes
-// from SBX_SOCK, defaulting to ./sbx-ctl.sock.
+// from SBX_SOCK, else from SBX_RUNTIME as `<runtime>/ctl.sock`. There is no
+// cwd-relative default: missing both is a usage error (exit 2).
 import net from 'node:net';
+import path from 'node:path';
 
 const USAGE = 'usage: sbx [--help] | pending | approve <id> | deny <id> [reason]';
 // Exit codes: 0 ok, 1 unknown id / refused / socket failure, 2 usage.
-const sockPath = process.env.SBX_SOCK || './sbx-ctl.sock';
 const [cmd, ...args] = process.argv.slice(2);
 if (!cmd || cmd === '--help' || cmd === '-h') {
   console.log(USAGE);
   process.exit(cmd ? 0 : 2);
 }
-if (!['pending', 'approve', 'deny'].includes(cmd) || ((cmd !== 'pending') && !args[0])) {
+if (!['pending', 'approve', 'deny'].includes(cmd) || (cmd !== 'pending' && !args[0])) {
+  console.log(USAGE);
+  process.exit(2);
+}
+const sockPath = process.env.SBX_SOCK
+  || (process.env.SBX_RUNTIME ? path.join(process.env.SBX_RUNTIME, 'ctl.sock') : null);
+if (!sockPath) {
   console.log(USAGE);
   process.exit(2);
 }
