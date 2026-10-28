@@ -92,7 +92,7 @@ function treeRss(rootPid, kids) {
   const members = [];
   const stack = [String(rootPid)];
   while (stack.length) {
-    const p = stack.pop();
+    const p = /** @type {string} */ (stack.pop());
     members.push(p);
     for (const k of kids[p] || []) stack.push(k);
   }
@@ -132,7 +132,7 @@ try {
     runtime,
     logFile: path.join(runtime, 'mitm.log'),
     port: 0,
-    allowLoopback: true,
+    unsafeTestOnly: { allowLoopback: true },
     hold: { shouldHold: () => 'bench-park', timeoutMs: 'never' },
   });
   const { port: tcpPort } = await proxy.ready;
@@ -196,7 +196,7 @@ try {
   await waitFor(() => {
     while (holdSockets.length < N) {
       const i = holdSockets.length;
-      const s = net.connect(tcpPort, '127.0.0.1');
+      const s = net.connect(/** @type {number} */ (tcpPort), '127.0.0.1');
       s.on('error', () => {});
       s.write(`POST http://127.0.0.1:1/hold-${i} HTTP/1.1\r\nHost: 127.0.0.1:1\r\nContent-Length: 4\r\n\r\nx=${String(i).padStart(2, '0')}`);
       holdSockets.push(s);

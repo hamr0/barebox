@@ -2,9 +2,9 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, delimiter } from 'node:path';
 import net from 'node:net';
 import { launch, buildCaBundle } from '../src/launcher.js';
 
@@ -50,6 +50,14 @@ describe('launch validation (no sandbox needed)', () => {
       command: ['true'], socket: '/elsewhere.sock' }), /disagrees/);
   });
 
+  it('rejects a non-integer proxyPort before spawning (shell injection)', () => {
+    const base = { runtime: '/x', agent: 'a', proj: '/y', command: ['true'] };
+    assert.throws(() => launch({ ...base, proxyPort: '3128;touch /tmp/x' }), /proxyPort/);
+    assert.throws(() => launch({ ...base, proxyPort: 0 }), /proxyPort/);
+    assert.throws(() => launch({ ...base, proxyPort: 70000 }), /proxyPort/);
+    assert.throws(() => launch({ ...base, proxyPort: 3.5 }), /proxyPort/);
+  });
+
   it('fails loudly past the ~108-char socket path limit', () => {
     const rt = join(tmpdir(), `bb-long-${'d'.repeat(90)}`);
     assert.throws(() => launch({ runtime: rt, agent: 'agent', proj: '/y', command: ['true'] }),
@@ -74,6 +82,193 @@ describe('launch validation (no sandbox needed)', () => {
   });
 });
 
+describe('mount order for a project under $HOME (no sandbox needed)', () => {
+  // Setup-independent: a fake `bwrap` on PATH records its argv and exits 0,
+  // so the mount ORDER is asserted without any sandbox. bwrap mounts cover
+  // what is below them (later wins), so $HOME read-only must come FIRST,
+  // then the project (overlay or read-only), then locked-path tmpfs masks,
+  // then runtime masks.
+  let binDir, prevPath, prevArgsFile, savedHome;
+  const argsFile = () => process.env.BB_ARGS_FILE;
+  before(() => {
+    binDir = mkdtempSync(join(tmpdir(), 'bb-fakebin-'));
+    const out = join(binDir, 'args');
+    writeFileSync(join(binDir, 'bwrap'),
+      '#!/bin/sh\n[ "$1" = "--version" ] && { echo "bubblewrap 0.12.0"; exit 0; }\nprintf \'%s\\n\' "$@" > "$BB_ARGS_FILE"\nexit 0\n');
+    chmodSync(join(binDir, 'bwrap'), 0o755);
+    prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${prevPath}`;
+    prevArgsFile = process.env.BB_ARGS_FILE;
+    process.env.BB_ARGS_FILE = out;
+    savedHome = process.env.HOME;
+  });
+  after(() => {
+    process.env.PATH = prevPath;
+    if (prevArgsFile === undefined) delete process.env.BB_ARGS_FILE;
+    else process.env.BB_ARGS_FILE = prevArgsFile;
+    process.env.HOME = savedHome;
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  async function launchArgs(opts) {
+    rmSync(argsFile(), { force: true });
+    const child = launch(opts);
+    await new Promise((resolve, reject) => {
+      child.on('error', reject);
+      child.on('close', resolve);
+    });
+    return readFileSync(argsFile(), 'utf8').split('\n').filter((l) => l !== '');
+  }
+
+  /** Index of a consecutive argv run, or -1. */
+  const idxOf = (args, ...seq) =>
+    args.findIndex((_, i) => seq.every((s, k) => args[i + k] === s));
+
+  it('overlay: $HOME read-only lands before the project overlay', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bb-mo-'));
+    try {
+      const home = join(root, 'home');
+      const proj = join(home, 'proj');
+      const rt = join(root, 'rt');
+      mkdirSync(proj, { recursive: true });
+      writeFileSync(join(proj, 'f.txt'), 'x\n');
+      process.env.HOME = home;
+      const args = await launchArgs({ runtime: rt, agent: 'mo', proj, command: ['true'], overlay: true });
+      const homeIdx = idxOf(args, '--ro-bind', home, home);
+      const ovIdx = idxOf(args, '--overlay-src', proj);
+      assert.ok(homeIdx >= 0, `home bind missing in ${args.join(' ')}`);
+      assert.ok(ovIdx >= 0, `project overlay missing in ${args.join(' ')}`);
+      assert.ok(homeIdx < ovIdx, `home bind must precede the project overlay (got ${homeIdx} vs ${ovIdx})`);
+    } finally {
+      process.env.HOME = savedHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('no overlay: $HOME read-only lands before the project read-only bind', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bb-mo-'));
+    try {
+      const home = join(root, 'home');
+      const proj = join(home, 'proj');
+      const rt = join(root, 'rt');
+      mkdirSync(proj, { recursive: true });
+      process.env.HOME = home;
+      const args = await launchArgs({ runtime: rt, agent: 'mp', proj, command: ['true'] });
+      const homeIdx = idxOf(args, '--ro-bind', home, home);
+      const projIdx = idxOf(args, '--ro-bind', proj, proj);
+      assert.ok(homeIdx >= 0 && projIdx >= 0, `binds missing in ${args.join(' ')}`);
+      assert.ok(homeIdx < projIdx, `home bind must precede the project bind (got ${homeIdx} vs ${projIdx})`);
+    } finally {
+      process.env.HOME = savedHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('always detaches the terminal (--new-session), even when stdin is a TTY', async () => {
+    // Pretend the caller sits at a terminal: the flag must not depend on it.
+    const root = mkdtempSync(join(tmpdir(), 'bb-mo-'));
+    const savedTty = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+    try {
+      const home = join(root, 'home');
+      const proj = join(home, 'proj');
+      const rt = join(root, 'rt');
+      mkdirSync(proj, { recursive: true });
+      process.env.HOME = home;
+      Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
+      const args = await launchArgs({ runtime: rt, agent: 'ns', proj, command: ['true'] });
+      assert.ok(args.includes('--new-session'), `--new-session missing in ${args.join(' ')}`);
+    } finally {
+      if (savedTty) Object.defineProperty(process.stdin, 'isTTY', savedTty);
+      else delete process.stdin.isTTY;
+      process.env.HOME = savedHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('a locked path inside the project stays masked after the project mount', async () => {
+    // The project IS $HOME here and holds its own `.ssh`: the locked tmpfs
+    // must land on top of the project mount, or the real drawer leaks
+    // through the overlay.
+    const root = mkdtempSync(join(tmpdir(), 'bb-mo-'));
+    try {
+      const home = join(root, 'home');
+      const rt = join(root, 'rt');
+      mkdirSync(join(home, '.ssh'), { recursive: true });
+      writeFileSync(join(home, '.ssh', 'id_test'), 'secret\n');
+      writeFileSync(join(home, 'f.txt'), 'x\n');
+      process.env.HOME = home;
+      const args = await launchArgs({ runtime: rt, agent: 'ml', proj: home, command: ['true'], overlay: true });
+      const homeIdx = idxOf(args, '--ro-bind', home, home);
+      const ovIdx = idxOf(args, '--overlay-src', home);
+      const lockIdx = idxOf(args, '--tmpfs', join(home, '.ssh'));
+      assert.ok(homeIdx >= 0 && ovIdx >= 0, `binds missing in ${args.join(' ')}`);
+      assert.ok(lockIdx >= 0, `locked mask missing in ${args.join(' ')}`);
+      assert.ok(homeIdx < ovIdx, 'home bind must precede the project mount');
+      assert.ok(lockIdx > ovIdx, `locked mask must follow the project mount (got ${lockIdx} vs ${ovIdx})`);
+    } finally {
+      process.env.HOME = savedHome;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('locked file masks (no sandbox needed)', () => {
+  // Fake bwrap again: a file is masked with a /dev/null bind (never --tmpfs),
+  // a symlinked file at its real target, and both land after the project mount.
+  let binDir, prevPath, prevArgsFile, savedHome, root;
+  before(() => {
+    binDir = mkdtempSync(join(tmpdir(), 'bb-fakebin-'));
+    writeFileSync(join(binDir, 'bwrap'),
+      '#!/bin/sh\n[ "$1" = "--version" ] && { echo "bubblewrap 0.12.0"; exit 0; }\nprintf \'%s\\n\' "$@" > "$BB_ARGS_FILE"\nexit 0\n');
+    chmodSync(join(binDir, 'bwrap'), 0o755);
+    prevPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${prevPath}`;
+    prevArgsFile = process.env.BB_ARGS_FILE;
+    process.env.BB_ARGS_FILE = join(binDir, 'args');
+    savedHome = process.env.HOME;
+    root = mkdtempSync(join(tmpdir(), 'bb-lf-'));
+  });
+  after(() => {
+    process.env.PATH = prevPath;
+    if (prevArgsFile === undefined) delete process.env.BB_ARGS_FILE;
+    else process.env.BB_ARGS_FILE = prevArgsFile;
+    process.env.HOME = savedHome;
+    rmSync(binDir, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('masks a file with /dev/null, a symlink at its target, a dir with tmpfs; skips absent and outside-link', async () => {
+    const home = join(root, 'home'); const proj = join(root, 'proj'); const rt = join(root, 'rt');
+    mkdirSync(join(home, '.aws'), { recursive: true });
+    mkdirSync(join(home, 'dotfiles'));
+    mkdirSync(proj);
+    writeFileSync(join(home, '.netrc'), 'n');
+    writeFileSync(join(home, 'dotfiles', 'npmrc'), 't');
+    symlinkSync('dotfiles/npmrc', join(home, '.npmrc'));
+    const outside = join(root, 'outside-pypirc');
+    writeFileSync(outside, 'o');
+    symlinkSync(outside, join(home, '.pypirc'));     // target outside HOME and project
+    symlinkSync(join(home, 'nowhere'), join(home, '.git-credentials')); // dangling
+    process.env.HOME = home;
+    rmSync(process.env.BB_ARGS_FILE, { force: true });
+    const child = launch({ runtime: rt, agent: 'lf', proj, command: ['true'] });
+    await new Promise((res, rej) => { child.on('error', rej); child.on('close', res); });
+    const args = readFileSync(process.env.BB_ARGS_FILE, 'utf8').split('\n').filter((l) => l !== '');
+    const at = (...seq) => args.findIndex((_, i) => seq.every((s, k) => args[i + k] === s));
+    const projIdx = at('--ro-bind', proj, proj);
+    assert.ok(projIdx >= 0);
+    for (const f of [join(home, '.netrc'), join(home, 'dotfiles', 'npmrc')]) {
+      const i = at('--dev-bind', '/dev/null', f);
+      assert.ok(i > projIdx, `file mask for ${f} missing or before the project mount: ${args.join(' ')}`);
+    }
+    assert.ok(at('--tmpfs', join(home, '.aws')) > projIdx, '.aws dir mask missing');
+    assert.equal(at('--tmpfs', join(home, '.netrc')), -1, 'a file must never get --tmpfs');
+    assert.equal(at('--dev-bind', '/dev/null', join(home, '.npmrc')), -1, 'symlink spelling is not bound');
+    assert.ok(!args.includes(outside) && !args.includes(join(home, '.pypirc')), 'outside link masked');
+    assert.ok(!args.includes(join(home, '.git-credentials')), 'dangling link masked');
+  });
+});
+
 describe('buildCaBundle (no sandbox needed)', () => {
   it('combines system roots with the barebox CA, key never involved', () => {
     const root = mkdtempSync(join(tmpdir(), 'bb-ca-'));
@@ -95,6 +290,34 @@ describe('buildCaBundle (no sandbox needed)', () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it('a present bundle is reused, not rewritten (5.3)', () => {
+    // The CA doesn't change during a runtime's life: 20 agents launching at
+    // once build the bundle once. A second CA must not replace the first.
+    const root = mkdtempSync(join(tmpdir(), 'bb-ca2-'));
+    try {
+      const mkCa = (cn, keyN, pemN) => {
+        execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes',
+          '-keyout', join(root, keyN), '-out', join(root, pemN), '-days', '1',
+          '-subj', `/CN=${cn}`], { stdio: 'ignore' });
+        return join(root, pemN);
+      };
+      const ca1 = mkCa('bb-test-ca-1', 'ca1.key', 'ca1.pem');
+      const ca2 = mkCa('bb-test-ca-2', 'ca2.key', 'ca2.pem');
+      const rt = join(root, 'rt');
+      const out = buildCaBundle(rt, ca1);
+      assert.ok(out.endsWith('ca-bundle.pem'), 'still reports the bundle path');
+      const first = readFileSync(out, 'utf8');
+      assert.ok(first.includes(readFileSync(ca1, 'utf8').trim()), 'first CA in the bundle');
+      const again = buildCaBundle(rt, ca2);
+      assert.equal(again, out, 'same path back');
+      const second = readFileSync(out, 'utf8');
+      assert.equal(second, first, 'not rewritten');
+      assert.ok(!second.includes(readFileSync(ca2, 'utf8').trim()), 'second CA ignored');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
@@ -106,6 +329,14 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     home = join(root, 'home'); proj = join(root, 'proj'); rt = join(root, 'rt');
     mkdirSync(join(home, '.ssh'), { recursive: true });
     writeFileSync(join(home, '.ssh', 'secret.txt'), 'x');
+    // credential-store fixtures: a dir, a file, a symlinked file, a control
+    mkdirSync(join(home, '.aws'));
+    writeFileSync(join(home, '.aws', 'credentials'), 'aws-secret\n');
+    writeFileSync(join(home, '.netrc'), 'machine x password netrc-secret\n');
+    mkdirSync(join(home, 'dotfiles'));
+    writeFileSync(join(home, 'dotfiles', 'npmrc'), '_authToken=npm-secret\n');
+    symlinkSync('dotfiles/npmrc', join(home, '.npmrc'));
+    writeFileSync(join(home, 'notes.txt'), 'plain notes\n');
     mkdirSync(proj, { recursive: true });
     writeFileSync(join(proj, 'ro.txt'), 'x');
     savedHome = process.env.HOME;
@@ -154,11 +385,37 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     assert.equal(r.code, 0, r.err);
   });
 
+  it('runs the agent in its own session, detached from our terminal', async () => {
+    // /proc/self/stat field 6 is the session id. Without --new-session the
+    // session leader lives outside the sandbox's pid namespace and reads as
+    // 0; with it the session starts inside, so the id is nonzero.
+    await listenSock('ts');
+    const c = launch({ runtime: rt, agent: 'ts', proj,
+      command: ['bash', '-c', 'read -r l </proc/self/stat; set -- ${l##*) }; echo "$4"'] });
+    const r = await run(c);
+    assert.equal(r.code, 0, r.err);
+    assert.notEqual(r.out.trim(), '0', 'agent shares the caller\'s session (no --new-session)');
+  });
+
   it('masks locked drawers', async () => {
     await listenSock('t1');
     const c = launch({ runtime: rt, agent: 't1', proj,
       command: ['bash', '-c', 'test ! -e "$HOME/.ssh/secret.txt"'] });
     assert.equal((await run(c)).code, 0);
+  });
+
+  it('masks credential stores: dirs empty, files read empty, symlinked file shut at both spellings', async () => {
+    await listenSock('t1b');
+    const script = [
+      '[ -z "$(ls -A "$HOME/.aws")" ] || exit 11',
+      '[ "$(wc -c < "$HOME/.netrc")" = 0 ] || exit 12',
+      '[ "$(wc -c < "$HOME/.npmrc")" = 0 ] || exit 13',
+      '[ "$(wc -c < "$HOME/dotfiles/npmrc")" = 0 ] || exit 14',
+      '[ "$(cat "$HOME/notes.txt")" = "plain notes" ] || exit 15',
+    ].join('\n');
+    const c = launch({ runtime: rt, agent: 't1b', proj, command: ['bash', '-c', script] });
+    const r = await run(c);
+    assert.equal(r.code, 0, `exit ${r.code} (11 .aws, 12 .netrc, 13 .npmrc, 14 dotfiles/npmrc, 15 notes): ${r.err}`);
   });
 
   it('binds project read-only', async () => {
@@ -224,11 +481,56 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     assert.equal((await run(c)).code, 0);
   });
 
+  it('an agent cannot answer its own ask (runtime under $HOME is masked)', async () => {
+    // The file checkpoint is the approve/deny capability: a forged
+    // `answers/<id>.json` from inside must never reach the host tree the
+    // proxy polls. The runtime lives under $HOME here, so the launcher
+    // masks it; the write below lands on the mask (or fails) — either way
+    // the host must not see it. The trailing visibility check catches
+    // missing masks: without them $HOME/rt shows through (readable) and
+    // the inner command exits nonzero even though the write itself fails.
+    const rtHome = join(home, 'rt');
+    mkdirSync(join(rtHome, 'answers'), { recursive: true });
+    mkdirSync(join(rtHome, 'asks'), { recursive: true });
+    mkdirSync(join(rtHome, 'socks'), { recursive: true });
+    const srv = net.createServer((s) => s.resume());
+    await new Promise((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(join(rtHome, 'socks', 'ta.sock'), resolve);
+    });
+    servers.push(srv);
+    const c = launch({ runtime: rtHome, agent: 'ta', proj,
+      command: ['bash', '-c', 'echo \'{"decision":"allow"}\' > "$HOME/rt/answers/h1.json"; echo wrote:$?; test ! -e "$HOME/rt/asks" && test ! -e "$HOME/rt/answers"'] });
+    const r = await run(c);
+    assert.equal(r.code, 0, r.err);
+    assert.ok(!existsSync(join(rtHome, 'answers', 'h1.json')),
+      `forged answer reached the host (inside said: ${r.out}${r.err})`);
+  });
+
+  it('a runtime outside home/proj is not visible inside at all', async () => {
+    const rtOut = join(root, 'rt-out');
+    mkdirSync(join(rtOut, 'answers'), { recursive: true });
+    mkdirSync(join(rtOut, 'socks'), { recursive: true });
+    const srv = net.createServer((s) => s.resume());
+    await new Promise((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(join(rtOut, 'socks', 'tb.sock'), resolve);
+    });
+    servers.push(srv);
+    const c = launch({ runtime: rtOut, agent: 'tb', proj,
+      extraEnv: { RT_OUT: rtOut },
+      command: ['bash', '-c', 'echo \'{"decision":"allow"}\' > "$RT_OUT/answers/h1.json"'] });
+    const r = await run(c);
+    assert.notEqual(r.code, 0, `write to an invisible runtime must fail (got ${r.code})`);
+    assert.ok(!existsSync(join(rtOut, 'answers', 'h1.json')), 'host tree untouched');
+  });
+
   it('hides runtime sockets that show through $HOME, front door still works', async () => {
     // Production layout: the runtime lives under $HOME, so the ro-bind of
-    // home would expose every agent socket (identity) and the control
-    // socket (approve/deny) — and a read-only bind does NOT stop
-    // connect(2). The launch must mask the runtime dir inside.
+    // home would expose every agent socket (identity) and the file
+    // checkpoint (`asks/`, `answers/` — approve/deny) — and a read-only
+    // bind does NOT stop connect(2). The launch must mask the runtime dir
+    // inside.
     const rtHome = join(home, 'rt');
     mkdirSync(join(rtHome, 'socks'), { recursive: true });
     const sock = join(rtHome, 'socks', 't8.sock');

@@ -169,7 +169,7 @@ agent: travel-bot
 
 ```yaml
 mode: strict            # strict | normal | relaxed
-locked_paths: [~/.ssh, ~/secrets, ~/.mozilla, ~/.config/chromium, ~/.gnupg]
+locked_paths: 21 credential stores, see LOCKED_PATHS in src/launcher.js  # ~/.claude stays readable until M5
 network:
   always_x:
     domains: [api.stripe.com, "*.adyen.com", "*.paypal.com"]

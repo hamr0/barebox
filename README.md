@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/status-POC-c0841a" alt="status: POC">
 </p>
 
-> **Status:** POC. The walls (M0), HTTPS inspection (M1), and hold-and-ask (M2) are proven and measured. The npm package is a name reservation — the API lands with the graduation rewrite next. Linux only.
+> **Status:** early. The walls (M0), HTTPS inspection (M1), hold-and-ask (M2), the one-call `run()` and file ask channel (M2.5) and the undo layer (M4) are built and measured; the decision rules (M3), key custody (M5) and the rest are not. Today's hold rule is interim: payment destinations, plus every non-GET/HEAD request in `ask` and `auto` modes. Linux only.
 
 ## Why
 
@@ -41,8 +41,8 @@ Three letters, each handled differently — the same `r`/`w`/`x` as [bareguard](
 
 The agent works in your house:
 
-- **Tracing paper (w).** The agent sees your real files, but every change lands on an overlay laid over them. At the end you commit it or roll it back.
-- **Locked drawers (r).** It reads most things. `~/.ssh`, `~/secrets`, `~/.gnupg`, browser profiles stay shut.
+- **Tracing paper (w).** The agent sees your real files, but every change lands on an overlay laid over them. At the end you commit it or roll it back (`sbx run --overlay -- <cmd>`, then `sbx diff`, `sbx commit`, `sbx rollback`).
+- **Locked drawers (r).** It reads most things. Keys and password stores (`~/.ssh`, `~/secrets`, `~/.gnupg`, `~/.password-store`, keyrings), browser profiles, cloud and cluster credentials (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/op`) and token files (`~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.cargo/credentials.toml`) stay shut. The agent's own model credentials (`~/.claude`) do not; moving those out is M5.
 - **One front door with a doorman (x).** No network of its own. Lookups pass; anything that sends, pays, or publishes waits for your yes.
 - **Keys it never holds.** The agent types a placeholder; the doorman puts the real API key in the request header only after you approve that request.
 
@@ -60,7 +60,7 @@ The agent works in your house:
   +-----+--------------- bwrap sandbox (unprivileged) ---------------+
   |  files:   overlay   lower = real project (read only)             |
   |                     upper = per-run tracing paper                |
-  |  locked paths (~/.ssh etc.) -> empty tmpfs                       |
+  |  locked paths (~/.ssh etc.) -> empty tmpfs or /dev/null          |
   |  network: none of its own                                        |
   |  socat inside: 127.0.0.1:3128 -> per-agent unix socket           |
   +-----+------------------------------------------------------------+
@@ -89,7 +89,7 @@ Measured, not estimated. Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22.
 | Start + exit | **10 ms** (M0 POC; unmeasured on the rewrite — TODO re-measure) | 1.87–2.05 s |
 | 20 agents | ~228 MB (rough sum: ~72 MB proxy + 20 × 7.8 MB) | ~2 GB |
 
-Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 GB VPS. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/product/findings.md).
+Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 GB VPS. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/logs/findings.md).
 
 ## Roadmap
 
@@ -99,7 +99,7 @@ Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 
 | M1 | Proxy sees inside HTTPS (curl, node, python requests, git) | **PASS** — real-internet matrix + negatives, peak 63 MB |
 | M2 | Hold one `x` request, ask, keep everything else running | **PASS** — 9-scenario hold matrix, 120 s + never timeouts |
 | M3 | Decide r/w/x deterministically (rwxmap + bareguard), audit log | |
-| M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging | |
+| M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging | **PASS** — paper + review flow implemented, full bwrap+unix proof in a real shell |
 | M5 | Keys the agent never holds | |
 | M6 | Scale run: 20 agents + shared proxy | |
 | M7 | Demos: payment held for approval; prompt-injected `~/.ssh` exfil blocked | |
@@ -112,11 +112,11 @@ M0–M2 are the go/no-go. Later: macOS (`sandbox-exec` + APFS clones), Windows v
 npm install barebox
 ```
 
-Requires Node.js >= 22. Zero production dependencies. Published 0.1.0 is the reservation scaffold — nothing to import yet.
+Requires Node.js >= 22. Zero production dependencies. Needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap. CI builds bubblewrap 0.12.0 from a checksum-pinned source tarball and fails if any test is skipped. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
 
 ## Try the POCs
 
-Linux with `bwrap`, `socat`, `openssl`, Node >= 22 and Python 3. Needs a normal shell (namespaces + listening sockets), not a tool sandbox. The POCs are throwaway proofs, not the product.
+Linux with `bwrap` (>= 0.11.0 only for the overlay), `socat`, `openssl`, Node >= 22 and Python 3. Needs a normal shell (namespaces + listening sockets), not a tool sandbox. The POCs are throwaway proofs, not the product.
 
 ```
 git clone https://github.com/hamr0/barebox && cd barebox

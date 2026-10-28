@@ -69,7 +69,7 @@ describe(`end-to-end (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}` : 
   }
   const log = () => readFileSync(join(rt, 'mitm.log'), 'latin1');
   const sbx = (...args) => execA('node', [join(ROOT, 'src/cli.js'), ...args],
-    { encoding: 'latin1', env: { ...process.env, SBX_SOCK: join(rt, 'ctl.sock') } });
+    { encoding: 'latin1', env: { ...process.env, SBX_RUNTIME: rt } });
 
   before(async () => {
     root = mkdtempSync(join(tmpdir(), 'bb-e2e-'));
@@ -84,10 +84,10 @@ describe(`end-to-end (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}` : 
     tlsUp = await startHttps(kc);
     // allowLoopback is the explicit TEST-ONLY opt-in: the fixture lives on
     // 127.0.0.1, which the default wall denies. Production never passes this.
-    proxy = createProxy({ certDir: join(rt, 'certs'), runtime: rt,
+    proxy = createProxy({ runtime: rt,
       logFile: join(rt, 'mitm.log'), upstreamCa: join(rt, 'certs', 'ca.pem'),
-      allowLoopback: true,
-      hold: { match: '/hold', timeoutMs: 15000 }, controlSocket: join(rt, 'ctl.sock') });
+      unsafeTestOnly: { allowLoopback: true },
+      hold: { match: '/hold', timeoutMs: 15000, pollMs: 100 } });
     await proxy.ready;
     sock = proxy.addAgent('e2e');
   });
@@ -120,7 +120,11 @@ describe(`end-to-end (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}` : 
       caFile: proxy.caFile, command: ['bash', '-c', inner] });
     const done = run(c);
     const held = await waitFor(
-      () => proxy.pending().find((h) => /E2EHOLD/.test(h.body)),
+      () => proxy.pending().find((h) => {
+        try {
+          return /E2EHOLD/.test(JSON.parse(readFileSync(join(rt, 'asks', `${h.id}.json`), 'utf8')).bodyPreview);
+        } catch { return false; }
+      }),
       'E2EHOLD to park');
     assert.equal(held.agent, 'e2e');
     assert.equal((await sbx('approve', held.id)).stdout.trim(), `approved ${held.id}`);

@@ -1,12 +1,12 @@
 # barebox
 
 <!-- MEMORY:START -->
-No MEMORY.md yet — the first `/remember` consolidation creates `.claude/remember/MEMORY.md`; link it here when it exists.
+@.claude/remember/MEMORY.md
 <!-- MEMORY:END -->
 
 <!-- DOCS_INDEX:START -->
-Docs: `docs/product/agent-sandbox-prd.md` (the PRD), `docs/product/agent-sandbox.md` (full story),
-`poc/m0/README.md` (M0 walls proof). No `docs/index.md` yet — search this corpus instead of reading it whole.
+Docs map: `docs/index.md` — every doc in this project, with line counts.
+Search this corpus instead of reading it whole: `/docs-builder search <query words>`
 <!-- DOCS_INDEX:END -->
 
 ## Dev Rules
@@ -30,3 +30,17 @@ Docs: `docs/product/agent-sandbox-prd.md` (the PRD), `docs/product/agent-sandbox
 **Responsive web UI is mandatory.** Any web UI must work on mobile by default — fluid layouts, viewport meta, breakpoints, no horizontal scroll. Verify in DevTools device emulation before claiming a UI task is done. POCs exempt; real projects are not.
 
 For full development and testing standards, see `.claude/remember/AGENT_RULES.md` (plus `LIBRARY_CONVENTIONS.md` — this is a zero-dependency library). Consult when building something new or adding a feature — a standards guide, not hot context.
+
+<!-- AGENT_RULES:START -->
+**One writer per piece of state.** One function assigns each field; everything else
+calls it. Grep who writes it before you write it — and if a write can land from a
+callback, thread, or lifecycle, the reader must tell stale from fresh.
+
+**Surgical changes only.** Touch what the task requires. Dead code, nits, bugs you
+pass: if it's inside or affects the code you're already changing and the fix changes
+no behavior, fix it and say so — otherwise report it and say what it costs to leave
+it. A problem you don't fix goes in the report, never in a comment.
+
+Standards guide (read when designing/building something new, not hot context):
+.claude/remember/AGENT_RULES.md
+<!-- AGENT_RULES:END -->

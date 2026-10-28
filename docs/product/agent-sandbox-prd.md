@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Name: barebox (CLI `sbx`).
-> Status: M0–M2 PASS; graduation rewrite done and branch-reviewed (ready, Oct 27). Next: M2.5 integration seam, then M4 → M3 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M0–M2 PASS; graduation rewrite shipped as **barebox 0.2.0** on npm (Oct 27, provenance-signed). M2.5 integration seam and M4 undo layer are built (unreleased; see CHANGELOG [Unreleased]). Next: M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 – Nov 4 2026 (10 days). Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -148,6 +148,16 @@ agent `sleep` excluded per the PRD walls-only definition).
 This supersedes the M0/M1 POC proxy figures (52.1 MB bare, 59.9–63.1 MB with TLS) for the
 rewritten code. Start timing remains unmeasured on the rewrite (TODO re-measure).
 
+### Release v0.2.0 (Oct 27)
+
+Published to npm from `main` at `d6c67f5` (tag `v0.2.0`), with SLSA provenance. A fresh install exports `createProxy` and `launch`, and `sbx --help` exits 0. The tarball has 18 files and nothing from `poc/`, `docs/`, `test/` or `scripts/`. Before it could ship, the publish path needed three fixes, each found by its own gate:
+
+| PR | Gate that failed | Cause | Lesson |
+|---|---|---|---|
+| #2 | Test (`spawn socat ENOENT`) | `publish.yml` lacked the bubblewrap/socat install and userns sysctl that `ci.yml` has | Runner deps must be identical in every workflow that runs `npm test` |
+| #3 | Adopter type check (TS2339, TS1543) | The gate's quickstart still used `proxy.holds` and a JSON import without `with { type: "json" }` | Update the adopter quickstart whenever the public API changes |
+| #4 | npm `E422` at publish | `package.json` had no `repository`; provenance requires it to match the repo | Every suite package needs `repository`; bin paths written without `./` avoid npm 11's misleading "invalid and removed" warning |
+
 ## 4. Evidence so far
 
 Measured on the dev machine: Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22, ext4 home. These came from throwaway POCs. They are evidence, not the product.
@@ -232,6 +242,7 @@ Notes: in `nonet` mode all file walls stayed green — only the network leaked, 
 - Mounting the proxy socket needs a tmpfs over its target dir.
 - The bwrap root needs a `/lib64 -> usr/lib64` symlink or every dynamic binary fails with `No such file or directory` (the ELF interpreter path). Proven by red/green minimal repro in the M0 run.
 - Each sandbox holds 2 bwrap processes (supervisor + ns child) plus socat; count RSS per-PID-tree, and never `pgrep -f` the bridge string (bwrap parents match their own command line).
+- Ubuntu's apt ships bubblewrap 0.9.0, which lacks the overlay options. `ci.yml` and `publish.yml` build 0.12.0 from a sha256-pinned source tarball into `/usr`, and both fail the run when the suite reports any skipped test (a skip is not a pass).
 
 ## 5. Decisions
 
@@ -253,7 +264,7 @@ Signed off by the user.
 | Governance v1 | Single operator, one mode (or one gate) per agent, one audit log. |
 | Secrets v1 | Injected in request headers only, after approval. A placeholder sits inside the sandbox. Body placeholder swap (for example `{{CARD}}` in a form body) is not v1. |
 | Localhost sockets (M0) | Blocked entirely. The net namespace isolates localhost; revisit treat-as-x in M3 only if a demo needs a local DB. |
-| Locked paths (M0) | `~/.ssh`, `~/secrets`, `~/.mozilla`, `~/.config/chromium`, `~/.gnupg`. More later without changing the walls. |
+| Locked paths (M0) | 21 credential stores; see `LOCKED_PATHS` in `src/launcher.js`. `~/.claude` stays readable until M5. More later without changing the walls. |
 | Browser agents + Jev | Out of v1. Demo A uses an API, not a browser. |
 | M0 harness | 20× idle sandboxes (`sleep` + `socat`, no real agent) for walls-only overhead ≤ 10 MB each; bypass set = unset proxy env, `--noproxy`, direct curl to IP. Real-agent and TLS memory come in M1/M6. |
 | API surface | CLI for sure plus programmatic APIs for spawning sandboxed workflows (goal: spawn workflows in a sandbox easily). |
@@ -364,12 +375,12 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 2. **The file checkpoint**:
    - `<runtime>/asks/<id>.json` is written when a request parks, and `<runtime>/answers/<id>.json` is read once, then renamed away.
    - A stale or late answer is ignored and logged, as in fwdloop.
-   - An `ASK OPEN <id>` line goes to stderr, so a human watching a terminal knows.
+   - `sbx run` prints an `ask <id> <agent> <method> <url> rule=<rule>` line to stdout (`{"ev":"ask",...}` with `--json`), so a human watching a terminal knows. The library prints nothing: a caller of `run()` or `createProxy` gets `asks/<id>.json` and the `onEvent` callback.
    - The control socket and its server are deleted.
-3. **A decision-ready ask payload**: `id`, `agent`, `method`, `url`, `rule` (`payment`, `card-in-body`, `x:unlabelled-POST`), `letter`, a redacted body preview, `waitingSec`, `expiresAt`. barebox knows the request, not the intent; the caller adds its own context (step, goal).
-4. **`run({ proj, command, mode, gate, onAsk })`** → `{ exit, asks, audit }` (plus `diff` once M4 exists). It wraps `createProxy`, `addAgent` and `launch`, which stay public as the low-level parts.
-5. **`sbx run [--mode ask|auto|trust] [--json] -- <cmd>`**. With `--json`, stdout carries JSON lines (`{"ev":"ask",...}`, `{"ev":"done","exit":N}`), and the exit code mirrors the agent's.
-6. **Audit lines in bareguard's shape** (see Decisions, "Audit"), so M3 shares the file without a migration.
+3. **A decision-ready ask payload**: `id`, `agent`, `method`, `url`, `rule` (`payment`, `card-in-body`, `x:unlabelled-POST`), `letter`, a body preview (redaction lands in M3, see item 6), `waitingSec`, `expiresAt`. barebox knows the request, not the intent; the caller adds its own context (step, goal).
+4. **`run({ proj, command, mode, onAsk })`** → `{ exit, asks, audit, diff, runtime }` (`diff` is the M4 overlay diff; `gate` is not an option today, the foundations rework removed it). It wraps `createProxy`, `addAgent` and `launch`, which stay public as the low-level parts.
+5. **`sbx run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd>`**. With `--json`, stdout carries JSON lines (`{"ev":"ask",...}`, `{"ev":"decided",...}` as each ask ends, `{"ev":"done","exit":N}`), and the exit code mirrors the agent's.
+6. **Audit lines in bareguard's shape** (see Decisions, "Audit"), so M3 shares the file without a migration. STATUS (Oct 27): the bareguard line shape is DEFERRED to M3 — the current log is barebox's own JSONL. Body-preview redaction is NOT DONE either: the preview is verbatim up to `ASK_BODY_LIMIT` (see `holds.js`), redaction waits for M3's bareguard `secrets`.
 
 **Done when:**
 - A loop answers a parked request through `onAsk` with no files involved.
@@ -421,7 +432,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | | |
 |---|---|
 | Goal | Every file write is reviewable and reversible. |
-| We use | bwrap overlay. |
+| We use | bwrap overlay (`--overlay-src` / `--overlay`, bubblewrap >= 0.11.0; an older bwrap is refused with a clear message, runs without the overlay still work). |
 | We build | An overlay upper per run. `sbx diff`, `sbx commit`, `sbx rollback`. Handling of deletions (overlay whiteouts). Detection of files the user changed meanwhile: on conflict, refuse or flag. |
 | Riskiest assumption | Commit applies the upper layer to the real folder correctly, including deletions and files changed meanwhile. |
 | Done when | A run that edits, creates and deletes files commits to the correct result. Rollback leaves the folder as it was. A file changed by the user mid-run is flagged, not overwritten. |
@@ -523,3 +534,4 @@ None of these block M0. Nothing here is silently assumed.
 | 7 | **The agent's own model calls.** An agent POSTs to its LLM API (`/v1/messages`, `/v1/chat/completions`) every turn. With "other methods = x", `auto` would ask on every turn. Recommendation: ship a small default rwx label set marking known inference endpoints (Anthropic, OpenAI-compatible, Baseten, local) as `r` (no outside side effect beyond cost), extendable by the user. Cost limits belong to bareguard's `budget`, not to an ask. | M3 rule set; must be settled before M3's POC or `auto` is unusable. |
 | 8 | **"Don't ask again for this run"** (Claude Code's option). Should an answer carry `remember: true`, scoped to agent + method + host for the rest of the run? It cuts repeat asks, but bareguard's `gate.add` only tightens, so widening needs support there (would be friction F5). Recommendation: leave it out of M2.5; decide in M3 after seeing how noisy `auto` is with Q7 in place. | M3. |
 | 9 | **Ask timeout with a file channel.** Polling adds latency; the M2 default deadline was 120 s. What poll interval and default deadline? Recommendation: 250 ms poll, 120 s deadline, configurable; timeout = deny. | M2.5. |
+| 10 | **The hold decision never sees the body** (found Oct 27, design read). `shouldHold(req)` runs in `handleRequest` *before* the body is read and gets method, URL and headers only. Unheld requests stream straight to upstream; only held ones are buffered. So the body half of the card/payment floor — card numbers (Luhn) ask in every mode, `trust` included (section 2) — is **not enforced today**, and no body-based rule (bareguard `secrets` in a body, payment JSON) can be. Fixing it changes the proxy's core path: either buffer every request body up to a cap before deciding (latency + memory on every request; what cap, and what happens above it — deny, ask, or stream unchecked?), or decide in two passes (headers now, body at end-of-stream before the last byte goes upstream — needs holding the final chunk). Recommendation: buffer up to a small cap (e.g. 64 KB, card numbers and secrets live in small bodies), stream larger bodies with the floor applied to their first cap bytes, and measure the cost against the 80 MB target with 20 agents. | M3 design, before M3's POC: the seam shape `shouldHold(req)` → `shouldHold(req, body?)` and the buffering policy. |

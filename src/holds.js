@@ -1,23 +1,106 @@
 // holds.js — the ONLY writer of the hold queue.
 //
-// A held request parks with its client socket open until a human approves,
-// denies, or the deadline / client / proxy goes away first. Approving a hold
-// whose client is gone must be impossible: `abandon()` removes the entry, so
-// a later `approve` answers `unknown <id>` and nothing is forwarded.
-import net from 'node:net';
+// A held request parks with its client socket open until the ask channel
+// answers. Two channels, one queue:
+// - `onAsk(ask) -> Promise<{ decision, reason? }>` (bareguard's
+//   `humanChannel` shape): one promise per hold, no files involved.
+// - the default file checkpoint: `<runtime>/asks/<id>.json` is written on
+//   park, and ONE interval per queue reads `<runtime>/answers/` once per
+//   tick (default 250 ms, PRD Q9), consuming each answer file (renamed away
+//   before reading). An answer for a held id settles it; anything else is
+//   stale: ignored, logged (`stale-answer`), removed.
+// The deadline timer in `add()` is the only deadline: nothing else looks
+// at the clock. Timeout — or any failure of the channel itself — is deny.
+// A malformed answer (bad JSON, missing/unknown decision) is ignored,
+// logged (`malformed-answer`), and removed; the hold keeps waiting until
+// the deadline. The queue never throws on channel input: everything
+// unexpected is loud in the log and eventually a deny.
+//
+// Decisions enter through one `normalizeDecision` (`allow`/`deny`, with
+// `'approve'` accepted as an alias of `'allow'` in answer files only) and
+// are reported through one optional `onEvent` callback: `{ type: 'ask' }`
+// when a hold parks, `{ type: 'decided' }` when it settles or is abandoned
+// (`deny` / `client gone`). Outcomes are
+// reported, never reconstructed: `run()` and `sbx run` build their ask
+// records from these events. The library never writes to stdout or stderr.
+//
+// Approving a hold whose client is gone must be impossible: `abandon()`
+// removes the entry and its ask file, so a later answer is stale and
+// nothing is forwarded.
+//
+// Ask payload (`asks/<id>.json`): `id`, `agent`, `method`, `url`, `rule`
+// (the hold-reason string), `letter`, `bodyPreview` + `truncated`,
+// `waitingSec` (0 at park; readers use the file mtime for a live value),
+// `expiresAt` (ISO-8601 UTC string, or null when `timeoutMs: 'never'`).
+// `letter` is `'x'` for every parked ask: letters are M3's job (rwxmap +
+// bareguard) — the queue only parks what the decision function flags, and
+// everything flagged today is irreversible. Headers are excluded from the
+// payload (they carry Authorization secrets); the body preview is capped at
+// ASK_BODY_LIMIT bytes but otherwise verbatim — M3's bareguard `secrets`
+// redaction takes over redaction there.
+//
+// Answer payload (`answers/<id>.json`): `{ decision: 'allow' | 'deny',
+// reason? }`. `'approve'` is accepted as an alias of `'allow'`. Writers
+// must write atomically (tmp file + rename); readers never see partials.
 import fs from 'node:fs';
+import path from 'node:path';
+import { runtimePaths } from './runtime.js';
+
+/** Body preview cap for `asks/<id>.json` (bytes). */
+export const ASK_BODY_LIMIT = 4096;
+
+/** Default answer poll interval in ms (PRD Q9). */
+export const DEFAULT_POLL_MS = 250;
 
 /**
  * A parked request, as returned by {@link pending}. Plain objects only —
- * the queue itself never leaves this module.
+ * the queue itself never leaves this module. No body: returning whole 1 MB
+ * bodies from a status call is never needed, and the ask payload in
+ * `asks/<id>.json` carries the preview.
  *
  * @typedef {object} HeldRequest
  * @property {string} id hold id (`h<n>`)
  * @property {string} agent agent name (its socket), never `c<n>`
  * @property {string} method HTTP method
  * @property {string} url full URL
- * @property {string} body request body so far (utf8)
+ * @property {string} rule hold-reason string from the decision function
  * @property {number} waitingSec seconds since the hold parked
+ */
+
+/**
+ * A queue event, as delivered to the `onEvent` callback: `{ type: 'ask' }`
+ * when a hold parks, `{ type: 'decided' }` when it settles or its client
+ * goes away (`deny` / `client gone`): every ask ends in exactly one.
+ *
+ * @typedef {{ type: 'ask', ask: AskPayload } | { type: 'decided', id: string, decision: 'allow' | 'deny', reason?: string }} HoldEvent
+ */
+
+/**
+ * Queue event callback.
+ *
+ * @typedef {(e: HoldEvent) => void} OnEvent
+ */
+
+/**
+ * The decision-ready ask written to `asks/<id>.json`.
+ *
+ * @typedef {object} AskPayload
+ * @property {string} id hold id (`h<n>`)
+ * @property {string} agent agent name (its socket)
+ * @property {string} method HTTP method
+ * @property {string} url full URL
+ * @property {string} rule hold-reason string from the decision function
+ * @property {string} letter always `'x'` until M3 owns letters
+ * @property {string} bodyPreview request body preview, utf8, capped at ASK_BODY_LIMIT bytes
+ * @property {boolean} truncated true when the body exceeded ASK_BODY_LIMIT
+ * @property {number} waitingSec 0 at park; readers use the file mtime for a live value
+ * @property {string|null} expiresAt ISO-8601 UTC deadline, or null when `timeoutMs: 'never'`
+ */
+
+/**
+ * Decide a parked ask. Resolves `{ decision: 'allow' | 'deny', reason? }`.
+ *
+ * @typedef {(ask: AskPayload) => Promise<{ decision: string, reason?: string }>} OnAsk
  */
 
 /**
@@ -28,7 +111,100 @@ import fs from 'node:fs';
  */
 
 /**
- * Create the hold queue.
+ * Atomic write: tmp file + rename, so readers never see a partial payload.
+ *
+ * @param {string} file destination path
+ * @param {string} text content
+ * @returns {void}
+ */
+export function writeFileAtomic(file, text) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  // 0600, not the 0644 default: asks carry the audit trail and unredacted
+  // body previews, and answers carry the decision. (Umask can only remove
+  // bits from 0600, never add group/other access.)
+  fs.writeFileSync(tmp, text, { mode: 0o600 });
+  fs.renameSync(tmp, file);
+}
+
+let consumeN = 0;
+
+/**
+ * Consume a file exactly once: rename it away, then read and unlink the
+ * renamed copy. Returns null when there is nothing to consume.
+ *
+ * @param {string} file path to consume
+ * @returns {string|null} content, `''` when the renamed copy is unreadable, null when absent
+ */
+function consumeFile(file) {
+  const tmp = `${file}.consumed-${process.pid}-${++consumeN}`;
+  try {
+    fs.renameSync(file, tmp);
+  } catch {
+    return null;
+  }
+  let text = '';
+  try {
+    text = fs.readFileSync(tmp, 'utf8');
+  } catch {}
+  try {
+    fs.unlinkSync(tmp);
+  } catch {}
+  return text;
+}
+
+/**
+ * Validate an answer payload's shape. Returns the raw decision pair;
+ * normalization (including the `'approve'` alias) is `normalizeDecision`'s
+ * job. Anything unparsable, or with a missing decision, is malformed.
+ *
+ * @param {string} text raw answer file content
+ * @returns {{ decision: unknown, reason?: unknown } | null} raw pair, or null when malformed
+ */
+function parseAnswer(text) {
+  let obj;
+  try {
+    obj = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== 'object') return null;
+  const { decision, reason } = /** @type {{ decision?: unknown, reason?: unknown }} */ (obj);
+  if (typeof decision !== 'string' || !decision) return null;
+  return { decision, reason };
+}
+
+/**
+ * The one normalization of decisions, applied once wherever a decision
+ * enters (an answer file, or an `onAsk` result). The audit log speaks
+ * `allow`/`deny`, which is bareguard's vocabulary.
+ *
+ * @param {{ decision?: unknown, reason?: unknown } | null} input raw decision pair
+ * @param {object} [opts]
+ * @param {boolean} [opts.approveAlias] accept `'approve'` as an alias of `'allow'` (answer files only)
+ * @returns {{ decision: 'allow' | 'deny', reason?: string } | null} normalized, or null when not a decision at all
+ */
+export function normalizeDecision(input, { approveAlias = false } = {}) {
+  const decision = input?.decision;
+  if (decision === 'allow' || (approveAlias && decision === 'approve')) {
+    return { decision: 'allow' };
+  }
+  if (decision === 'deny') {
+    const reason = input?.reason;
+    return {
+      decision: 'deny',
+      reason: typeof reason === 'string' && reason ? reason : 'denied',
+    };
+  }
+  return null;
+}
+
+/**
+ * Create the hold queue. One queue per runtime, enforced by `claimRuntime`
+ * in `createProxy` (a second live proxy on the same runtime never starts):
+ * on the file channel the queue owns `asks/` and `answers/` for its
+ * runtime, clearing both at start and removing its asks on close, so no
+ * answer outlives its queue.
  *
  * @param {object} opts
  * @param {(o: Record<string, unknown>) => void} opts.log audit-log writer
@@ -36,52 +212,214 @@ import fs from 'node:fs';
  * @param {string} [opts.match] path substring that parks a request (default impl when `shouldHold` is absent)
  * @param {number|string} [opts.timeoutMs] hold deadline in ms, or `'never'` (default 120000)
  * @param {number} [opts.maxBody] bodies over this are denied at the door, never queued (default 1048576)
- * @param {string|null} [opts.controlSocket] unix socket path for `pending | approve | deny`
+ * @param {string|null} [opts.runtime] runtime dir; required for the default file checkpoint (writes `asks/`, polls `answers/`)
+ * @param {OnAsk|null} [opts.onAsk] ask seam (bareguard `humanChannel` shape); when present no files are involved
+ * @param {number} [opts.pollMs] answer poll interval in ms for the default file checkpoint (default 250, PRD Q9)
+ * @param {OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle or abandon
  * @param {(entry: object) => void} opts.onApprove forward the parked request upstream
  * @param {(entry: object, reason: string) => void} opts.onDeny refuse the parked request
- * @returns {{ add: (entry: object) => string, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, approve: (id: string) => string, deny: (id: string, reason: string) => string, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], size: () => number, close: () => void }} queue handle
+ * @returns {{ add: (entry: object) => string, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
  */
 export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
-  maxBody = 1048576, controlSocket = null, onApprove, onDeny }) {
-  const decide = shouldHold
-    ?? ((req) => (match && new URL(req.url).pathname.includes(match) ? `path matches ${match}` : null));
+  maxBody = 1048576, runtime = null, onAsk = null, pollMs = DEFAULT_POLL_MS,
+  onEvent = null, onApprove, onDeny }) {
+  // The default IS matchPath: one definition of the path-substring rule (see below).
+  const decide = shouldHold ?? (match ? matchPath(match) : () => null);
   /** @returns {number|null} */
   const deadlineMs = () => {
     if (timeoutMs === 'never') return null;
     const ms = timeoutMs ?? 120000;
     return typeof ms === 'number' && Number.isFinite(ms) && ms >= 0 ? ms : 120000;
   };
+  if (onAsk != null && typeof onAsk !== 'function') {
+    throw new Error('createHolds: onAsk must be a function');
+  }
+  if (onEvent != null && typeof onEvent !== 'function') {
+    throw new Error('createHolds: onEvent must be a function');
+  }
+  const poll = typeof pollMs === 'number' && Number.isFinite(pollMs) && pollMs > 0
+    ? pollMs
+    : DEFAULT_POLL_MS;
+  // Custom onAsk owns decisions with no files involved; the default IS the
+  // file checkpoint and needs a runtime dir for asks/ + answers/.
+  const useFiles = onAsk == null;
+  if (useFiles && !runtime) {
+    throw new Error('createHolds: runtime is required for the default file checkpoint (or pass onAsk)');
+  }
+  const paths = runtime ? runtimePaths(runtime) : null;
+  if (paths) {
+    fs.mkdirSync(paths.asksDir, { recursive: true });
+    fs.mkdirSync(paths.answersDir, { recursive: true });
+  }
+  // A dead queue's leftovers must never decide the next queue's holds
+  // (ids restart at h1): clear both folders at start, logging one audit
+  // line per removed answer.
+  if (useFiles && paths) {
+    for (const [dir, isAnswers] of /** @type {[string, boolean][]} */ ([[paths.asksDir, false], [paths.answersDir, true]])) {
+      let names;
+      try {
+        names = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const name of names) {
+        try {
+          fs.unlinkSync(path.join(dir, name));
+        } catch {
+          continue;
+        }
+        if (isAnswers) {
+          log({ ev: 'stale-answer', id: name.endsWith('.json') ? name.slice(0, -'.json'.length) : name, note: 'leftover from a dead queue; removed at start' });
+        }
+      }
+    }
+  }
 
   let n = 0;
   /** @type {Map<string, object>} */
   const queue = new Map();
 
   const pub = (h) => ({
-    id: h.id, agent: h.agent, method: h.method, url: h.url,
-    body: h.body.toString('utf8'), waitingSec: Math.round((Date.now() - h.t0) / 1000),
+    id: h.id, agent: h.agent, method: h.method, url: h.url, rule: h.note,
+    waitingSec: Math.round((Date.now() - h.t0) / 1000),
   });
 
-  function settle(id, approve, reason) {
+  /**
+   * Build the decision-ready ask payload for a parked entry.
+   *
+   * @param {object} entry queue entry
+   * @param {number|null} ms hold deadline in ms, or null for never
+   * @param {string} rule hold-reason string
+   * @returns {AskPayload}
+   */
+  function askPayload(entry, ms, rule) {
+    const body = Buffer.isBuffer(entry.body) ? entry.body : Buffer.from(String(entry.body ?? ''));
+    return {
+      id: entry.id,
+      agent: entry.agent,
+      method: entry.method,
+      url: entry.url,
+      rule,
+      // M3 owns letters; everything the queue parks today is irreversible.
+      letter: 'x',
+      bodyPreview: body.subarray(0, ASK_BODY_LIMIT).toString('utf8'),
+      truncated: body.length > ASK_BODY_LIMIT,
+      waitingSec: 0,
+      // ISO-8601 UTC (not epoch ms): readable in `sbx pending` and logs.
+      expiresAt: ms === null ? null : new Date(entry.t0 + ms).toISOString(),
+    };
+  }
+
+  function removeAskFile(id) {
+    if (!paths) return;
+    try {
+      fs.unlinkSync(paths.askFile(id));
+    } catch {}
+  }
+
+  function settle(id, approved, reason) {
     const h = queue.get(id);
     if (!h) return `unknown ${id}`;
     queue.delete(id);
     if (h.timer) clearTimeout(h.timer);
-    if (approve) {
-      log({ ev: 'decide', id, agent: h.agent, decision: 'approve', reason: reason || undefined });
+    removeAskFile(id);
+    const decision = approved ? 'allow' : 'deny';
+    if (approved) {
+      log({ ev: 'decide', id, agent: h.agent, decision, reason: reason || undefined });
       onApprove(h);
-      return `approved ${id}`;
+    } else {
+      log({ ev: 'decide', id, agent: h.agent, decision, reason });
+      onDeny(h, reason);
     }
-    log({ ev: 'decide', id, agent: h.agent, decision: 'deny', reason });
-    onDeny(h, reason);
-    return `denied ${id}`;
+    onEvent?.({ type: 'decided', id, decision, reason: reason || undefined });
+    return approved ? `approved ${id}` : `denied ${id}`;
   }
+
+  /**
+   * Park an entry: write the ask file (file channel only) and report the
+   * ask. Double-settle is safe: the deadline timer and the answer race,
+   * and the loser finds no entry. The file channel never waits here: the
+   * single interval settles on answer, the timer denies on deadline.
+   * The `onAsk` channel stays a promise per hold.
+   *
+   * @param {object} entry queue entry
+   * @param {number|null} ms hold deadline in ms, or null for never
+   * @param {string} rule hold-reason string
+   * @returns {Promise<void>}
+   */
+  async function park(entry, ms, rule) {
+    const ask = askPayload(entry, ms, rule);
+    if (useFiles && paths) {
+      try {
+        writeFileAtomic(paths.askFile(entry.id), JSON.stringify(ask));
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        log({ ev: 'deny', agent: entry.agent, code: 500, note: `ask channel failed: ${msg}` });
+        settle(entry.id, false, 'ask channel failed');
+        return;
+      }
+    }
+    onEvent?.({ type: 'ask', ask });
+    if (!useFiles) {
+      /** @type {{ decision?: unknown, reason?: unknown } | null} */
+      let raw = null;
+      try {
+        raw = await onAsk(ask);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        raw = { decision: 'deny', reason: `onAsk failed: ${msg}` };
+      }
+      const norm = normalizeDecision(raw);
+      if (norm && norm.decision === 'allow') settle(entry.id, true, '');
+      else settle(entry.id, false, norm?.reason ?? 'denied');
+    }
+  }
+
+  /**
+   * The one answer reader (file channel only): each tick reads `answers/`
+   * once, consuming every answer file. A held id settles; anything else is
+   * stale (ignored, logged, removed). Malformed answers are ignored and
+   * logged; the hold keeps waiting until its deadline.
+   *
+   * @returns {void}
+   */
+  function pollAnswers() {
+    if (!paths) return;
+    let names;
+    try {
+      names = fs.readdirSync(paths.answersDir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (!name.endsWith('.json')) continue;
+      const id = name.slice(0, -'.json'.length);
+      const text = consumeFile(paths.answerFile(id));
+      if (text === null) continue;
+      const norm = normalizeDecision(parseAnswer(text), { approveAlias: true });
+      if (!norm) {
+        log({ ev: 'malformed-answer', id, note: 'ignored; still waiting' });
+        continue;
+      }
+      if (!queue.has(id)) {
+        log({ ev: 'stale-answer', id, note: 'unknown or already-settled id; ignored' });
+        continue;
+      }
+      settle(id, norm.decision === 'allow', norm.reason ?? '');
+    }
+  }
+
+  const pollTimer = useFiles && paths
+    ? setInterval(pollAnswers, poll)
+    : null;
+  if (pollTimer && typeof pollTimer.unref === 'function') pollTimer.unref();
 
   const holds = {
     add({ agent, method, url, headers, body, sock, cres, note }) {
       const id = `h${++n}`;
       const ms = deadlineMs();
       const entry = {
-        id, agent, method, url, headers, body, sock, cres, t0: Date.now(),
+        id, agent, method, url, headers, body, sock, cres, note, t0: Date.now(),
         timer: ms === null ? null
           : setTimeout(() => settle(id, false, 'hold timeout'), ms),
       };
@@ -90,21 +428,21 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       queue.set(id, entry);
       log({ ev: 'hold', id, agent, method, url, reason: note ?? undefined,
         timeoutMs: ms, waiting: queue.size });
+      void park(entry, ms, note ?? '');
       return id;
     },
 
-    approve(id) { return settle(id, true, ''); },
-    deny(id, reason) { return settle(id, false, reason || 'denied by user'); },
-
-    // The client went away: drop its holds so no later approve can forward
+    // The client went away: drop its holds so no later answer can forward
     // a request nobody is listening for.
     abandon(id) {
       const h = queue.get(id);
       if (!h) return;
       queue.delete(id);
       if (h.timer) clearTimeout(h.timer);
+      removeAskFile(id);
       log({ ev: 'hold-abandoned', id, agent: h.agent, method: h.method, url: h.url });
       onDeny(h, 'client gone');
+      onEvent?.({ type: 'decided', id, decision: 'deny', reason: 'client gone' });
     },
 
     abandonSocket(sock) {
@@ -116,39 +454,13 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
     decide(req) { return decide(req); },
 
     pending() { return [...queue.values()].map(pub); },
-    size() { return queue.size; },
 
     close() {
-      for (const [id] of queue) settle(id, false, 'proxy closing');
-      ctl?.close();
+      if (pollTimer) clearInterval(pollTimer);
+      // settle() removes each ask file: `sbx pending` never lists a dead queue's holds.
+      for (const [id] of [...queue]) settle(id, false, 'proxy closing');
     },
   };
-
-  let ctl = null;
-  if (controlSocket) {
-    try { fs.unlinkSync(controlSocket); } catch {}
-    ctl = net.createServer((sock) => {
-      let line = '';
-      sock.on('data', (ch) => {
-        line += ch.toString('latin1');
-        const i = line.indexOf('\n');
-        if (i < 0) return;
-        const [cmd, arg, ...rest] = line.slice(0, i).trim().split(' ');
-        let out = '';
-        if (cmd === 'pending') out = JSON.stringify(holds.pending());
-        else if (cmd === 'approve' && arg) out = holds.approve(arg);
-        else if (cmd === 'deny' && arg) out = holds.deny(arg, rest.join(' '));
-        else out = 'usage: pending | approve <id> | deny <id> [reason]';
-        sock.end(out + '\n');
-      });
-      sock.on('error', () => {});
-    });
-    ctl.on('error', () => {});
-    ctl.listen(controlSocket, () => {
-      // Anyone who can connect can approve payments.
-      try { fs.chmodSync(controlSocket, 0o600); } catch {}
-    });
-  }
 
   return holds;
 }

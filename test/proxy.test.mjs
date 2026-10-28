@@ -15,14 +15,15 @@ import assert from 'node:assert/strict';
 import { execFile as execFileCb, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, readFileSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, existsSync, statSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
 import os from 'node:os';
-import { createProxy, denyReasonForIp } from '../src/proxy.js';
+import { createProxy } from '../src/proxy.js';
+import { denyReasonForIp } from '../src/wall.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
 
@@ -129,9 +130,9 @@ before(async () => {
   plainUp = await startHttp();
   // allowLoopback is the TEST-ONLY opt-in: fixtures listen on 127.0.0.1,
   // which the default wall denies (see 'loopback wall' below).
-  proxy = createProxy({ port: 0, certDir: join(RT, 'certs'),
+  proxy = createProxy({ port: 0,
     logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-    clientIdleMs: 1000, allowLoopback: true });
+    clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true } });
   ({ port: PORT } = await proxy.ready);
   PROXY = `http://127.0.0.1:${PORT}`;
 });
@@ -333,6 +334,20 @@ describe('negatives', () => {
     await waitLog(/upstream 127\.0\.0\.1 failed/, 'dead-upstream 502');
   });
 
+  it('a failed upstream writes exactly one deny line', async () => {
+    // A free port with nothing listening: the dial is refused, `fail` answers.
+    const srv = net.createServer();
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const dead = srv.address().port;
+    await new Promise((r) => srv.close(r));
+    const code = await curl('-o', '/dev/null', '-w', '%{http_code}', `http://127.0.0.1:${dead}/one-deny`);
+    assert.equal(code.stdout, '502');
+    const denyLines = () => log().split('\n').filter((l) => l.includes('"ev":"deny"') && l.includes(`:${dead}`));
+    await waitFor(() => denyLines().length > 0, 'a deny line for the dead upstream');
+    const denies = denyLines();
+    assert.equal(denies.length, 1, denies.join('\n'));
+  });
+
   it('client without CA fails with exit 60, not silence', async () => {
     const err = await curl(`${tlsUp.url}?m=nocA`).then(
       () => null, (e) => e);
@@ -345,10 +360,17 @@ describe('negatives', () => {
   });
 
   it('second proxy on the same port rejects ready, never crashes', async () => {
-    const dup = createProxy({ port: PORT, certDir: join(RT, 'certs'),
-      logFile: join(RT, 'mitm.log'), upstreamCa: CA });
-    await assert.rejects(dup.ready, /EADDRINUSE/);
-    await dup.close();
+    // Own runtime: one proxy per runtime, so the port conflict is what
+    // rejects `ready` here (the claim on a fresh runtime succeeds).
+    const drt = mkdtempSync(join(tmpdir(), 'bb-dup-'));
+    try {
+      const dup = createProxy({ port: PORT,
+        logFile: join(drt, 'mitm.log'), upstreamCa: CA, runtime: drt });
+      await assert.rejects(dup.ready, /EADDRINUSE/);
+      await dup.close();
+    } finally {
+      rmSync(drt, { recursive: true, force: true });
+    }
     // Original still serves.
     const g = await curl('--cacert', CA, '-o', '/dev/null', '-w', '%{http_code}',
       `${tlsUp.url}?m=after-dup`);
@@ -410,14 +432,18 @@ describe('negatives', () => {
 });
 
 describe('loopback wall: default deny after DNS resolution', () => {
+  // Dedicated runtime + CA: the shared RT is claimed by the module proxy
+  // for the whole file, so this chain owns its runtime (and CA request).
+  const DRT = mkdtempSync(join(tmpdir(), 'bb-denywall-'));
+  const dlog = () => readFileSync(join(DRT, 'mitm.log'), 'latin1');
   let dp = null;
   let dport = 0;
   let DPROXY = '';
 
   before(async () => {
     // No allowLoopback: this is the production shape.
-    dp = createProxy({ port: 0, certDir: join(RT, 'certs'),
-      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT });
+    dp = createProxy({ port: 0,
+      logFile: join(DRT, 'mitm.log'), upstreamCa: CA, runtime: DRT });
     ({ port: dport } = await dp.ready);
     DPROXY = `http://127.0.0.1:${dport}`;
   });
@@ -425,6 +451,7 @@ describe('loopback wall: default deny after DNS resolution', () => {
   after(async () => {
     await dp?.close();
     dp = null;
+    rmSync(DRT, { recursive: true, force: true });
   });
 
   it('plain HTTP to 127.0.0.1 is 403 with reason, never forwarded', async () => {
@@ -437,7 +464,8 @@ describe('loopback wall: default deny after DNS resolution', () => {
     assert.equal(r.stdout, '403', `expected 403, got ${r.stdout}`);
     assert.ok(ms < 1000, `wall must answer fast, took ${ms}ms`);
     assert.equal(plainUp.hits.get('/') ?? 0, before, 'denied request must never reach upstream');
-    await waitLog(/loopback upstream denied: 127\.0\.0\.1/, 'deny line with reason');
+    await waitFor(() => /loopback upstream denied: 127\.0\.0\.1/.test(dlog()),
+      'deny line with reason');
   });
 
   it('CONNECT to 127.0.0.1 is refused 403 at the door, no cert minted', async () => {
@@ -500,10 +528,15 @@ describe('loopback wall: default deny after DNS resolution', () => {
 });
 
 describe('dns rebinding wall (stubbed resolver)', () => {
+  // Dedicated runtime + CA: serial stub proxies each claim it in turn and
+  // release it on close, so one runtime serves the whole describe.
+  const SRT = mkdtempSync(join(tmpdir(), 'bb-stubrt-'));
+  after(() => { rmSync(SRT, { recursive: true, force: true }); });
   async function stubProxy(stub, extra = {}) {
-    const p = createProxy({ port: 0, certDir: join(RT, 'certs'),
-      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-      resolveUpstream: stub, ...extra });
+    const { unsafeTestOnly: extraUnsafe, ...rest } = extra;
+    const p = createProxy({ port: 0,
+      logFile: join(SRT, 'mitm.log'), upstreamCa: CA, runtime: SRT,
+      unsafeTestOnly: { resolveUpstream: stub, ...(extraUnsafe ?? {}) }, ...rest });
     const { port } = await p.ready;
     return { p, url: `http://127.0.0.1:${port}` };
   }
@@ -544,7 +577,7 @@ describe('dns rebinding wall (stubbed resolver)', () => {
     const { p, url } = await stubProxy(async () => {
       await new Promise((r) => setTimeout(r, 300));
       return ['127.0.0.1'];
-    }, { allowLoopback: true, upstreamTimeoutMs: 3000 });
+    }, { unsafeTestOnly: { allowLoopback: true }, upstreamTimeoutMs: 3000 });
     try {
       const target = `${plainUp.url}?m=bodyrace`.replace('http://127.0.0.1', 'http://slowdns.test');
       const r = await execA('curl', ['-s', '--max-time', '10', '-x', url,
@@ -563,7 +596,7 @@ describe('dns rebinding wall (stubbed resolver)', () => {
       // Door + forward checks see the fixture; anything after would be a re-dial.
       if (calls <= 2) return ['127.0.0.1'];
       return ['93.184.216.34'];
-    }, { allowLoopback: true });
+    }, { unsafeTestOnly: { allowLoopback: true } });
     try {
       const r = await execA('curl', ['-s', '--max-time', '5', '-x', url,
         `${plainUp.url}?m=pin`.replace('http://127.0.0.1', 'http://pinned.test')],
@@ -578,29 +611,47 @@ describe('dns rebinding wall (stubbed resolver)', () => {
 });
 
 describe('holds', () => {
-  // The control socket lives inside the runtime dir (createProxy enforces
-  // this: the launcher masks exactly that dir from sandboxed agents).
-  const ctlPath = () => join(RT, 'ctl.sock');
-  const NEED_UNIX = UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI';
+  // Dedicated runtime + CA: the shared RT is claimed by the module proxy
+  // for the whole file, so every hold chain here owns its runtime.
+  // File checkpoint: `asks/<id>.json` appears on park, `answers/<id>.json`
+  // decides. No unix socket is involved, so these run everywhere.
+  const HRT = mkdtempSync(join(tmpdir(), 'bb-holdrt-'));
+  // Minted by each hold proxy via ensureCA before it answers `ready`, so a
+  // client arg built after the proxy starts always resolves to a real file.
+  const HCA = join(HRT, 'certs', 'ca.pem');
+  const hlog = () => readFileSync(join(HRT, 'mitm.log'), 'latin1');
+  const waitHlog = (re, what) => waitFor(() => re.test(hlog()), what);
+  const answersDir = () => join(HRT, 'answers');
+  const askFile = (id) => join(HRT, 'asks', `${id}.json`);
+  const answerFile = (id) => join(answersDir(), `${id}.json`);
+  // Atomic answer write, exactly like `sbx approve` / `sbx deny`.
+  const answer = (id, obj) => {
+    mkdirSync(answersDir(), { recursive: true });
+    const tmp = join(answersDir(), `.${id}.${process.pid}.tmp`);
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, answerFile(id));
+  };
+  const readAsk = (id) => JSON.parse(readFileSync(askFile(id), 'utf8'));
+  // pending() carries no bodies (2.4): find a parked hold by its ask file's
+  // body preview, which is what the approver sees.
+  const pendingWith = (marker) => hp.pending().find((h) => {
+    try { return new RegExp(marker).test(readAsk(h.id).bodyPreview); } catch { return false; }
+  });
+  async function waitGone(p, what) {
+    await waitFor(() => !existsSync(p), what);
+  }
   let hp = null;
   let hport = 0;
-  const ctl = (cmd) => new Promise((resolve, reject) => {
-    const s = net.connect(ctlPath(), () => s.write(cmd + '\n'));
-    let out = '';
-    s.on('data', (c) => { out += c; });
-    s.on('end', () => resolve(out.trim()));
-    s.on('error', reject);
-  });
 
-  // Fast by design: 500 ms client-idle, ~1.5 s hold deadline. A parked
-  // request must outlive the idle timer (it is in flight, never idle), so
-  // the approve test sleeps past idle and finds the hold still parked.
+  // Fast by design: 500 ms client-idle, ~1.5 s hold deadline, 25 ms answer
+  // poll. A parked request must outlive the idle timer (it is in flight,
+  // never idle), so the approve test sleeps past idle and finds the hold
+  // still parked.
   async function holdProxy(holdExtra = {}) {
-    hp = createProxy({ port: 0, certDir: join(RT, 'certs'),
-      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-      clientIdleMs: 500, allowLoopback: true,
-      hold: { match: '/hold', timeoutMs: 1500, ...holdExtra },
-      ...(UNIX_OK ? { controlSocket: ctlPath() } : {}) });
+    hp = createProxy({ port: 0,
+      logFile: join(HRT, 'mitm.log'), upstreamCa: CA, runtime: HRT,
+      clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
+      hold: { match: '/hold', timeoutMs: 1500, pollMs: 25, ...holdExtra } });
     ({ port: hport } = await hp.ready);
     return `http://127.0.0.1:${hport}`;
   }
@@ -610,55 +661,56 @@ describe('holds', () => {
       await hp?.close();
     } finally {
       hp = null;
-      try { if (RT) rmSync(join(RT, 'ctl.sock'), { force: true }); } catch {}
     }
+    rmSync(HRT, { recursive: true, force: true });
   });
 
-  it('controlSocket outside the runtime throws, before any side effect', async () => {
-    // No unix bind needed: createProxy must refuse synchronously.
-    const outside = join(tmpdir(), `bb-outside-${process.pid}.sock`);
-    assert.throws(() => createProxy({ port: 0, certDir: join(RT, 'certs'),
-      logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-      controlSocket: outside }), /inside the runtime/);
-    assert.ok(!existsSync(outside), 'refused socket must not be created');
-  });
-
-  it('certDir outside the runtime throws, before any side effect', async () => {
+  it('runtime is required (certs always live at <runtime>/certs)', async () => {
     // No sandbox needed: createProxy must refuse synchronously, before the
     // log stream or any CA file (ca.key especially) is created.
     const outsideBase = mkdtempSync(join(tmpdir(), 'bb-outside-cert-'));
-    const outsideCerts = join(outsideBase, 'certs');
     const outsideLog = join(outsideBase, 'mitm.log');
     try {
-      assert.throws(() => createProxy({ port: 0, certDir: outsideCerts,
-        logFile: outsideLog, upstreamCa: CA, runtime: RT }), /inside the runtime/);
-      assert.ok(!existsSync(outsideCerts), 'refused certDir must not be created');
+      assert.throws(() => createProxy({ port: 0,
+        logFile: outsideLog, upstreamCa: CA }), /runtime is required/);
       assert.ok(!existsSync(outsideLog), 'refused log file must not be created');
     } finally {
       rmSync(outsideBase, { recursive: true, force: true });
     }
   });
 
-  it('approve forwards, deny refuses with reason', { skip: NEED_UNIX }, async () => {
+  it('approve forwards, deny refuses with reason', async () => {
     const P2 = await holdProxy();
     try {
       const p1 = execA('curl', ['-s', '--max-time', '5', '-x', P2,
-        '--cacert', CA, '--data', 'm=HOLD1', `${tlsUp.url}hold`], { encoding: 'latin1' });
-      const held = await waitFor(() => hp.pending().find((h) => /HOLD1/.test(h.body)),
+        '--cacert', HCA, '--data', 'm=HOLD1', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const held = await waitFor(() => pendingWith('HOLD1'),
         'hold on m=HOLD1 to park');
       assert.equal(held.agent, 'tcp');
       // Parked past the 500 ms idle timer: still held, not reaped.
       await new Promise((r) => setTimeout(r, 600));
       assert.ok(hp.pending().some((h) => h.id === held.id), 'parked hold outlives the idle timer');
-      assert.equal(await ctl(`approve ${held.id}`), `approved ${held.id}`);
+      // The ask file is decision-ready: rule, letter x, body preview, ISO expiry.
+      const ask = readAsk(held.id);
+      assert.equal(ask.id, held.id);
+      assert.equal(ask.agent, 'tcp');
+      assert.match(ask.url, /\/hold/);
+      assert.equal(ask.rule, 'path matches /hold');
+      assert.equal(ask.letter, 'x');
+      assert.match(ask.bodyPreview, /HOLD1/);
+      assert.equal(ask.truncated, false);
+      assert.match(ask.expiresAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      answer(held.id, { decision: 'allow' });
       assert.match((await p1).stdout, /HOLD1/);
       assert.equal(hp.pending().length, 0);
+      assert.ok(!existsSync(askFile(held.id)), 'settled ask file is removed');
+      assert.ok(!existsSync(answerFile(held.id)), 'answer is consumed exactly once');
 
       const p2 = execA('curl', ['-s', '--max-time', '5', '-x', P2,
-        '--cacert', CA, '--data', 'm=HOLD2', `${tlsUp.url}hold`], { encoding: 'latin1' });
-      const held2 = await waitFor(() => hp.pending().find((h) => /HOLD2/.test(h.body)),
+        '--cacert', HCA, '--data', 'm=HOLD2', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const held2 = await waitFor(() => pendingWith('HOLD2'),
         'hold on m=HOLD2 to park');
-      assert.equal(await ctl(`deny ${held2.id} nope`), `denied ${held2.id}`);
+      answer(held2.id, { decision: 'deny', reason: 'nope' });
       assert.match((await p2).stdout, /denied: nope/);
     } finally {
       await hp.close();
@@ -670,7 +722,7 @@ describe('holds', () => {
     const P2 = await holdProxy({ timeoutMs: 1500 });
     try {
       const body = await execA('curl', ['-s', '--max-time', '5', '-x', P2,
-        '--cacert', CA, '--data', 'm=HOLDT', `${tlsUp.url}hold`], { encoding: 'latin1' });
+        '--cacert', HCA, '--data', 'm=HOLDT', `${tlsUp.url}hold`], { encoding: 'latin1' });
       assert.match(body.stdout, /hold timeout/);
       assert.equal(hp.pending().length, 0);
     } finally {
@@ -684,11 +736,10 @@ describe('holds', () => {
     try {
       const p = execA('curl', ['-s', '--max-time', '5', '-x', P2,
         '--data', 'm=PLAINHOLD', `${plainUp.url}hold`], { encoding: 'latin1' });
-      const held = await waitFor(() => hp.pending().find((h) => /PLAINHOLD/.test(h.body)),
+      const held = await waitFor(() => pendingWith('PLAINHOLD'),
         'plain-HTTP hold to park');
       assert.equal(held.agent, 'tcp');
-      if (!UNIX_OK) { p.catch(() => {}); return; } // parked is proven; approve needs the control socket
-      assert.equal(await ctl(`approve ${held.id}`), `approved ${held.id}`);
+      answer(held.id, { decision: 'allow' });
       assert.match((await p).stdout, /PLAINHOLD/);
     } finally {
       await hp.close();
@@ -702,7 +753,7 @@ describe('holds', () => {
       const before = tlsUp.hits.get('/hold') ?? 0;
       const big = 'm=' + 'x'.repeat(1024);
       const r = await execA('curl', ['-s', '--max-time', '5', '-x', P2,
-        '--cacert', CA, '--data', big, `${tlsUp.url}hold`], { encoding: 'latin1' });
+        '--cacert', HCA, '--data', big, `${tlsUp.url}hold`], { encoding: 'latin1' });
       assert.match(r.stdout, /body too large to hold/);
       assert.equal(hp.pending().length, 0);
       assert.equal(tlsUp.hits.get('/hold') ?? 0, before, 'over-cap body must never reach upstream');
@@ -716,15 +767,19 @@ describe('holds', () => {
     const P2 = await holdProxy();
     try {
       const before = tlsUp.hits.get('/hold') ?? 0;
-      const t = await connectTunnelVia(P2, `127.0.0.1:${tlsUp.port}`);
+      const t = await connectTunnelVia(P2, `127.0.0.1:${tlsUp.port}`,
+        readFileSync(HCA, 'utf8'));
       const body = 'm=ABANDON';
       t.write(`POST /hold HTTP/1.1\r\nHost: 127.0.0.1:${tlsUp.port}\r\nContent-Length: ${body.length}\r\n\r\n${body}`);
-      const held = await waitFor(() => hp.pending().find((h) => /ABANDON/.test(h.body)),
+      const held = await waitFor(() => pendingWith('ABANDON'),
         'hold on m=ABANDON to park');
       t.destroy(); // agent disconnects / gives up
       await waitFor(() => hp.pending().length === 0, 'abandoned hold to drop');
-      await waitLog(/hold-abandoned/, 'hold-abandoned');
-      if (UNIX_OK) assert.equal(await ctl(`approve ${held.id}`), `unknown ${held.id}`);
+      await waitHlog(/hold-abandoned/, 'hold-abandoned');
+      // A late answer is stale: ignored, logged, swept — never forwarded.
+      answer(held.id, { decision: 'allow' });
+      await waitGone(answerFile(held.id), 'late answer to be swept');
+      await waitHlog(/stale-answer/, 'stale-answer');
       assert.equal(tlsUp.hits.get('/hold') ?? 0, before, 'abandoned hold must never reach upstream');
     } finally {
       await hp.close();
@@ -735,7 +790,7 @@ describe('holds', () => {
   it('close() settles parked holds and open tunnels, then resolves', async () => {
     const P2 = await holdProxy();
     const p = execA('curl', ['-s', '--max-time', '5', '-x', P2,
-      '--cacert', CA, '--data', 'm=PARKED', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      '--cacert', HCA, '--data', 'm=PARKED', `${tlsUp.url}hold`], { encoding: 'latin1' });
     await waitFor(() => hp.pending().length > 0, 'hold to park before close');
     // An idle keep-alive tunnel, held open past close().
     const idle = net.connect(hport, '127.0.0.1');
@@ -749,20 +804,20 @@ describe('holds', () => {
     idle.destroy();
   });
 
-  it('other requests complete while one is parked (go/no-go b)', { skip: NEED_UNIX }, async () => {
+  it('other requests complete while one is parked (go/no-go b)', async () => {
     const P2 = await holdProxy();
     try {
       const held = execA('curl', ['-s', '--max-time', '8', '-x', P2,
-        '--cacert', CA, '--data', 'm=BUSY1', `${tlsUp.url}hold`], { encoding: 'latin1' });
-      const parked = await waitFor(() => hp.pending().find((h) => /BUSY1/.test(h.body)),
+        '--cacert', HCA, '--data', 'm=BUSY1', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const parked = await waitFor(() => pendingWith('BUSY1'),
         'hold on m=BUSY1 to park');
       // Same agent, separate connection, non-matching path: answers while
       // the first request is still parked — holds never gate the agent.
       const free = await execA('curl', ['-s', '--max-time', '8', '-x', P2,
-        '--cacert', CA, `${tlsUp.url}?m=free`], { encoding: 'latin1' });
+        '--cacert', HCA, `${tlsUp.url}?m=free`], { encoding: 'latin1' });
       assert.equal(free.stdout, 'local-ok');
       assert.ok(hp.pending().some((h) => h.id === parked.id), 'first request still parked');
-      assert.equal(await ctl(`approve ${parked.id}`), `approved ${parked.id}`);
+      answer(parked.id, { decision: 'allow' });
       assert.match((await held).stdout, /BUSY1/);
       assert.equal(hp.pending().length, 0);
     } finally {
@@ -771,8 +826,140 @@ describe('holds', () => {
     }
   });
 
+  it('onAsk answers with no files involved', async () => {
+    const seen = new Set((() => { try { return readdirSync(join(HRT, 'asks')); } catch { return []; } })());
+    const op = createProxy({ port: 0,
+      logFile: join(HRT, 'mitm.log'), upstreamCa: CA, runtime: HRT,
+      clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
+      hold: { match: '/hold', timeoutMs: 5000,
+        onAsk: async (ask) => {
+          assert.equal(ask.letter, 'x');
+          assert.equal(ask.rule, 'path matches /hold');
+          return { decision: 'allow' };
+        } } });
+    try {
+      const { port } = await op.ready;
+      const r = await execA('curl', ['-s', '--max-time', '5', '-x', `http://127.0.0.1:${port}`,
+        '--cacert', HCA, '--data', 'm=ONASK', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      assert.match(r.stdout, /ONASK/);
+      assert.equal(op.pending().length, 0);
+      // The file channel stayed silent: no ask file appeared.
+      const now = new Set((() => { try { return readdirSync(join(HRT, 'asks')); } catch { return []; } })());
+      assert.deepEqual([...now].filter((f) => !seen.has(f)), [],
+        'onAsk must not write ask files');
+    } finally {
+      await op.close();
+    }
+  });
+
+  it('depth 3: concurrent holds decide independently', async () => {
+    const P2 = await holdProxy({ timeoutMs: 10000 });
+    try {
+      const bodies = ['DEPTH1', 'DEPTH2', 'DEPTH3'];
+      const ps = bodies.map((m) => execA('curl', ['-s', '--max-time', '8', '-x', P2,
+        '--cacert', HCA, '--data', `m=${m}`, `${tlsUp.url}hold`], { encoding: 'latin1' }));
+      const held = await waitFor(() => {
+        const p = hp.pending();
+        return p.length === 3 ? p : null;
+      }, '3 holds to park');
+      const byBody = (m) => held.find((h) => readAsk(h.id).bodyPreview.includes(m));
+      answer(byBody('DEPTH1').id, { decision: 'allow' });
+      answer(byBody('DEPTH2').id, { decision: 'deny', reason: 'second' });
+      answer(byBody('DEPTH3').id, { decision: 'allow' });
+      const [r1, r2, r3] = await Promise.all(ps);
+      assert.match(r1.stdout, /DEPTH1/);
+      assert.match(r2.stdout, /denied: second/);
+      assert.match(r3.stdout, /DEPTH3/);
+      assert.equal(hp.pending().length, 0);
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
+  it('double answer settles once; the late one is stale', async () => {
+    const P2 = await holdProxy();
+    try {
+      const before = tlsUp.hits.get('/hold') ?? 0;
+      const p = execA('curl', ['-s', '--max-time', '5', '-x', P2,
+        '--cacert', HCA, '--data', 'm=DOUBLE', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const held = await waitFor(() => pendingWith('DOUBLE'),
+        'hold on m=DOUBLE to park');
+      answer(held.id, { decision: 'allow' });
+      assert.match((await p).stdout, /DOUBLE/);
+      assert.equal(tlsUp.hits.get('/hold') ?? 0, before + 1);
+      // Decided already: a second answer is stale — swept, logged, never
+      // applied twice.
+      answer(held.id, { decision: 'deny', reason: 'late' });
+      await waitGone(answerFile(held.id), 'late answer to be swept');
+      await waitHlog(/stale-answer/, 'stale-answer');
+      assert.equal(tlsUp.hits.get('/hold') ?? 0, before + 1, 'late answer must not forward again');
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
+  it('malformed answers are ignored; a valid one still decides', async () => {
+    const P2 = await holdProxy();
+    try {
+      const p = execA('curl', ['-s', '--max-time', '8', '-x', P2,
+        '--cacert', HCA, '--data', 'm=MALFORMED', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const held = await waitFor(() => pendingWith('MALFORMED'),
+        'hold on m=MALFORMED to park');
+      // Bad JSON: consumed, logged, still parked.
+      mkdirSync(answersDir(), { recursive: true });
+      writeFileSync(answerFile(held.id), 'not json{');
+      await waitGone(answerFile(held.id), 'garbage answer to be consumed');
+      // Unknown decision: consumed, logged, still parked.
+      answer(held.id, { decision: 'maybe' });
+      await waitGone(answerFile(held.id), 'odd answer to be consumed');
+      await waitHlog(/malformed-answer/, 'malformed-answer');
+      assert.equal(hp.pending().length, 1, 'malformed answers must not settle the hold');
+      answer(held.id, { decision: 'allow' });
+      assert.match((await p).stdout, /MALFORMED/);
+      assert.equal(hp.pending().length, 0);
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
+  it('stale answers for unknown ids are ignored and logged', async () => {
+    const P2 = await holdProxy();
+    try {
+      assert.equal(hp.pending().length, 0);
+      answer('h9999', { decision: 'allow' });
+      await waitGone(answerFile('h9999'), 'unknown answer to be swept');
+      await waitHlog(/stale-answer/, 'stale-answer');
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
+  it('never holds until answered', async () => {
+    const P2 = await holdProxy({ timeoutMs: 'never' });
+    try {
+      const p = execA('curl', ['-s', '--max-time', '8', '-x', P2,
+        '--cacert', HCA, '--data', 'm=NEVER', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const held = await waitFor(() => pendingWith('NEVER'),
+        'hold on m=NEVER to park');
+      assert.equal(readAsk(held.id).expiresAt, null);
+      await new Promise((r) => setTimeout(r, 400));
+      assert.ok(hp.pending().some((h) => h.id === held.id), 'never hold stays parked');
+      answer(held.id, { decision: 'deny', reason: 'finally' });
+      assert.match((await p).stdout, /denied: finally/);
+    } finally {
+      await hp.close();
+      hp = null;
+    }
+  });
+
   // CONNECT to an arbitrary proxy base (used by the abandon test).
-  async function connectTunnelVia(base, target) {
+  // caPem defaults to the module CA; callers behind a dedicated-runtime
+  // proxy pass that runtime's minted ca.pem instead.
+  async function connectTunnelVia(base, target, caPem = CA_PEM) {
     const { port: bp } = new URL(base);
     const sock = net.connect(parseInt(bp, 10), '127.0.0.1');
     await once(sock, 'connect');
@@ -787,7 +974,7 @@ describe('holds', () => {
       sock.on('error', reject);
     });
     assert.match(head, /200 Connection established/);
-    const t = tls.connect({ socket: sock, ca: [CA_PEM], servername: target.split(':')[0] });
+    const t = tls.connect({ socket: sock, ca: [caPem], servername: target.split(':')[0] });
     await once(t, 'secureConnect');
     return t;
   }
@@ -801,23 +988,104 @@ describe('holds', () => {
   }
 });
 
-describe('two agents keep identity under interleave', () => {
-  const ctl2Path = () => join(RT, 'ctl2.sock');
-  const NEED_UNIX2 = UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI';
-  const ctl2 = (cmd) => new Promise((resolve, reject) => {
-    const s = net.connect(ctl2Path(), () => s.write(cmd + '\n'));
-    let out = '';
-    s.on('data', (c) => { out += c; });
-    s.on('end', () => resolve(out.trim()));
-    s.on('error', reject);
+describe('one proxy owns a runtime (claim)', () => {
+  // File channel + TCP door only: no unix socket, so these run everywhere.
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-claimpx-'));
   });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+  // Atomic answer write, exactly like `sbx approve` / `sbx deny`.
+  const answerOn = (rt, id, obj) => {
+    mkdirSync(join(rt, 'answers'), { recursive: true });
+    const tmp = join(rt, 'answers', `.${id}.${process.pid}.tmp`);
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, join(rt, 'answers', `${id}.json`));
+  };
+
+  it('a second live proxy throws, and the first hold stays answerable', async () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const p1 = createProxy({ port: 0,
+      logFile: join(rt, 'mitm.log'), upstreamCa: CA, runtime: rt,
+      clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
+      hold: { match: '/hold', timeoutMs: 5000, pollMs: 25 } });
+    try {
+      const { port } = await p1.ready;
+      const p = execA('curl', ['-s', '--max-time', '5', '-x', `http://127.0.0.1:${port}`,
+        '--cacert', join(rt, 'certs', 'ca.pem'), '--data', 'm=CLAIM1', `${tlsUp.url}hold`], { encoding: 'latin1' });
+      const held = await waitFor(() => p1.pending().find((h) => {
+        try {
+          return JSON.parse(readFileSync(join(rt, 'asks', `${h.id}.json`), 'utf8')).bodyPreview.includes('CLAIM1');
+        } catch { return false; }
+      }), 'hold on m=CLAIM1 to park');
+      assert.throws(() => createProxy({ port: 0, logFile: join(rt, 'mitm2.log'), runtime: rt }),
+        new RegExp(`in use by pid ${process.pid}`));
+      assert.ok(existsSync(join(rt, 'asks', `${held.id}.json`)), 'ask file survives the refused proxy');
+      answerOn(rt, held.id, { decision: 'allow' });
+      const r = await p;
+      assert.match(r.stdout, /CLAIM1/);
+    } finally {
+      await p1.close();
+    }
+  });
+
+  it('close releases the runtime for the next proxy', async () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    const p1 = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), runtime: rt });
+    await p1.ready;
+    await p1.close();
+    const p2 = createProxy({ port: 0, logFile: join(rt, 'mitm2.log'), runtime: rt });
+    try {
+      await p2.ready;
+    } finally {
+      await p2.close();
+    }
+  });
+
+  it('a ready rejected by a taken port releases the runtime', async () => {
+    const rtA = mkdtempSync(join(root, 'rtA-'));
+    const rtB = mkdtempSync(join(root, 'rtB-'));
+    const pA = createProxy({ port: 0, logFile: join(rtA, 'mitm.log'), runtime: rtA });
+    const { port } = await pA.ready;
+    try {
+      const pB = createProxy({ port, logFile: join(rtB, 'mitm.log'), runtime: rtB });
+      await assert.rejects(pB.ready, /EADDRINUSE/);
+      await pB.close();
+      const pC = createProxy({ port: 0, logFile: join(rtB, 'mitm2.log'), runtime: rtB });
+      try {
+        await pC.ready;
+      } finally {
+        await pC.close();
+      }
+    } finally {
+      await pA.close();
+    }
+  });
+});
+
+describe('two agents keep identity under interleave', () => {
+  const NEED_UNIX2 = UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI';
+  // Dedicated runtime: the shared RT is claimed by the module proxy, and
+  // the asks/answers channel lives under the proxy's own runtime.
+  const TRT = mkdtempSync(join(tmpdir(), 'bb-twoagent-'));
+  after(() => { rmSync(TRT, { recursive: true, force: true }); });
+  const tlog = () => readFileSync(join(TRT, 'mitm.log'), 'latin1');
+  const answer = (id, obj) => {
+    const dir = join(TRT, 'answers');
+    mkdirSync(dir, { recursive: true });
+    const tmp = join(dir, `.${id}.${process.pid}.tmp`);
+    writeFileSync(tmp, JSON.stringify(obj));
+    renameSync(tmp, join(dir, `${id}.json`));
+  };
 
   it('holds, responses and log lines name the right agent',
     { skip: NEED_UNIX2 }, async () => {
-      const tp = createProxy({ port: 0, certDir: join(RT, 'certs'),
-        logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
-        clientIdleMs: 1000, allowLoopback: true,
-        hold: { match: '/hold', timeoutMs: 15000 }, controlSocket: ctl2Path() });
+      const tp = createProxy({ port: 0,
+        logFile: join(TRT, 'mitm.log'), upstreamCa: CA, runtime: TRT,
+        clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true },
+        hold: { match: '/hold', timeoutMs: 15000, pollMs: 25 } });
       await tp.ready;
       const sa = [];
       try {
@@ -844,8 +1112,9 @@ describe('two agents keep identity under interleave', () => {
         }, 'both agents to park');
         const gotA = both.find((h) => h.agent === 'fa');
         const gotB = both.find((h) => h.agent === 'fb');
-        assert.ok(gotA && /FA1/.test(gotA.body), 'fa hold carries fa');
-        assert.ok(gotB && /FB1/.test(gotB.body), 'fb hold carries fb');
+        const previewOf = (h) => JSON.parse(readFileSync(join(TRT, 'asks', `${h.id}.json`), 'utf8')).bodyPreview;
+        assert.ok(gotA && /FA1/.test(previewOf(gotA)), 'fa hold carries fa');
+        assert.ok(gotB && /FB1/.test(previewOf(gotB)), 'fb hold carries fb');
         // A free request on fa's door answers while both holds are parked.
         const sF = await open(fa,
           `GET http://${upHost}/?m=free HTTP/1.1\r\nHost: ${upHost}\r\nConnection: close\r\n\r\n`);
@@ -853,23 +1122,22 @@ describe('two agents keep identity under interleave', () => {
         assert.equal(free.status, 200);
         assert.equal(free.body, 'local-ok');
         assert.equal(tp.pending().length, 2, 'holds still parked');
-        assert.equal(await ctl2(`approve ${gotA.id}`), `approved ${gotA.id}`);
-        assert.equal(await ctl2(`approve ${gotB.id}`), `approved ${gotB.id}`);
+        answer(gotA.id, { decision: 'allow' });
+        answer(gotB.id, { decision: 'allow' });
         const rA = await rAP;
         const rB = await rBP;
         assert.equal(rA.status, 200);
         assert.match(rA.body, /FA1/);
         assert.equal(rB.status, 200);
         assert.match(rB.body, /FB1/);
-        await waitFor(() => /"agent":"fb"/.test(log()) && /m=FB1/.test(log()),
+        await waitFor(() => /"agent":"fb"/.test(tlog()) && /m=FB1/.test(tlog()),
           'log to name fb');
-        assert.match(log(), /"agent":"fa"/);
+        assert.match(tlog(), /"agent":"fa"/);
       } finally {
         for (const s of sa) { try { s.destroy(); } catch {} }
         try { tp.removeAgent('fa'); } catch {}
         try { tp.removeAgent('fb'); } catch {}
         await tp.close();
-        try { rmSync(ctl2Path(), { force: true }); } catch {}
       }
     });
 });
@@ -898,9 +1166,12 @@ describe('audit log secrets', () => {
   });
 
   it('user redact hook runs after built-in scrubbing', async () => {
-    const tp = createProxy({ port: 0, certDir: join(RT, 'certs'),
-      logFile: join(RT, 'mitm-hook.log'), runtime: RT,
-      clientIdleMs: 1000, allowLoopback: true,
+    // Own runtime: the shared RT is claimed by the module proxy.
+    const trt = mkdtempSync(join(tmpdir(), 'bb-hook-'));
+    const hookLogPath = join(trt, 'mitm-hook.log');
+    const tp = createProxy({ port: 0,
+      logFile: hookLogPath, runtime: trt,
+      clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true },
       redact: (e) => ({ ...e, hookRan: e.ev }) });
     try {
       const { port } = await tp.ready;
@@ -909,17 +1180,72 @@ describe('audit log secrets', () => {
         '-H', `Authorization: ${secret}`, `${plainUp.url}?m=hookredact`],
         { encoding: 'latin1' });
       const hookLog = () => {
-        try { return readFileSync(join(RT, 'mitm-hook.log'), 'latin1'); }
+        try { return readFileSync(hookLogPath, 'latin1'); }
         catch { return ''; }
       };
       await waitFor(() => /m=hookredact/.test(hookLog()), 'hook log line');
-      assert.equal(statSync(join(RT, 'mitm-hook.log')).mode & 0o777, 0o600);
+      assert.equal(statSync(hookLogPath).mode & 0o777, 0o600);
       const text = hookLog();
       assert.match(text, /"hookRan":"req"/);
       assert.match(text, /\[redacted\]/);
       assert.ok(!text.includes(secret), 'secret must not survive the hook either');
     } finally {
       await tp.close();
+      rmSync(trt, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('upstream fallback (2.1 item 1)', () => {
+  it('localhost reaches a 127.0.0.1 upstream when ::1 refuses', async () => {
+    // localhost resolves to ::1 first here; the fixture listens on 127.0.0.1
+    // only, so dialing just the first address gets ECONNREFUSED. The wall
+    // passes both under allowLoopback and the dial falls through to 127.0.0.1.
+    const r = await curl(`http://localhost:${plainUp.port}/?m=localhost`);
+    assert.equal(r.stdout, 'local-ok');
+    await waitLog(/m=localhost/, 'localhost request');
+  });
+});
+
+describe('audit log secrets, continued (2.1 items 3-4)', () => {
+  it('cookie and api-key headers leave no secret in logged req lines', async () => {
+    const session = `session=${process.pid}-secret`;
+    const apiKey = `key-${process.pid}-secret`;
+    const r = await curl('-H', `Cookie: ${session}`,
+      '-H', `X-Api-Key: ${apiKey}`,
+      `${plainUp.url}?m=cookiekey`);
+    assert.equal(r.stdout, 'local-ok');
+    await waitLog(/m=cookiekey/, 'cookiekey request');
+    const text = log();
+    assert.ok(!text.includes(session), 'cookie must not appear in the log');
+    assert.ok(!text.includes(apiKey), 'api key must not appear in the log');
+    const line = text.split('\n').find((l) => l.includes('m=cookiekey'));
+    assert.ok(line, 'cookiekey req line is logged');
+    assert.match(line, /\[redacted\]/);
+  });
+
+  it('an existing 0644 log is tightened to 0600 on start', async () => {
+    // Own runtime: the shared RT is claimed by the module proxy.
+    const trt = mkdtempSync(join(tmpdir(), 'bb-oldlog-'));
+    const logPath = join(trt, 'mitm-old.log');
+    writeFileSync(logPath, 'old line\n');
+    chmodSync(logPath, 0o644);
+    const tp = createProxy({ port: 0,
+      logFile: logPath, runtime: trt,
+      clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true } });
+    try {
+      const { port } = await tp.ready;
+      await execA('curl', ['-s', '--max-time', '8', '-x', `http://127.0.0.1:${port}`,
+        `${plainUp.url}?m=oldlog`], { encoding: 'latin1' });
+      const oldLog = () => {
+        try { return readFileSync(logPath, 'latin1'); }
+        catch { return ''; }
+      };
+      await waitFor(() => /m=oldlog/.test(oldLog()), 'oldlog line');
+      assert.equal(statSync(logPath).mode & 0o777, 0o600);
+    } finally {
+      await tp.close();
+      rmSync(trt, { recursive: true, force: true });
     }
   });
 });

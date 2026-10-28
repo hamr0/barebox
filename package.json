@@ -1,6 +1,6 @@
 {
   "name": "barebox",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Lightweight local sandbox for AI agents: every write undoable, nothing leaves the machine without passing the doorman.",
   "license": "Apache-2.0",
   "repository": {
@@ -37,7 +37,7 @@
     "redteam:m0": "bash poc/m0/redteam.sh",
     "bench": "node scripts/bench.mjs",
     "test": "env -u NODE_USE_ENV_PROXY -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u FTP_PROXY -u http_proxy -u https_proxy -u all_proxy -u ftp_proxy node --test --import ./test/setup-env.mjs \"test/*.test.mjs\"",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "build:types": "tsc",
     "build:primitives": "node scripts/gen-primitives.mjs",
     "check:primitives": "node scripts/gen-primitives.mjs --check",

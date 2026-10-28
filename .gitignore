@@ -7,3 +7,4 @@ poc/m0/idle-*.log
 .claude/
 .litectx/
 .idea/
+docs/.docs-builder/

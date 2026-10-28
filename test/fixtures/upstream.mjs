@@ -51,11 +51,14 @@ function routes() {
   return { handler, hits };
 }
 
-// /hold echoes the POST body back, so tests can match their markers.
-function holdAware(handler) {
+// /hold echoes the POST body back, so tests can match their markers. It
+// counts its hits like every other path: hold tests assert a forward
+// happened exactly once (approve) or never (over-cap, abandon, stale).
+function holdAware(handler, hits) {
   return (req, res) => {
     const u = new URL(req.url, 'http://x');
     if (u.pathname === '/hold') {
+      hits.set(u.pathname, (hits.get(u.pathname) ?? 0) + 1);
       const chunks = [];
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => res.end(Buffer.concat(chunks)));
@@ -73,7 +76,7 @@ function holdAware(handler) {
  */
 export async function startHttps({ key, cert }) {
   const { handler, hits } = routes();
-  const srv = https.createServer({ key, cert }, holdAware(handler));
+  const srv = https.createServer({ key, cert }, holdAware(handler, hits));
   await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
   const port = srv.address().port;
   return {
@@ -91,7 +94,7 @@ export async function startHttps({ key, cert }) {
  */
 export async function startHttp() {
   const { handler, hits } = routes();
-  const srv = http.createServer(holdAware(handler));
+  const srv = http.createServer(holdAware(handler, hits));
   await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve));
   const port = srv.address().port;
   return {
