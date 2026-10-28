@@ -6,9 +6,9 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, mkdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import net from 'node:net';
-import { claimRuntime, runtimePaths } from '../src/runtime.js';
+import { claimRuntime, runtimePaths, shellQuote } from '../src/runtime.js';
 
 const RUNTIME_URL = new URL('../src/runtime.js', import.meta.url).href;
 
@@ -144,6 +144,21 @@ describe('claimRuntime: one live proxy per runtime', () => {
     r2();
   });
 
+  it('the runtime root is 0700 whatever the umask', () => {
+    const prev = process.umask(0);
+    try {
+      const rt = join(root, `rt-${process.pid}-${Date.now()}`);
+      const release = claimRuntime(rt);
+      try {
+        assert.equal(statSync(rt).mode & 0o777, 0o700);
+      } finally {
+        release();
+      }
+    } finally {
+      process.umask(prev);
+    }
+  });
+
   it('the owner file is 0600', () => {
     const rt = mkdtempSync(join(root, 'rt-'));
     const release = claimRuntime(rt);
@@ -151,6 +166,16 @@ describe('claimRuntime: one live proxy per runtime', () => {
       assert.equal(statSync(runtimePaths(rt).owner).mode & 0o777, 0o600);
     } finally {
       release();
+    }
+  });
+
+  it('shellQuote leaves safe paths alone and quotes the rest', () => {
+    assert.equal(shellQuote('/tmp/sbx-a1'), '/tmp/sbx-a1');
+    assert.equal(shellQuote('/tmp/my dir'), `'/tmp/my dir'`);
+    assert.equal(shellQuote(`/tmp/it's`), `'/tmp/it'\\''s'`);
+    for (const orig of ['/tmp/sbx-a1', '/tmp/my dir', `/tmp/it's`]) {
+      const q = shellQuote(orig);
+      assert.equal(execFileSync('bash', ['-c', `printf %s ${q}`], { encoding: 'utf8' }), orig);
     }
   });
 });

@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ensureCA, certFor, HOST_RE } from './certs.js';
 import { createHolds } from './holds.js';
-import { claimRuntime, runtimePaths } from './runtime.js';
+import { claimRuntime, ensurePrivateDir, runtimePaths } from './runtime.js';
 import { checkUpstream } from './wall.js';
 
 const AGENT = Symbol('agent');
@@ -119,7 +119,7 @@ function scrubSecrets(entry) {
  * @param {ProxyOptions} opts
  * @returns live proxy: `ready` resolves when listeners + CA are up; the shape is inferred, see `Proxy`
  * @when Reach for this HARNESS-ONLY to run the front door: it terminates agent TLS, sees every request, and parks the ones a human must decide. It decides nothing itself; pair with the launcher for sandboxes and `sbx` for decisions.
- * @fails Throws synchronously on a missing `logFile` or `runtime`. Throws when another live proxy owns the runtime; the claim dies with its process; nothing is ever taken over. At runtime, dead upstreams, malformed input, over-cap and timed-out holds all become loud logged HTTP errors, never silence and never a crash. A second proxy on the same port rejects `ready`, never crashes the process.
+ * @fails Throws synchronously on a missing or unopenable `logFile` or `runtime`. Throws when another live proxy owns the runtime; the claim dies with its process; nothing is ever taken over. At runtime, dead upstreams, malformed input, over-cap and timed-out holds all become loud logged HTTP errors, never silence and never a crash. A second proxy on the same port rejects `ready`, never crashes the process.
  * @example
  * import { createProxy } from "barebox";
  * const proxy = createProxy({ port: 0, runtime: "./sbx-runtime", logFile: "./mitm.log" });
@@ -145,11 +145,29 @@ export function createProxy(opts) {
   const certDir = runtimePaths(runtime).certsDir;
   const holdMaxBody = hold?.maxBody ?? 1048576;
 
-  const logStream = fs.createWriteStream(logFile, { flags: 'a', mode: 0o600 });
-  // `mode` applies only at creation: a 0644 log from an older run would stay
-  // world-readable while new lines append, so fix it up on every start. A
-  // not-yet-created file throws here and is created 0600 by the stream.
+  // Open the audit log synchronously: a bad `logFile` (a directory, a
+  // missing parent, no permission) throws here, where the claim can still
+  // be released — not later as an uncaught stream error.
+  let logFd;
+  try {
+    logFd = fs.openSync(logFile, 'a', 0o600);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    releaseClaim();
+    throw new Error(`createProxy: cannot open logFile ${logFile}: ${msg}`);
+  }
+  // `null` path: the open `fd` is the file; the cast keeps `tsc` quiet.
+  const logStream = fs.createWriteStream(logFile, { fd: logFd });
+  // `openSync`'s mode is masked by the umask and doesn't apply to an
+  // existing file: a 0644 log from an older run would stay world-readable
+  // while new lines append, so fix it up on every start.
   try { fs.chmodSync(logFile, 0o600); } catch {}
+  let logFailed = false;
+  logStream.on('error', (e) => {
+    if (logFailed) return;
+    logFailed = true;
+    console.error(`sbx: audit log ${logFile} write failed: ${e instanceof Error ? e.message : String(e)}`);
+  });
   const log = (o) => { logStream.write(JSON.stringify(redact(scrubSecrets(o))) + '\n'); };
   let trust = null;
   if (upstreamCa) {
@@ -517,7 +535,7 @@ export function createProxy(opts) {
     const sockPath = runtimePaths(runtime).socket(name);
     if (agentServers.has(name)) return sockPath;
     try { fs.unlinkSync(sockPath); } catch {}
-    fs.mkdirSync(path.dirname(sockPath), { recursive: true });
+    ensurePrivateDir(path.dirname(sockPath));
     const srv = net.createServer((sock) => {
       if (closed) { sock.destroy(); return; }
       admit(sock, name);

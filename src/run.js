@@ -186,13 +186,16 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
     await proxy.close().catch(() => {});
     throw e;
   }
-  const sock = proxy.addAgent(agent);
-  // `launch` runs INSIDE the try: a synchronous throw there (uncommitted
-  // overlay changes, a runtime inside the project) must still close the
-  // proxy — otherwise its listening sockets keep this process alive forever.
+  /** @type {string} */
+  let sock;
+  // `addAgent` and `launch` run INSIDE the try: a synchronous throw there
+  // (a broken socket folder, uncommitted overlay changes, a runtime inside
+  // the project) must still close the proxy — otherwise its listening
+  // sockets keep this process alive forever.
   /** @type {number} */
   let exit;
   try {
+    sock = proxy.addAgent(agent);
     const child = launch({
       runtime: rt, agent, proj, command,
       socket: sock, caFile: proxy.caFile,

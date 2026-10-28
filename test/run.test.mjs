@@ -17,6 +17,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { run, shouldHoldForMode } from '../src/run.js';
+import { claimRuntime, runtimePaths } from '../src/runtime.js';
 import { setupOverlay } from '../src/overlay.js';
 import { startHttp } from './fixtures/upstream.mjs';
 
@@ -142,6 +143,29 @@ describe('run() closes the proxy when launch throws (no sandbox needed)', () => 
       });
       assert.equal(code, 2, `expected the launch rejection (exit 2), got ${code}: out=${out} err=${err}`);
       assert.match(out, /REJECTED:.*uncommitted/, `the rejection must name the cause: ${out} ${err}`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+});
+
+describe('run() releases the runtime when addAgent throws (no sandbox needed)', () => {
+  // No child process: the damage is a leaked runtime claim in-process, not
+  // a hung event loop (addAgent throws before any listener exists). The
+  // socket folder is a plain file, so ensurePrivateDir throws EEXIST inside
+  // addAgent AFTER the proxy claimed the runtime.
+  it('a throwing addAgent rejects AND releases the runtime', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bb-runadd-'));
+    try {
+      const proj = join(root, 'proj');
+      const rt = join(root, 'rt');
+      mkdirSync(proj, { recursive: true });
+      mkdirSync(rt, { recursive: true });
+      writeFileSync(dirname(runtimePaths(rt).socket('a')), 'x');
+      await assert.rejects(run({ proj, command: ['true'], runtime: rt, agent: 'a' }), /EEXIST/);
+      const release = claimRuntime(rt);
+      release();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

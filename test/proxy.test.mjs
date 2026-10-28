@@ -665,6 +665,24 @@ describe('holds', () => {
     rmSync(HRT, { recursive: true, force: true });
   });
 
+  it('an unopenable logFile throws synchronously and releases the claim', async () => {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-badlog-'));
+    try {
+      const dirLog = join(rt, 'logdir');
+      mkdirSync(dirLog, { recursive: true });
+      assert.throws(() => createProxy({ port: 0, logFile: dirLog, runtime: rt }),
+        /cannot open logFile/);
+      const p2 = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), runtime: rt });
+      try {
+        await p2.ready;
+      } finally {
+        await p2.close();
+      }
+    } finally {
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
   it('runtime is required (certs always live at <runtime>/certs)', async () => {
     // No sandbox needed: createProxy must refuse synchronously, before the
     // log stream or any CA file (ca.key especially) is created.
@@ -1039,6 +1057,8 @@ describe('one proxy owns a runtime (claim)', () => {
     const p2 = createProxy({ port: 0, logFile: join(rt, 'mitm2.log'), runtime: rt });
     try {
       await p2.ready;
+      p2.addAgent('a1');
+      assert.equal(statSync(join(rt, 'socks')).mode & 0o777, 0o700);
     } finally {
       await p2.close();
     }

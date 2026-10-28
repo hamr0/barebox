@@ -27,6 +27,7 @@ import net from 'node:net';
 import {
   setupOverlay, diffOverlay, commitOverlay, rollbackOverlay, undoJournal,
   finishFailedCommit, changedSince, overlaySupportError, fpNow, OverlayConflictError, DEFAULT_IGNORE,
+  hashFile,
 } from '../src/overlay.js';
 import { runtimePaths } from '../src/runtime.js';
 import { launch } from '../src/launcher.js';
@@ -1832,4 +1833,59 @@ describe('sbx diff/commit/rollback CLI', () => {
       assert.match((await sbx(['commit'], { SBX_RUNTIME: rt })).stdout, /committed new\.txt/);
       assert.equal(readFileSync(join(proj, 'new.txt'), 'utf8'), 'agent\n');
     });
+});
+
+describe('hashFile (no sandbox needed)', () => {
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'bb-hash-'));
+  });
+  after(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Deterministic non-repeating bytes. */
+  function fill(n) {
+    const buf = Buffer.alloc(n);
+    let x = 0x12345678;
+    for (let i = 0; i < n; i++) {
+      x ^= x << 13;
+      x ^= x >>> 17;
+      x ^= x << 5;
+      buf[i] = x & 0xff;
+    }
+    return buf;
+  }
+
+  it('hashes a multi-chunk file exactly', () => {
+    const f = join(root, 'big.bin');
+    writeFileSync(f, fill(1024 * 1024 * 2 + 123));
+    assert.equal(hashFile(f), createHash('sha256').update(readFileSync(f)).digest('hex'));
+  });
+
+  it('hashes an empty file like the empty string', () => {
+    const f = join(root, 'empty.bin');
+    writeFileSync(f, '');
+    assert.equal(hashFile(f), createHash('sha256').update('').digest('hex'));
+  });
+
+  it('names the path on failure', () => {
+    const f = join(root, 'missing.bin');
+    assert.throws(() => hashFile(f), new RegExp(`hash failed for ${f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  });
+
+  it('keeps the error code so the walker can refuse loudly', () => {
+    const f = join(root, 'unreadable.bin');
+    writeFileSync(f, 'x');
+    chmodSync(f, 0o000);
+    try {
+      hashFile(f);
+      assert.fail('must throw');
+    } catch (e) {
+      assert.equal(e.code, 'EACCES');
+      assert.match(e.message, /hash failed for .*unreadable\.bin/);
+    } finally {
+      chmodSync(f, 0o600);
+    }
+  });
 });
