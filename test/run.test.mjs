@@ -241,6 +241,24 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
     assert.match(res.audit && readFileSync(res.audit, 'utf8'), /"ev":"decide"/);
   });
 
+  it('a held request whose client disconnects ends as deny / client gone in asks', async () => {
+    const rt = join(root, 'rt-gone');
+    const out = capture();
+    const err = capture();
+    // curl gives up after 1s while the ask is still unanswered.
+    const res = await run({
+      proj, runtime: rt, unsafeTestOnly: { allowLoopback: true }, timeoutMs: 15000,
+      stdout: out.stream, stderr: err.stream,
+      command: ['bash', '-c',
+        `curl -s --max-time 1 --data m=RUNGONE http://127.0.0.1:${plainUp.port}/hold; exit 0`],
+    });
+    assert.equal(res.exit, 0, err.text());
+    assert.equal(res.asks.length, 1);
+    assert.equal(res.asks[0].decision, 'deny');
+    assert.equal(res.asks[0].reason, 'client gone');
+    assert.deepEqual(readdirSync(join(rt, 'asks')), []);
+  });
+
   it('a command with no network creates a temp runtime and returns exit 0', async () => {
     const res = await run({ proj, command: ['true'] });
     assert.equal(res.exit, 0);

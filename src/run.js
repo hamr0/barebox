@@ -106,7 +106,7 @@ export function shouldHoldForMode(mode) {
  * @property {string[]} command argv to run inside, for example `["bash", "-c", "echo hi"]`
  * @property {string} [mode] `ask` | `auto` (default) | `trust`; see the mode comment at the top of this file
  * @property {import('./holds.js').OnAsk} [onAsk] ask seam; when present no files are involved, otherwise the file checkpoint runs
- * @property {import('./holds.js').OnEvent} [onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle (also feeds `asks`)
+ * @property {import('./holds.js').OnEvent} [onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle or abandon (also feeds `asks`)
  * @property {string} [runtime] runtime dir (created when absent: a short `sbx-*` temp dir, keeping unix socket paths under the ~108-char limit)
  * @property {string} [agent] agent name (default `'agent'`)
  * @property {number|string} [timeoutMs] hold deadline in ms, or `'never'` (default 120000)
@@ -125,7 +125,7 @@ export function shouldHoldForMode(mode) {
  * @param {string[]} opts.command argv to run inside, for example `["bash", "-c", "echo hi"]`
  * @param {string} [opts.mode] `ask` | `auto` (default) | `trust`; see the mode comment at the top of this file
  * @param {import('./holds.js').OnAsk|null} [opts.onAsk] ask seam; when present no files are involved, otherwise the file checkpoint runs
- * @param {import('./holds.js').OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle (also feeds `asks`)
+ * @param {import('./holds.js').OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle or abandon (also feeds `asks`)
  * @param {string|null} [opts.runtime] runtime dir (created when absent: a short `sbx-*` temp dir, keeping unix socket paths under the ~108-char limit)
  * @param {string} [opts.agent] agent name (default `'agent'`)
  * @param {number|string} [opts.timeoutMs] hold deadline in ms, or `'never'` (default 120000)

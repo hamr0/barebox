@@ -19,7 +19,8 @@
 // Decisions enter through one `normalizeDecision` (`allow`/`deny`, with
 // `'approve'` accepted as an alias of `'allow'` in answer files only) and
 // are reported through one optional `onEvent` callback: `{ type: 'ask' }`
-// when a hold parks, `{ type: 'decided' }` when it settles. Outcomes are
+// when a hold parks, `{ type: 'decided' }` when it settles or is abandoned
+// (`deny` / `client gone`). Outcomes are
 // reported, never reconstructed: `run()` and `sbx run` build their ask
 // records from these events. The library never writes to stdout or stderr.
 //
@@ -68,7 +69,8 @@ export const DEFAULT_POLL_MS = 250;
 
 /**
  * A queue event, as delivered to the `onEvent` callback: `{ type: 'ask' }`
- * when a hold parks, `{ type: 'decided' }` when it settles.
+ * when a hold parks, `{ type: 'decided' }` when it settles or its client
+ * goes away (`deny` / `client gone`): every ask ends in exactly one.
  *
  * @typedef {{ type: 'ask', ask: AskPayload } | { type: 'decided', id: string, decision: 'allow' | 'deny', reason?: string }} HoldEvent
  */
@@ -213,7 +215,7 @@ export function normalizeDecision(input, { approveAlias = false } = {}) {
  * @param {string|null} [opts.runtime] runtime dir; required for the default file checkpoint (writes `asks/`, polls `answers/`)
  * @param {OnAsk|null} [opts.onAsk] ask seam (bareguard `humanChannel` shape); when present no files are involved
  * @param {number} [opts.pollMs] answer poll interval in ms for the default file checkpoint (default 250, PRD Q9)
- * @param {OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle
+ * @param {OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle or abandon or abandon
  * @param {(entry: object) => void} opts.onApprove forward the parked request upstream
  * @param {(entry: object, reason: string) => void} opts.onDeny refuse the parked request
  * @returns {{ add: (entry: object) => string, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
@@ -440,6 +442,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       removeAskFile(id);
       log({ ev: 'hold-abandoned', id, agent: h.agent, method: h.method, url: h.url });
       onDeny(h, 'client gone');
+      onEvent?.({ type: 'decided', id, decision: 'deny', reason: 'client gone' });
     },
 
     abandonSocket(sock) {
@@ -454,17 +457,8 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
 
     close() {
       if (pollTimer) clearInterval(pollTimer);
-      const parked = [...queue.keys()];
+      // settle() removes each ask file: `sbx pending` never lists a dead queue's holds.
       for (const [id] of [...queue]) settle(id, false, 'proxy closing');
-      // The queue's asks die with it: remove their files explicitly, so
-      // `sbx pending` can never list holds of a dead queue.
-      if (paths) {
-        for (const id of parked) {
-          try {
-            fs.unlinkSync(paths.askFile(id));
-          } catch {}
-        }
-      }
     },
   };
 

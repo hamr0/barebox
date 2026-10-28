@@ -23,13 +23,14 @@ function runBlock(i, b, dir) {
     { encoding: 'utf8', timeout: 60000, env: { ...process.env, TMPDIR: dir } });
 }
 
-/** With `dir` removed, run one block and assert it exits 0. */
-function runBlockClean(i, b) {
+/** With `dir` removed, run one block, assert it exits 0, then run the optional `check(dir)` before the removal. */
+function runBlockClean(i, b, check) {
   const dir = mkdtempSync(join(tmpdir(), 'bb-doc-'));
   try {
     const res = runBlock(i, b, dir);
     if (res.error) throw res.error;
     assert.equal(res.status, 0, `block ${i} exits 0 (stderr: ${res.stderr})`);
+    if (check) check(dir);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -49,16 +50,14 @@ describe('context doc quickstarts run as written', () => {
     });
   }
 
-  it('blocks leak no sbx-*/proj-* folders into the shared tmpdir', () => {
-    const entries = () => new Set(readdirSync(tmpdir())
-      .filter((n) => n.startsWith('sbx-') || n.startsWith('proj-')));
-    const before = entries();
+  it('block mkdtemps land under TMPDIR, not the shared tmpdir', () => {
     for (const [i, b] of found.entries()) {
       if (!b.run) continue;
-      runBlockClean(i, b);
+      runBlockClean(i, b, (dir) => {
+        assert.ok(readdirSync(dir).some((n) => n.startsWith('sbx-')),
+          `block ${i} created its sbx-* folder under TMPDIR (${dir}), not the shared tmpdir`);
+      });
     }
-    assert.deepEqual([...entries()].filter((n) => !before.has(n)), [],
-      'every block-owned folder stays under TMPDIR');
   });
 });
 

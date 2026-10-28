@@ -10,9 +10,10 @@
 // Runs one sandboxed agent start-to-finish in this process (project = cwd).
 // The runtime is SBX_RUNTIME when set, else a short temp dir (printed to
 // stderr so a second terminal can approve from it). With --json, stdout
-// carries JSON lines only (`{"ev":"ask",...}` per parked ask, then
-// `{"ev":"done","exit":N}`); the agent's own output goes to stderr there so
-// the stream stays parseable. Without --json the same events print as
+// carries JSON lines only (`{"ev":"ask",...}` per parked ask,
+// `{"ev":"decided","id","decision","reason"}` when each one ends (answered,
+// timed out, or its client went away), then `{"ev":"done","exit":N}`); the
+// agent's own output goes to stderr there so the stream stays parseable. Without --json the same events print as
 // human-readable lines. The process exit code mirrors the agent's (usage
 // errors stay exit 2). SBX_UNSAFE_TEST_ALLOW_LOOPBACK=1 is a TEST-ONLY opt-in
 // (fixtures live on 127.0.0.1); production never sets it.
@@ -162,16 +163,21 @@ async function run(args) {
   const json = values.json ?? false;
   const overlay = values.overlay ?? false;
   const runtime = process.env.SBX_RUNTIME || createRuntime();
+  // Agent-controlled bytes, sanitized before they reach a terminal or a JSON consumer.
+  const clean = (o, keys) => {
+    const c = { ...o };
+    for (const k of keys) if (c[k] != null) c[k] = safe(c[k]);
+    return c;
+  };
   const emitAsk = (h) => {
-    // Agent-controlled bytes, sanitized before they reach a terminal.
-    const clean = {
-      ...h,
-      id: safe(h.id), agent: safe(h.agent), method: safe(h.method),
-      url: safe(h.url), rule: safe(h.rule),
-      ...(h && typeof h === 'object' && 'bodyPreview' in h ? { bodyPreview: safe(h.bodyPreview) } : {}),
-    };
-    if (json) out(JSON.stringify({ ev: 'ask', ...clean }));
-    else out(`ask ${clean.id} ${clean.agent} ${clean.method} ${clean.url} rule=${clean.rule}`);
+    const c = clean(h, ['id', 'agent', 'method', 'url', 'rule', 'bodyPreview']);
+    if (json) out(JSON.stringify({ ev: 'ask', ...c }));
+    else out(`ask ${c.id} ${c.agent} ${c.method} ${c.url} rule=${c.rule}`);
+  };
+  const emitDecided = (e) => {
+    const c = clean(e, ['id', 'decision', 'reason']);
+    if (json) out(JSON.stringify({ ev: 'decided', id: c.id, decision: c.decision, reason: c.reason }));
+    else out(`decided ${c.id} ${c.decision}${c.reason ? ` (${c.reason})` : ''}`);
   };
   err(`runtime ${runtime} (answer with: SBX_RUNTIME=${runtime} sbx approve <id>)`);
   /** @type {{ exit: number, diff: { path: string }[] } | null} */
@@ -185,7 +191,7 @@ async function run(args) {
       unsafeTestOnly: { allowLoopback: process.env.SBX_UNSAFE_TEST_ALLOW_LOOPBACK === '1' },
       overlay,
       ...(extraIgnore.length ? { overlayIgnore: ['node_modules', ...extraIgnore] } : {}),
-      onEvent: (e) => { if (e.type === 'ask') emitAsk(e.ask); },
+      onEvent: (e) => { if (e.type === 'ask') emitAsk(e.ask); else emitDecided(e); },
       // With --json stdout is a pure event stream: agent output goes to
       // stderr so a parser never trips over it.
       ...(json ? { stdout: process.stderr, stderr: process.stderr } : {}),

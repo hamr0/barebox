@@ -22,7 +22,8 @@ import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
 import os from 'node:os';
-import { createProxy, denyReasonForIp } from '../src/proxy.js';
+import { createProxy } from '../src/proxy.js';
+import { denyReasonForIp } from '../src/wall.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
 
@@ -331,6 +332,20 @@ describe('negatives', () => {
       'https://127.0.0.1:9/');
     assert.equal(code.stdout, '502');
     await waitLog(/upstream 127\.0\.0\.1 failed/, 'dead-upstream 502');
+  });
+
+  it('a failed upstream writes exactly one deny line', async () => {
+    // A free port with nothing listening: the dial is refused, `fail` answers.
+    const srv = net.createServer();
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const dead = srv.address().port;
+    await new Promise((r) => srv.close(r));
+    const code = await curl('-o', '/dev/null', '-w', '%{http_code}', `http://127.0.0.1:${dead}/one-deny`);
+    assert.equal(code.stdout, '502');
+    const denyLines = () => log().split('\n').filter((l) => l.includes('"ev":"deny"') && l.includes(`:${dead}`));
+    await waitFor(() => denyLines().length > 0, 'a deny line for the dead upstream');
+    const denies = denyLines();
+    assert.equal(denies.length, 1, denies.join('\n'));
   });
 
   it('client without CA fails with exit 60, not silence', async () => {

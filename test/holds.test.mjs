@@ -133,17 +133,20 @@ describe('hold queue events (2.1, 2.2, 2.4)', () => {
     }
   });
 
-  it('an abandoned hold emits no decision; its late answer is stale', async () => {
+  it('an abandoned hold reports decided / deny / client gone once; its late answer is stale', async () => {
     const { rt, logs, events, denied, q } = mkQueue();
     try {
       const id = park(q);
       await waitFor(() => events.length >= 1, 'ask event');
+      assert.deepEqual(readdirSync(join(rt, 'asks')), [`${id}.json`], 'parked: ask file present');
       q.abandon(id);
-      assert.deepEqual(events.map((e) => e.type), ['ask'], 'no decided event for abandon');
+      assert.deepEqual(events.slice(1),
+        [{ type: 'decided', id, decision: 'deny', reason: 'client gone' }]);
       assert.deepEqual(denied, [[id, 'client gone']]);
+      assert.deepEqual(readdirSync(join(rt, 'asks')), [], 'ask file removed');
       answer(rt, id, { decision: 'allow' });
       await waitFor(() => logs.some((l) => l.ev === 'stale-answer'), 'stale-answer');
-      assert.deepEqual(events.map((e) => e.type), ['ask'], 'still no decision');
+      assert.equal(events.filter((e) => e.type === 'decided').length, 1, 'still exactly one decided');
     } finally {
       q.close();
     }

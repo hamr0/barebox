@@ -33,6 +33,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Test-only options moved under one key: `createProxy({ unsafeTestOnly: { allowLoopback, resolveUpstream } })`, `run({ unsafeTestOnly: { allowLoopback } })`. The CLI variable is renamed from `SBX_ALLOW_LOOPBACK` to `SBX_UNSAFE_TEST_ALLOW_LOOPBACK`.
 - `onEvent(e)` on `createHolds` / `createProxy`'s `hold` / `run()`: `{ type: 'ask', ask }` when a hold parks, `{ type: 'decided', id, decision, reason }` when it settles. `run()`'s `asks` result is built from these events.
+- `sbx run` prints how each ask ended: `decided <id> <allow|deny> [(reason)]`, or `{"ev":"decided","id","decision","reason"}` with `--json`, between the `ask` and `done` lines. A hold whose client went away reports `deny` / `client gone` (also in `run()`'s `asks`).
 - Decisions are written as `allow` / `deny` everywhere, the audit log included. `approve` is still accepted, as an alias in answer files only.
 - `sbx` results go to stdout; every error, refusal and usage-on-error goes to stderr through `err`. `--help` stays on stdout, exit 0. Exit codes don't change. (Item 4 changed no output streams.)
 

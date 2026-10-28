@@ -110,6 +110,82 @@ function procStart(pid) {
   return afterComm.length >= 20 ? afterComm[19] : null;
 }
 
+/** @param {string} owner owner file path @returns {{pid?: unknown, start?: unknown}|null} the claim, or null when missing, empty or garbage */
+function readClaim(owner) {
+  try {
+    return JSON.parse(fs.readFileSync(owner, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+/** @param {string} runtime runtime dir @param {unknown} pid the holder @returns {Error} the one in-use error */
+function inUseError(runtime, pid) {
+  return new Error(
+    `runtime ${runtime} is in use by pid ${String(pid)} (one proxy per runtime: use another SBX_RUNTIME, or leave it unset for a fresh one)`);
+}
+
+/**
+ * Create `owner` holding `claim`, whole or not at all: write a temp file,
+ * then hard-link it into place. `link` fails with EEXIST when `owner`
+ * exists, and `owner` can never be seen empty by a second starter.
+ *
+ * @param {string} owner owner file path
+ * @param {unknown} claim JSON-serializable claim
+ * @returns {void} throws EEXIST when `owner` exists
+ */
+function createOwner(owner, claim) {
+  const body = JSON.stringify(claim);
+  const tmp = `${owner}.tmp-${crypto.randomBytes(8).toString('hex')}`;
+  try {
+    fs.writeFileSync(tmp, body, { flag: 'wx', mode: 0o600 });
+    fs.linkSync(tmp, owner);
+  } finally {
+    try { fs.unlinkSync(tmp); } catch {}
+  }
+}
+
+/**
+ * Take over an owner file judged stale. Renames it away, then checks what
+ * was really moved: if another starter won the takeover first, the file is
+ * its fresh claim, which goes back and we refuse. Exported for tests, the
+ * way `changedSince` is exported from `overlay.js`.
+ *
+ * @param {string} runtime runtime dir
+ * @param {{pid?: unknown, start?: unknown}|null} judged the claim judged stale (null: unreadable)
+ * @param {unknown} mine our claim
+ * @returns {void} throws "in use by pid N" when someone else holds the runtime
+ */
+export function takeOverStale(runtime, judged, mine) {
+  const owner = runtimePaths(runtime).owner;
+  const stale = `${owner}.stale-${crypto.randomBytes(8).toString('hex')}`;
+  let moved = false;
+  try {
+    fs.renameSync(owner, stale);
+    moved = true;
+  } catch (e) {
+    if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'ENOENT') throw e;
+    // Already gone: another takeover won; the link below decides.
+  }
+  if (moved) {
+    const got = readClaim(stale);
+    const same = got && judged ? got.pid === judged.pid && got.start === judged.start : !got && !judged;
+    if (!same) {
+      // A fresh claim, not the stale one: put it back (fails if a third landed).
+      try { fs.linkSync(stale, owner); } catch {}
+      try { fs.unlinkSync(stale); } catch {}
+      throw inUseError(runtime, got?.pid ?? 'unknown');
+    }
+    try { fs.unlinkSync(stale); } catch {}
+  }
+  try {
+    createOwner(owner, mine);
+  } catch (e) {
+    if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EEXIST') throw e;
+    throw inUseError(runtime, readClaim(owner)?.pid ?? 'unknown');
+  }
+}
+
 /**
  * Claim one runtime for one live proxy: the single enforcer of "one proxy
  * owns a runtime". The owner file holds `{"pid","start"}` 0600; pid plus
@@ -123,58 +199,20 @@ export function claimRuntime(runtime) {
   const owner = runtimePaths(runtime).owner;
   fs.mkdirSync(runtime, { recursive: true });
   const mine = { pid: process.pid, start: procStart(process.pid) };
-  const writeMine = () => {
-    const fd = fs.openSync(owner, 'wx', 0o600);
-    try {
-      fs.writeFileSync(fd, JSON.stringify(mine));
-    } finally {
-      fs.closeSync(fd);
-    }
-  };
-  const readClaim = () => {
-    try {
-      return JSON.parse(fs.readFileSync(owner, 'utf8'));
-    } catch {
-      return null;
-    }
-  };
-  const inUseError = (/** @type {unknown} */ pid) => new Error(
-    `runtime ${runtime} is in use by pid ${String(pid)} (one proxy per runtime: use another SBX_RUNTIME, or leave it unset for a fresh one)`);
-  const takeOver = () => {
-    try {
-      const stale = `${owner}.stale-${crypto.randomBytes(8).toString('hex')}`;
-      fs.renameSync(owner, stale);
-      try { fs.unlinkSync(stale); } catch {}
-    } catch (e) {
-      if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'ENOENT') throw e;
-      // Already gone: another takeover won; the retry below decides.
-    }
-    try {
-      writeMine();
-    } catch (e) {
-      if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EEXIST') throw e;
-      throw inUseError(readClaim()?.pid ?? 'unknown');
-    }
-  };
   try {
-    writeMine();
+    createOwner(owner, mine);
   } catch (e) {
     if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EEXIST') throw e;
-    const cur = readClaim();
+    const cur = readClaim(owner);
     const pid = cur?.pid;
     if (typeof pid === 'number' && cur?.start !== undefined
       && procStart(pid) !== null && procStart(pid) === cur.start) {
-      throw inUseError(pid);
+      throw inUseError(runtime, pid);
     }
-    takeOver();
+    takeOverStale(runtime, cur, mine);
   }
   return () => {
-    let cur;
-    try {
-      cur = JSON.parse(fs.readFileSync(owner, 'utf8'));
-    } catch {
-      return;
-    }
+    const cur = readClaim(owner);
     if (cur?.pid === mine.pid && cur?.start === mine.start) {
       try { fs.unlinkSync(owner); } catch {}
     }

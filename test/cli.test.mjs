@@ -385,10 +385,41 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
     const code = await r.closed;
     assert.equal(code, 3, `stderr: ${r.err()}`);
     const lines = r.out().trim().split('\n').map((l) => JSON.parse(l));
-    assert.equal(lines.length, 2, `stdout must carry exactly ask+done: ${r.out()}`);
+    assert.equal(lines.length, 3, `stdout must carry exactly ask+decided+done: ${r.out()}`);
     assert.equal(lines[0].ev, 'ask');
     assert.match(lines[0].url, /\/hold/);
-    assert.deepEqual(lines[1], { ev: 'done', exit: 3 });
+    assert.deepEqual(lines[1], { ev: 'decided', id, decision: 'allow' });
+    assert.deepEqual(lines[2], { ev: 'done', exit: 3 });
+  });
+
+  it('--json --mode ask: a denied hold prints ask, decided for the same id, then done', { timeout: 120000 }, async (t) => {
+    if (skipIfBlocked(t)) return;
+    const r = spawnRun(['--mode', 'ask', '--json'],
+      ['bash', '-c', `curl -s --max-time 10 --data m=CLIDENY http://127.0.0.1:${plainUp.port}/hold >/dev/null; exit 0`]);
+    const id = await waitFor(() => {
+      const m = /"ev":"ask","id":"(h\d+)"/.exec(r.out());
+      return m && m[1];
+    }, 'ask line on stdout');
+    answer(id, { decision: 'deny', reason: 'nope' });
+    const code = await r.closed;
+    assert.equal(code, 0, `stderr: ${r.err()}`);
+    const lines = r.out().trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepEqual(lines.map((l) => l.ev), ['ask', 'decided', 'done'], r.out());
+    assert.equal(lines[0].id, id);
+    assert.deepEqual(lines[1], { ev: 'decided', id, decision: 'deny', reason: 'nope' });
+  });
+
+  it('human mode prints a decided line with its reason', { timeout: 120000 }, async (t) => {
+    if (skipIfBlocked(t)) return;
+    const r = spawnRun(['--mode', 'ask'],
+      ['bash', '-c', `curl -s --max-time 10 --data m=CLIDECIDED http://127.0.0.1:${plainUp.port}/hold >/dev/null`]);
+    const id = await waitFor(() => {
+      const m = /ask (h\d+) /.exec(r.out());
+      return m && m[1];
+    }, 'ask line on stdout');
+    answer(id, { decision: 'deny', reason: 'no thanks' });
+    await r.closed;
+    assert.match(r.out(), new RegExp(`^decided ${id} deny \\(no thanks\\)$`, 'm'));
   });
 
   it('human mode prints ask and done lines and mirrors the exit code', { timeout: 120000 }, async (t) => {

@@ -263,7 +263,7 @@ Signed off by the user.
 | Governance v1 | Single operator, one mode (or one gate) per agent, one audit log. |
 | Secrets v1 | Injected in request headers only, after approval. A placeholder sits inside the sandbox. Body placeholder swap (for example `{{CARD}}` in a form body) is not v1. |
 | Localhost sockets (M0) | Blocked entirely. The net namespace isolates localhost; revisit treat-as-x in M3 only if a demo needs a local DB. |
-| Locked paths (M0) | `~/.ssh`, `~/secrets`, `~/.mozilla`, `~/.config/chromium`, `~/.gnupg`. More later without changing the walls. |
+| Locked paths (M0) | 21 credential stores; see `LOCKED_PATHS` in `src/launcher.js`. `~/.claude` stays readable until M5. More later without changing the walls. |
 | Browser agents + Jev | Out of v1. Demo A uses an API, not a browser. |
 | M0 harness | 20× idle sandboxes (`sleep` + `socat`, no real agent) for walls-only overhead ≤ 10 MB each; bypass set = unset proxy env, `--noproxy`, direct curl to IP. Real-agent and TLS memory come in M1/M6. |
 | API surface | CLI for sure plus programmatic APIs for spawning sandboxed workflows (goal: spawn workflows in a sandbox easily). |
