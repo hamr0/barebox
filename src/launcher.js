@@ -12,38 +12,38 @@ import { setupOverlay } from './overlay.js';
 // with an empty tmpfs, a file with /dev/null (bwrap cannot mount a tmpfs on
 // a file; `--dev-bind`, because `--ro-bind` makes the mount nodev and the
 // read fails EACCES instead of reading empty). The real kind on disk picks the
-// mask; `kind` documents intent.
+// mask.
 // Deliberately NOT here: the agent's own model credentials (`~/.claude`,
 // `~/.claude.json`, `~/.config/anthropic`, ...). A sandboxed coding agent
 // needs them to run at all; moving keys out of the agent's reach is M5
 // ("keys the agent never holds"), not a mask.
 const LOCKED_PATHS = [
   // keys, password stores, keyrings
-  { path: '.ssh', kind: 'dir' },
-  { path: 'secrets', kind: 'dir' },
-  { path: '.gnupg', kind: 'dir' },
-  { path: '.password-store', kind: 'dir' },
-  { path: '.local/share/keyrings', kind: 'dir' },
+  '.ssh',
+  'secrets',
+  '.gnupg',
+  '.password-store',
+  '.local/share/keyrings',
   // browser profiles (cookies, saved passwords)
-  { path: '.mozilla', kind: 'dir' },
-  { path: '.config/chromium', kind: 'dir' },
-  { path: '.config/google-chrome', kind: 'dir' },
-  { path: '.config/BraveSoftware', kind: 'dir' },
+  '.mozilla',
+  '.config/chromium',
+  '.config/google-chrome',
+  '.config/BraveSoftware',
   // cloud, cluster and container credentials
-  { path: '.aws', kind: 'dir' },
-  { path: '.azure', kind: 'dir' },
-  { path: '.config/gcloud', kind: 'dir' },
-  { path: '.kube', kind: 'dir' },
-  { path: '.docker', kind: 'dir' },
+  '.aws',
+  '.azure',
+  '.config/gcloud',
+  '.kube',
+  '.docker',
   // forge and password-manager CLIs
-  { path: '.config/gh', kind: 'dir' },
-  { path: '.config/op', kind: 'dir' },
+  '.config/gh',
+  '.config/op',
   // token files
-  { path: '.netrc', kind: 'file' },
-  { path: '.npmrc', kind: 'file' },
-  { path: '.pypirc', kind: 'file' },
-  { path: '.git-credentials', kind: 'file' },
-  { path: '.cargo/credentials.toml', kind: 'file' },
+  '.netrc',
+  '.npmrc',
+  '.pypirc',
+  '.git-credentials',
+  '.cargo/credentials.toml',
 ];
 
 /**
@@ -196,7 +196,7 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   // Locked drawers AFTER the project mount: the tmpfs mask must land on top,
   // or a project that contains one of these paths (a project that IS $HOME,
   // or holds its own `.ssh`) would leak the real drawer through the overlay.
-  for (const { path: p } of LOCKED_PATHS) args.push(...lockMask(`${home}/${p}`, home, proj));
+  for (const p of LOCKED_PATHS) args.push(...lockMask(`${home}/${p}`, home, proj));
   // The runtime tree holds the file-checkpoint dirs (`asks/`, `answers/`
   // — the approve/deny capability) and every agent's socket (identity). A
   // read-only bind does NOT stop connect(2) to a unix socket, so wherever

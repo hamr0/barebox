@@ -30,7 +30,7 @@ import { parseArgs } from 'node:util';
 import { writeFileAtomic } from './holds.js';
 import { run as sandboxRun } from './run.js';
 import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
-import { assertAgentName, createRuntime, runtimePaths, safe } from './runtime.js';
+import { assertAgentName, createRuntime, runtimePaths, runtimeLive, safe } from './runtime.js';
 
 const USAGE = 'usage: sbx [--help] | pending | approve <id> | deny <id> [reason] | diff [--agent <name>] | commit [--agent <name>] [--skip-conflicts] | rollback [--agent <name>] | run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]';
 
@@ -298,6 +298,10 @@ async function pending(rest) {
       out('nothing held');
       process.exit(0);
     }
+    if (!(await runtimeLive(runtime))) {
+      err(`no live proxy on ${runtime}: ${items.length} stale ask(s) can't be decided (cleared at the next start)`);
+      process.exit(1);
+    }
     for (const h of items) {
       // Live wait from the ask file's mtime (the payload's waitingSec is 0 at park).
       let waiting = 0;
@@ -315,9 +319,9 @@ async function pending(rest) {
 
 /**
  * @param {string[]} rest command args (`<id> [reason]`)
- * @returns {{ id: string, reason: string, paths: ReturnType<typeof runtimePaths> }}
+ * @returns {Promise<{ id: string, reason: string, paths: ReturnType<typeof runtimePaths> }>}
  */
-function answerTarget(rest) {
+async function answerTarget(rest) {
   const { runtime, positionals } = decideArgs(rest);
   const [id, ...ids] = positionals;
   // The id goes straight into `asks/<id>.json` and `answers/<id>.json`:
@@ -335,19 +339,23 @@ function answerTarget(rest) {
     err(`unknown ${id}`);
     process.exit(1);
   }
+  if (!(await runtimeLive(runtime))) {
+    err(`no live proxy on ${runtime}: nothing reads answers`);
+    process.exit(1);
+  }
   return { id, reason: ids.join(' ') || 'denied by user', paths };
 }
 
 /** @param {string[]} rest @returns {Promise<void>} */
 async function approve(rest) {
-  const { id, paths } = answerTarget(rest);
+  const { id, paths } = await answerTarget(rest);
   writeFileAtomic(paths.answerFile(id), JSON.stringify({ decision: 'allow' }));
   out(`approved ${id}`);
 }
 
 /** @param {string[]} rest @returns {Promise<void>} */
 async function deny(rest) {
-  const { id, reason, paths } = answerTarget(rest);
+  const { id, reason, paths } = await answerTarget(rest);
   writeFileAtomic(paths.answerFile(id), JSON.stringify({ decision: 'deny', reason }));
   out(`denied ${id}`);
 }

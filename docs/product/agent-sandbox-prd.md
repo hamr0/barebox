@@ -374,9 +374,9 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 2. **The file checkpoint**:
    - `<runtime>/asks/<id>.json` is written when a request parks, and `<runtime>/answers/<id>.json` is read once, then renamed away.
    - A stale or late answer is ignored and logged, as in fwdloop.
-   - An `ASK OPEN <id>` line goes to stderr, so a human watching a terminal knows.
+   - An `ask <id> <agent> <method> <url> rule=<rule>` line goes to stdout (`{"ev":"ask",...}` with `--json`), so a human watching a terminal knows.
    - The control socket and its server are deleted.
-3. **A decision-ready ask payload**: `id`, `agent`, `method`, `url`, `rule` (`payment`, `card-in-body`, `x:unlabelled-POST`), `letter`, a redacted body preview, `waitingSec`, `expiresAt`. barebox knows the request, not the intent; the caller adds its own context (step, goal).
+3. **A decision-ready ask payload**: `id`, `agent`, `method`, `url`, `rule` (`payment`, `card-in-body`, `x:unlabelled-POST`), `letter`, a body preview (redaction lands in M3, see item 6), `waitingSec`, `expiresAt`. barebox knows the request, not the intent; the caller adds its own context (step, goal).
 4. **`run({ proj, command, mode, gate, onAsk })`** → `{ exit, asks, audit }` (plus `diff` once M4 exists). It wraps `createProxy`, `addAgent` and `launch`, which stay public as the low-level parts.
 5. **`sbx run [--mode ask|auto|trust] [--json] -- <cmd>`**. With `--json`, stdout carries JSON lines (`{"ev":"ask",...}`, `{"ev":"done","exit":N}`), and the exit code mirrors the agent's.
 6. **Audit lines in bareguard's shape** (see Decisions, "Audit"), so M3 shares the file without a migration. STATUS (Oct 27): the bareguard line shape is DEFERRED to M3 — the current log is barebox's own JSONL. Body-preview redaction is NOT DONE either: the preview is verbatim up to `ASK_BODY_LIMIT` (see `holds.js`), redaction waits for M3's bareguard `secrets`.

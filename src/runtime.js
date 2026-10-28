@@ -99,10 +99,58 @@ function pidOf(owner) {
   }
 }
 
+/** @param {unknown} pid @returns {boolean} true when a process with that pid is alive */
+function isPidAlive(pid) {
+  if (typeof pid !== 'number') return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return /** @type {{code?: string}} */ (e)?.code === 'EPERM';
+  }
+}
+
 /** @param {string} runtime runtime dir @param {unknown} pid the holder @returns {Error} the one in-use error */
 function inUseError(runtime, pid) {
   return new Error(
     `runtime ${runtime} is in use by pid ${String(pid)} (one proxy per runtime: use another SBX_RUNTIME, or leave it unset for a fresh one)`);
+}
+
+/**
+ * The abstract-socket name of a runtime's claim lock. Hashes the real path,
+ * device and inode, so a symlinked path finds the same lock and a recreated
+ * dir gets a new one.
+ *
+ * @param {string} runtime runtime dir
+ * @returns {string} the abstract socket name
+ */
+export function lockName(runtime) {
+  const real = fs.realpathSync(runtime);
+  const st = fs.statSync(real);
+  return '\0barebox-' + crypto.createHash('sha256')
+    .update(`${real}\0${st.dev}\0${st.ino}`).digest('hex').slice(0, 32);
+}
+
+/**
+ * True when a live proxy owns the runtime: something answers on its lock.
+ * Never binds, so it can never steal the claim from a proxy that's starting.
+ * A runtime that doesn't exist is not live.
+ *
+ * @param {string} runtime runtime dir
+ * @returns {Promise<boolean>} whether the lock connects
+ */
+export function runtimeLive(runtime) {
+  let name;
+  try {
+    name = lockName(runtime);
+  } catch {
+    return Promise.resolve(false);
+  }
+  return new Promise((resolve) => {
+    const sock = net.connect(name);
+    sock.on('connect', () => { sock.destroy(); resolve(true); });
+    sock.on('error', () => resolve(false));
+  });
 }
 
 /**
@@ -119,20 +167,20 @@ function inUseError(runtime, pid) {
  * the in-use message.
  *
  * @param {string} runtime runtime dir to claim
- * @returns {() => void} `release()`: unlinks the owner file only when it holds our pid, then closes the lock; idempotent
+ * @returns {() => void} `release()`: unlinks the owner file only when it holds our pid, then closes the lock; idempotent per claim
  */
 export function claimRuntime(runtime) {
   fs.mkdirSync(runtime, { recursive: true });
   const real = fs.realpathSync(runtime);
-  const st = fs.statSync(real);
   const owner = runtimePaths(real).owner;
-  const name = '\0barebox-' + crypto.createHash('sha256')
-    .update(`${real}\0${st.dev}\0${st.ino}`).digest('hex').slice(0, 32);
+  const name = lockName(runtime);
   const server = net.createServer((c) => c.destroy());
   server.on('error', () => {});
   server.listen(name);
   if (!server.listening) {
-    throw inUseError(runtime, pidOf(owner));
+    const pid = pidOf(owner);
+    if (isPidAlive(pid)) throw inUseError(runtime, pid);
+    throw new Error(`runtime ${runtime} could not be locked: no live owner is recorded (another proxy may be starting, or this process cannot bind unix sockets)`);
   }
   server.unref();
   const tmp = `${owner}.tmp-${crypto.randomBytes(8).toString('hex')}`;
@@ -145,7 +193,10 @@ export function claimRuntime(runtime) {
   } finally {
     try { fs.unlinkSync(tmp); } catch {}
   }
+  let released = false;
   return () => {
+    if (released) return;
+    released = true;
     if (pidOf(owner) === process.pid) {
       try { fs.unlinkSync(owner); } catch {}
     }

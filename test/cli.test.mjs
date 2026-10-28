@@ -13,6 +13,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { createProxy } from '../src/proxy.js';
+import { claimRuntime } from '../src/runtime.js';
 import { writeFileAtomic } from '../src/holds.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
@@ -146,6 +147,7 @@ describe('sbx approve/deny id validation + pending sanitizing (no sandbox needed
     // Body previews and URLs print raw to the approver's terminal: an
     // agent-controlled ESC could rewrite the line before approval.
     const rt = mkdtempSync(join(tmpdir(), 'bb-esc-'));
+    const release = claimRuntime(rt);
     try {
       mkdirSync(join(rt, 'asks'), { recursive: true });
       writeFileSync(join(rt, 'asks', 'h1.json'), JSON.stringify({
@@ -161,6 +163,29 @@ describe('sbx approve/deny id validation + pending sanitizing (no sandbox needed
       // The OSC sequence (`ESC ] 0 ; pwned BEL`) is consumed whole — only
       // the printable text around it remains.
       assert.match(r.stdout, /m=done/, 'printable content survives');
+    } finally {
+      release();
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
+  it('pending and approve refuse stale asks with no live proxy', async () => {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-stale-'));
+    try {
+      mkdirSync(join(rt, 'asks'), { recursive: true });
+      writeFileSync(join(rt, 'asks', 'h1.json'), JSON.stringify({
+        id: 'h1', agent: 'agent', method: 'POST',
+        url: 'http://x/hold', rule: 'r', bodyPreview: 'b',
+      }));
+      const pErr = await sbxCli(['pending'], { SBX_RUNTIME: rt }).then(() => null, (e) => e);
+      assert.ok(pErr, 'pending must fail with no live proxy');
+      assert.equal(pErr.code, 1);
+      assert.match(pErr.stderr, /no live proxy/);
+      const aErr = await sbxCli(['approve', 'h1'], { SBX_RUNTIME: rt }).then(() => null, (e) => e);
+      assert.ok(aErr, 'approve must fail with no live proxy');
+      assert.equal(aErr.code, 1);
+      assert.match(aErr.stderr, /no live proxy/);
+      assert.ok(!existsSync(join(rt, 'answers', 'h1.json')), 'no answer file written');
     } finally {
       rmSync(rt, { recursive: true, force: true });
     }
