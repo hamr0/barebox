@@ -200,7 +200,7 @@ end_of_run:
 
 - **Writes over sockets escape the overlay.** A local Postgres or Docker daemon isn't a file. Treat localhost sockets as x, or block them.
 - **Commit conflicts** if you edited the same files while the agent ran → needs a 3-way merge.
-- **Held requests can time out** on the server side if you approve slowly. Holding happens *before* forwarding, so only the agent's client waits; set a long client timeout.
+- **Held requests can time out** on the server side if you approve slowly. Holding happens *before* forwarding, so only the agent's client waits; set a long client timeout. The deadline counts from arrival, and each agent has one held request at a time: later ones wait in line (16 at most, then `429 hold queue full`).
 - **Certificate pinning** breaks inspection for some clients (rare for CLIs, common for mobile apps).
 - **Linux only.** macOS has no overlayfs or Landlock.
 

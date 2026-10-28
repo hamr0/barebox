@@ -76,7 +76,7 @@ The agent works in your house:
 - **Identity** is the socket, not a header the agent could fake. One socket per agent, all into one proxy.
 - **HTTPS inspection** uses a local CA that exists only inside the sandbox; the proxy reads method, URL, headers and body, then forwards.
 - **The doorman's x-rules**, strongest first: card numbers in the body (Luhn) → payment domains and paths (`/checkout`, `/payment`, …) → rwxmap labels for known APIs → unknown `POST` by mode (strict: ask once per domain; normal: allow and log).
-- **Approvals** come from a second terminal (`sbx pending`, `sbx approve <id>`, `sbx deny <id>`). Timeout means deny, with a clear `403` reason.
+- **Approvals** come from a second terminal (`sbx pending`, `sbx approve <id>`, `sbx deny <id>`). Timeout means deny, with a clear `403` reason. One held request per agent at a time: later ones wait in line (16 at most, then `429 hold queue full`), and the deadline counts from arrival.
 
 ## Numbers
 

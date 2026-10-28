@@ -117,7 +117,7 @@ The product stands or falls on three things, all on Linux.
 | # | Capability | Proof |
 |---|---|---|
 | a | The proxy is the only way out, fails closed, and can read inside HTTPS. | A request that skips the proxy fails. A request through it is visible in full (method, URL, headers, body) for curl, node, python requests, git over https. |
-| b | The proxy holds one x request for human approval while the agent keeps working. | One request parked; other requests from the same agent complete meanwhile; approve forwards it, deny or timeout returns a clear 403. |
+| b | The proxy holds one x request for human approval while the agent keeps working. | One request parked; other requests from the same agent complete meanwhile; approve forwards it, deny or timeout returns a clear 403. Since the hold-queue change each agent has one held request at a time: later ones wait unread in line (max 16, then `429 hold queue full`), and the deadline counts from arrival. |
 | c | Per-agent memory and the shared proxy stay within the memory targets. | Measured with 20 concurrent sandboxes (see Memory targets). |
 
 M0, M1 and M2 are the go/no-go modules. If any of a, b or c fails, stop and take it back to this PRD as a spec change. M3 onward is not started until M0–M2 pass.
@@ -143,7 +143,7 @@ agent `sleep` excluded per the PRD walls-only definition).
 | Per-sandbox overhead (two bwrap processes + socat each) | mean 7.8 MB, max 7.9 MB (range 7.7–7.9 across agents) | ≤ 10 MB each | PASS |
 | Proxy RSS idle | 60.1 MB | ≤ 80 MB | PASS |
 | Proxy RSS after minting 10 certs | 69.4 MB | ≤ 80 MB | PASS |
-| Proxy RSS with 20 parked holds | 71.9 MB | ≤ 80 MB | PASS |
+| Proxy RSS with 20 agents × (1 parked + 16 waiting) | 77.9 MB (re-measured 2026-10-28 on the hold-queue code; was 71.9 MB with 20 single parked holds) | ≤ 80 MB | PASS |
 
 This supersedes the M0/M1 POC proxy figures (52.1 MB bare, 59.9–63.1 MB with TLS) for the
 rewritten code. Start timing remains unmeasured on the rewrite (TODO re-measure).
@@ -397,7 +397,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Goal | Every request gets a letter and a decision through a gate; the mode decides what each letter does; every decision is in the one audit log. |
 | We use | bareguard (dependency: `Gate`, rwx, `isPrivateIp`, `secrets` redaction, audit). rwxmap output as bareguard rwx config. |
 | We build | See the list below. |
-| Riskiest assumption | **Proxy memory with bareguard loaded stays ≤ 80 MB.** The rewrite bench measured 71.9 MB with 20 parked holds, so the headroom is about 8 MB. Second: the "x asks" behaviour (see Suite friction). |
+| Riskiest assumption | **Proxy memory with bareguard loaded stays ≤ 80 MB.** The bench measures 77.9 MB with 20 agents × (1 parked + 16 waiting), so the headroom is about 2 MB (the global held-body cap is deferred to M3). Second: the "x asks" behaviour (see Suite friction). |
 | Done when | See the list below. |
 | Estimate | 1–1.5 days. |
 
@@ -525,7 +525,7 @@ None of these block M0. Nothing here is silently assumed.
 
 | # | Question | Decides |
 |---|---|---|
-| 1 | What is the real proxy memory with bareguard loaded? Measured so far: TLS + on-demand certs + 20 holds = 71.9 MB (rewrite bench, Oct 27). bareguard still unmeasured; about 8 MB of headroom. | The ≤ 80 MB target. Measured first in M3. |
+| 1 | What is the real proxy memory with bareguard loaded? Measured so far: TLS + on-demand certs + 20 agents × (1 parked + 16 waiting) = 77.9 MB (bench, Oct 28; 71.9 MB with 20 single holds on Oct 27). bareguard still unmeasured; about 2 MB of headroom. | The ≤ 80 MB target. Measured first in M3. |
 | 2 | ~~`node-forge` or shelling out to `openssl` for certificates?~~ Decided Oct 26: `openssl` subprocess (sandbox keeps proxy RSS clean; platform coupling accepted, see M1). | — |
 | 3 | How should the undo layer handle large untracked dirs (`node_modules`) and build output? | M4 design. |
 | 4 | Localhost sockets (Postgres, Docker daemon) are writes the overlay can't see. Decided Oct 26 for M0: block. | M3 revisits only if a demo needs a local DB. |
