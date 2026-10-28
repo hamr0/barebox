@@ -215,7 +215,7 @@ export function normalizeDecision(input, { approveAlias = false } = {}) {
  * @param {string|null} [opts.runtime] runtime dir; required for the default file checkpoint (writes `asks/`, polls `answers/`)
  * @param {OnAsk|null} [opts.onAsk] ask seam (bareguard `humanChannel` shape); when present no files are involved
  * @param {number} [opts.pollMs] answer poll interval in ms for the default file checkpoint (default 250, PRD Q9)
- * @param {OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle or abandon or abandon
+ * @param {OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle or abandon
  * @param {(entry: object) => void} opts.onApprove forward the parked request upstream
  * @param {(entry: object, reason: string) => void} opts.onDeny refuse the parked request
  * @returns {{ add: (entry: object) => string, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle

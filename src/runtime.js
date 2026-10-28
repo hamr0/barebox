@@ -145,44 +145,82 @@ function createOwner(owner, claim) {
   }
 }
 
+/** @param {{pid?: unknown, start?: unknown}|null} claim a parsed claim @returns {boolean} true when its holder is still the same live process */
+function isLive(claim) {
+  const pid = claim?.pid;
+  return typeof pid === 'number' && claim?.start !== undefined
+    && procStart(pid) !== null && procStart(pid) === claim.start;
+}
+
+/** @param {string} owner owner file path @returns {string|null} the raw bytes, or null when absent */
+function readRaw(owner) {
+  try {
+    return fs.readFileSync(owner, 'utf8');
+  } catch (e) {
+    if (/** @type {NodeJS.ErrnoException} */ (e).code === 'ENOENT') return null;
+    throw e;
+  }
+}
+
+/** @param {string} raw owner bytes @returns {unknown} the claim's pid, or 'unknown' */
+function pidOf(raw) {
+  try {
+    return JSON.parse(raw)?.pid ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 /**
- * Take over an owner file judged stale. Renames it away, then checks what
- * was really moved: if another starter won the takeover first, the file is
- * its fresh claim, which goes back and we refuse. Exported for tests, the
- * way `changedSince` is exported from `overlay.js`.
+ * Replace an owner file judged stale, without ever removing it. One marker
+ * `owner.takeover-<id>` (id = hash of the exact stale bytes) is taken
+ * exclusively; its unique holder re-reads `owner` and, only if it still
+ * holds those bytes, atomically renames our claim over it. Safe because the
+ * only writer that replaces content S is the holder of marker-S, and a live
+ * claim is never judged stale, so it has no taker. `owner` is never absent
+ * during a takeover, so a fresh starter's `createOwner` always collides.
+ * A marker whose holder died fails closed: removing it would reopen the
+ * race. Exported for tests, the way `changedSince` is in `overlay.js`.
  *
  * @param {string} runtime runtime dir
- * @param {{pid?: unknown, start?: unknown}|null} judged the claim judged stale (null: unreadable)
+ * @param {string} judgedRaw the exact owner bytes judged stale (may be empty)
  * @param {unknown} mine our claim
  * @returns {void} throws "in use by pid N" when someone else holds the runtime
  */
-export function takeOverStale(runtime, judged, mine) {
+export function takeOverStale(runtime, judgedRaw, mine) {
   const owner = runtimePaths(runtime).owner;
-  const stale = `${owner}.stale-${crypto.randomBytes(8).toString('hex')}`;
-  let moved = false;
+  const id = crypto.createHash('sha256').update(judgedRaw).digest('hex').slice(0, 16);
+  const marker = `${owner}.takeover-${id}`;
   try {
-    fs.renameSync(owner, stale);
-    moved = true;
-  } catch (e) {
-    if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'ENOENT') throw e;
-    // Already gone: another takeover won; the link below decides.
-  }
-  if (moved) {
-    const got = readClaim(stale);
-    const same = got && judged ? got.pid === judged.pid && got.start === judged.start : !got && !judged;
-    if (!same) {
-      // A fresh claim, not the stale one: put it back (fails if a third landed).
-      try { fs.linkSync(stale, owner); } catch {}
-      try { fs.unlinkSync(stale); } catch {}
-      throw inUseError(runtime, got?.pid ?? 'unknown');
-    }
-    try { fs.unlinkSync(stale); } catch {}
-  }
-  try {
-    createOwner(owner, mine);
+    createOwner(marker, mine);
   } catch (e) {
     if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EEXIST') throw e;
-    throw inUseError(runtime, readClaim(owner)?.pid ?? 'unknown');
+    const holder = readClaim(marker);
+    if (isLive(holder)) throw inUseError(runtime, holder?.pid);
+    throw new Error(`stale takeover marker ${marker} (pid ${String(holder?.pid ?? 'unknown')} is gone): delete it to reuse this runtime`);
+  }
+  try {
+    const cur = readRaw(owner);
+    if (cur === judgedRaw) {
+      const tmp = `${owner}.tmp-${crypto.randomBytes(8).toString('hex')}`;
+      try {
+        fs.writeFileSync(tmp, JSON.stringify(mine), { flag: 'wx', mode: 0o600 });
+        fs.renameSync(tmp, owner);
+      } finally {
+        try { fs.unlinkSync(tmp); } catch {}
+      }
+    } else if (cur === null) {
+      try {
+        createOwner(owner, mine);
+      } catch (e) {
+        if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EEXIST') throw e;
+        throw inUseError(runtime, pidOf(readRaw(owner) ?? ''));
+      }
+    } else {
+      throw inUseError(runtime, pidOf(cur));
+    }
+  } finally {
+    try { fs.unlinkSync(marker); } catch {}
   }
 }
 
@@ -190,7 +228,8 @@ export function takeOverStale(runtime, judged, mine) {
  * Claim one runtime for one live proxy: the single enforcer of "one proxy
  * owns a runtime". The owner file holds `{"pid","start"}` 0600; pid plus
  * start time survives pid reuse, and a second proxy in the same process is
- * refused like any other second owner.
+ * refused like any other second owner. A stale owner is replaced by
+ * `takeOverStale`, never removed.
  *
  * @param {string} runtime runtime dir to claim
  * @returns {() => void} `release()`: deletes the owner file only when it still holds our pid and start time, so another process's claim is never removed; idempotent
@@ -203,13 +242,11 @@ export function claimRuntime(runtime) {
     createOwner(owner, mine);
   } catch (e) {
     if (/** @type {NodeJS.ErrnoException} */ (e).code !== 'EEXIST') throw e;
-    const cur = readClaim(owner);
-    const pid = cur?.pid;
-    if (typeof pid === 'number' && cur?.start !== undefined
-      && procStart(pid) !== null && procStart(pid) === cur.start) {
-      throw inUseError(runtime, pid);
-    }
-    takeOverStale(runtime, cur, mine);
+    const raw = readRaw(owner) ?? '';
+    let cur = null;
+    try { cur = JSON.parse(raw); } catch {}
+    if (isLive(cur)) throw inUseError(runtime, cur.pid);
+    takeOverStale(runtime, raw, mine);
   }
   return () => {
     const cur = readClaim(owner);

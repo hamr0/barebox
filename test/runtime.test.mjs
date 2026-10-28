@@ -2,6 +2,8 @@
 // no sockets — owner files and /proc only).
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { mkdtempSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -113,30 +115,130 @@ describe('claimRuntime: startup races', () => {
     }
   });
 
-  it('a failed write leaves no owner behind (created via link, never partial)', () => {
-    const rt = mkdtempSync(join(root, 'rt-'));
-    writeFileSync(runtimePaths(rt).owner, JSON.stringify({ pid: 2 ** 22 + 7, start: '1' }));
-    const stale = JSON.parse(readFileSync(runtimePaths(rt).owner, 'utf8'));
-    assert.throws(() => takeOverStale(rt, stale, { pid: 1n }), TypeError);
-    assert.deepEqual(readdirSync(rt), [], 'no owner, no temp file');
+  const DEAD = JSON.stringify({ pid: 2 ** 22 + 7, start: '1' });
+  const markerOf = (rt, raw) => `${runtimePaths(rt).owner}.takeover-${crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16)}`;
+
+  it('a third starter at every step of a takeover never gets the runtime', () => {
+    const names = ['renameSync', 'linkSync', 'unlinkSync', 'writeFileSync'];
+    const orig = Object.fromEntries(names.map((n) => [n, fs[n]]));
+    const run = (inject) => {
+      const rt = mkdtempSync(join(root, 'rt-'));
+      const a = liveClaim();
+      writeFileSync(runtimePaths(rt).owner, JSON.stringify(a));
+      const aBytes = readFileSync(runtimePaths(rt).owner, 'utf8');
+      let calls = 0;
+      let inside = false;
+      let cErr = null;
+      for (const n of names) {
+        fs[n] = (...args) => {
+          if (!inside) {
+            calls++;
+            if (calls === inject) {
+              inside = true;
+              try { claimRuntime(rt); } catch (e) { cErr = e; } finally { inside = false; }
+            }
+          }
+          return orig[n](...args);
+        };
+      }
+      let bErr = null;
+      try {
+        takeOverStale(rt, DEAD, { pid: 424242, start: '9' });
+      } catch (e) {
+        bErr = e;
+      } finally {
+        for (const n of names) fs[n] = orig[n];
+      }
+      return { calls, cErr, bErr, owner: readFileSync(runtimePaths(rt).owner, 'utf8'), aBytes };
+    };
+    const N = run(0).calls;
+    assert.ok(N >= 1);
+    for (let n = 1; n <= N; n++) {
+      const r = run(n);
+      assert.match(String(r.cErr?.message), /in use/, `C refused at call ${n}`);
+      assert.match(String(r.bErr?.message), /in use/, `B refused at call ${n}`);
+      assert.equal(r.owner, r.aBytes, `A's claim intact at call ${n}`);
+    }
   });
 
-  it('takeover refuses a fresh claim another starter just won, and puts it back', () => {
+  it('a stale claim is replaced, never removed or renamed away', () => {
     const rt = mkdtempSync(join(root, 'rt-'));
-    const judged = { pid: 2 ** 22 + 7, start: '1' }; // what we judged stale
+    const owner = runtimePaths(rt).owner;
+    writeFileSync(owner, DEAD);
+    const seen = [];
+    const { unlinkSync, renameSync } = fs;
+    fs.unlinkSync = (p) => { if (p === owner) seen.push('unlink'); return unlinkSync(p); };
+    fs.renameSync = (from, to) => { if (from === owner) seen.push('rename'); return renameSync(from, to); };
+    let release;
+    try {
+      release = claimRuntime(rt);
+    } finally {
+      fs.unlinkSync = unlinkSync;
+      fs.renameSync = renameSync;
+    }
+    try {
+      assert.deepEqual(seen, []);
+      assert.equal(JSON.parse(readFileSync(owner, 'utf8')).pid, process.pid);
+    } finally {
+      release();
+    }
+  });
+
+  it('a dead takeover marker fails closed and is left untouched', () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    writeFileSync(runtimePaths(rt).owner, DEAD);
+    const marker = markerOf(rt, DEAD);
+    const dead = JSON.stringify({ pid: 2 ** 22 + 9, start: '1' });
+    writeFileSync(marker, dead);
+    assert.throws(() => claimRuntime(rt), (e) => e.message.includes(marker) && /is gone/.test(e.message));
+    assert.equal(readFileSync(marker, 'utf8'), dead);
+    assert.equal(readFileSync(runtimePaths(rt).owner, 'utf8'), DEAD);
+  });
+
+  it('a live takeover marker means in use', () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    writeFileSync(runtimePaths(rt).owner, DEAD);
+    writeFileSync(markerOf(rt, DEAD), JSON.stringify(liveClaim()));
+    assert.throws(() => claimRuntime(rt), new RegExp(`in use by pid ${process.pid}`));
+  });
+
+  it('a successful takeover leaves no marker and no temp file', () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    writeFileSync(runtimePaths(rt).owner, DEAD);
+    const release = claimRuntime(rt);
+    try {
+      assert.deepEqual(readdirSync(rt), ['owner']);
+    } finally {
+      release();
+    }
+  });
+
+  it('a failed write leaves the stale owner in place and nothing else', () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    writeFileSync(runtimePaths(rt).owner, DEAD);
+    assert.throws(() => takeOverStale(rt, DEAD, { pid: 1n }), TypeError);
+    assert.deepEqual(readdirSync(rt), ['owner'], 'no marker, no temp file');
+    assert.equal(readFileSync(runtimePaths(rt).owner, 'utf8'), DEAD);
+  });
+
+  it('takeover refuses a fresh claim another starter just won and leaves it in place', () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
     const fresh = liveClaim(); // what is on disk now: a live winner
     writeFileSync(runtimePaths(rt).owner, JSON.stringify(fresh));
-    assert.throws(() => takeOverStale(rt, judged, { pid: 424242, start: '9' }),
+    assert.throws(() => takeOverStale(rt, DEAD, { pid: 424242, start: '9' }),
       new RegExp(`in use by pid ${process.pid}`));
     assert.deepEqual(JSON.parse(readFileSync(runtimePaths(rt).owner, 'utf8')), fresh);
-    assert.deepEqual(readdirSync(rt), ['owner'], 'no stale file left');
+    assert.deepEqual(readdirSync(rt), ['owner'], 'no marker left');
   });
 
-  it('takeover of the claim it judged stale succeeds, garbage included', () => {
-    const rt = mkdtempSync(join(root, 'rt-'));
-    writeFileSync(runtimePaths(rt).owner, '');
-    const mine = liveClaim();
-    takeOverStale(rt, null, mine);
-    assert.deepEqual(JSON.parse(readFileSync(runtimePaths(rt).owner, 'utf8')), mine);
+  it('takeover of the claim it judged stale succeeds, garbage and empty included', () => {
+    for (const raw of ['', 'not json{', DEAD]) {
+      const rt = mkdtempSync(join(root, 'rt-'));
+      writeFileSync(runtimePaths(rt).owner, raw);
+      const mine = liveClaim();
+      takeOverStale(rt, raw, mine);
+      assert.deepEqual(JSON.parse(readFileSync(runtimePaths(rt).owner, 'utf8')), mine);
+      assert.deepEqual(readdirSync(rt), ['owner']);
+    }
   });
 });
