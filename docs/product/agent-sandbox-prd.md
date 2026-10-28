@@ -242,6 +242,7 @@ Notes: in `nonet` mode all file walls stayed green — only the network leaked, 
 - Mounting the proxy socket needs a tmpfs over its target dir.
 - The bwrap root needs a `/lib64 -> usr/lib64` symlink or every dynamic binary fails with `No such file or directory` (the ELF interpreter path). Proven by red/green minimal repro in the M0 run.
 - Each sandbox holds 2 bwrap processes (supervisor + ns child) plus socat; count RSS per-PID-tree, and never `pgrep -f` the bridge string (bwrap parents match their own command line).
+- Ubuntu's apt ships bubblewrap 0.9.0, which lacks the overlay options. `ci.yml` and `publish.yml` build 0.12.0 from a sha256-pinned source tarball into `/usr`, and both fail the run when the suite reports any skipped test (a skip is not a pass).
 
 ## 5. Decisions
 
@@ -431,7 +432,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | | |
 |---|---|
 | Goal | Every file write is reviewable and reversible. |
-| We use | bwrap overlay. |
+| We use | bwrap overlay (`--overlay-src` / `--overlay`, bubblewrap >= 0.11.0; an older bwrap is refused with a clear message, runs without the overlay still work). |
 | We build | An overlay upper per run. `sbx diff`, `sbx commit`, `sbx rollback`. Handling of deletions (overlay whiteouts). Detection of files the user changed meanwhile: on conflict, refuse or flag. |
 | Riskiest assumption | Commit applies the upper layer to the real folder correctly, including deletions and files changed meanwhile. |
 | Done when | A run that edits, creates and deletes files commits to the correct result. Rollback leaves the folder as it was. A file changed by the user mid-run is flagged, not overwritten. |
