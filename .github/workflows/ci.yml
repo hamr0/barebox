@@ -18,7 +18,7 @@ jobs:
           curl -sSfL -o /tmp/bwrap.tar.xz https://github.com/containers/bubblewrap/releases/download/v0.12.0/bubblewrap-0.12.0.tar.xz
           echo "9760d007363e3abba7c747489910f9f82d9fca53ba3bd3282e396fa3c97a3314  /tmp/bwrap.tar.xz" | sha256sum -c -
           tar -xJf /tmp/bwrap.tar.xz -C /tmp
-          meson setup /tmp/bwrap-build /tmp/bubblewrap-0.12.0 --prefix=/usr/local -Dman=disabled -Dtests=false -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled
+          meson setup /tmp/bwrap-build /tmp/bubblewrap-0.12.0 --prefix=/usr -Dman=disabled -Dtests=false -Dselinux=disabled -Dbash_completion=disabled -Dzsh_completion=disabled
           ninja -C /tmp/bwrap-build
           sudo ninja -C /tmp/bwrap-build install
           bwrap --version
@@ -27,4 +27,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run build:types
       - run: npm run check:primitives
-      - run: npm test
+      - name: Test (a skipped test fails CI — a skip is not a pass)
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee /tmp/test.log
+          grep -qx '# skipped 0' /tmp/test.log || { echo "::error::tests were skipped; a skip is not a pass"; grep '# SKIP' /tmp/test.log; exit 1; }
