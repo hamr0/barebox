@@ -156,7 +156,6 @@ export function createProxy(opts) {
     releaseClaim();
     throw new Error(`createProxy: cannot open logFile ${logFile}: ${msg}`);
   }
-  // `null` path: the open `fd` is the file; the cast keeps `tsc` quiet.
   const logStream = fs.createWriteStream(logFile, { fd: logFd });
   // `openSync`'s mode is masked by the umask and doesn't apply to an
   // existing file: a 0644 log from an older run would stay world-readable
@@ -168,7 +167,12 @@ export function createProxy(opts) {
     logFailed = true;
     console.error(`sbx: audit log ${logFile} write failed: ${e instanceof Error ? e.message : String(e)}`);
   });
-  const log = (o) => { logStream.write(JSON.stringify(redact(scrubSecrets(o))) + '\n'); };
+  // After close() ends the stream a late line (a socket torn down by close)
+  // is dropped on purpose: a write after end() would destroy the stream.
+  const log = (o) => {
+    if (logStream.writableEnded) return;
+    logStream.write(JSON.stringify(redact(scrubSecrets(o))) + '\n');
+  };
   let trust = null;
   if (upstreamCa) {
     let extra;
@@ -408,20 +412,39 @@ export function createProxy(opts) {
         headers: { ...creq.headers }, stream: creq, cres });
       return;
     }
-    creq.on('data', (c) => {
-      size += c.length;
-      if (size > holdMaxBody) { over = true; return; }
-      chunks.push(c);
+    // One held request per agent reads its body at a time; the rest wait
+    // unread in line. No body listener (it would resume the stream) until
+    // `onReady`. A request that never parks frees its slot when `cres` closes.
+    creq.pause();
+    const readHeld = () => {
+      creq.on('data', (c) => {
+        size += c.length;
+        if (size > holdMaxBody) { over = true; return; }
+        chunks.push(c);
+      });
+      creq.on('error', () => { denyRes(cres, 502, 'client body failed'); });
+      creq.on('end', () => {
+        if (over) { denyRes(cres, 403, 'body too large to hold'); return; }
+        const body = finishLog();
+        // Parked: the tunnel stays open until the ask channel decides. The
+        // hold reason travels as `note` so the ask file carries its `rule`.
+        queue.add({ agent, method, url: urlStr,
+          headers: { ...creq.headers }, body, sock, cres, note: reason,
+          slot, arrivedAt: slot.arrivedAt });
+      });
+      creq.resume();
+    };
+    const slot = queue.reserve(agent, {
+      onReady: readHeld,
+      onExpire: (why) => { denyRes(cres, 403, `denied: ${why}`); creq.resume(); },
     });
-    creq.on('error', () => denyRes(cres, 502, 'client body failed'));
-    creq.on('end', () => {
-      if (over) { denyRes(cres, 403, 'body too large to hold'); return; }
-      const body = finishLog();
-      // Parked: the tunnel stays open until the ask channel decides. The
-      // hold reason travels as `note` so the ask file carries its `rule`.
-      queue.add({ agent, method, url: urlStr,
-        headers: { ...creq.headers }, body, sock, cres, note: reason });
-    });
+    if (slot.state === 'full') {
+      denyRes(cres, 429, 'hold queue full');
+      creq.resume();
+      return;
+    }
+    cres.on('close', () => slot.cancel());
+    if (slot.state === 'now') readHeld();
   }
   // Idle tunnels die here; a request in flight is never idle by definition.
   server.keepAliveTimeout = clientIdleMs;
@@ -572,8 +595,12 @@ export function createProxy(opts) {
     logStream.end();
     /** @type {Promise<void>} */
     const flushed = new Promise((resolve) => {
-      if (logStream.writableFinished) resolve();
-      else logStream.once('finish', () => resolve());
+      if (logStream.writableFinished || logStream.destroyed) resolve();
+      else {
+        // A destroyed stream emits 'close', never 'finish'.
+        logStream.once('finish', () => resolve());
+        logStream.once('close', () => resolve());
+      }
     });
     await flushed;
     releaseClaim();
