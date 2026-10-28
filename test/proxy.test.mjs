@@ -1209,22 +1209,63 @@ describe('holds', () => {
         rest: (more) => s.write(more) };
     }
 
-    it('a waiter expires in line while the holder is still reading its body', { skip: NEED_UNIX, timeout: 20000 }, async () => {
-      await holdProxy({ timeoutMs: 400 });
+    it('a dripping holder expires at its deadline and frees the slot', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy({ timeoutMs: 600 });
+      let drip = null;
       try {
         const fa = hp.addAgent('fa');
-        // Holder: slot taken, body never completes, so it never parks and has no deadline.
-        const holder = await partialPost(fa, 'SLOW0', 100, 'm=SLOW0');
-        await nap(100);
-        const w = await post(fa, 'EXP1');
-        const out = await Promise.race([w.res, w.closed, nap(3000).then(() => ({ status: 'timeout' }))]);
-        const dt = Date.now() - w.t0;
-        assert.equal(out.status, 403);
-        assert.match(out.body, /hold timeout/);
-        assert.ok(dt >= 300 && dt < 700, `expired at arrival + deadline (took ${dt} ms)`);
-        assert.equal(hp.pending().length, 0, 'holder never parked');
-        assert.ok(!/m=EXP1/.test(hlog()), 'waiter body never read');
-        holder.s.destroy();
+        const t0 = Date.now();
+        const holder = await partialPost(fa, 'DRIP0', 100, 'd');
+        let sent = 1;
+        drip = setInterval(() => { if (sent < 100) { sent++; holder.rest('d'); } }, 100);
+        // The client is still dripping when the proxy answers and closes, so
+        // under load the kernel may deliver an RST before curl-like reads the 403.
+        const out = await Promise.race([holder.res.catch(() => ({ status: 'reset' })), holder.closed,
+          nap(3000).then(() => ({ status: 'timeout' }))]);
+        const dt = Date.now() - t0;
+        assert.ok(out.status === 403 || out.status === 'reset' || out.status === 'closed', `got ${out.status}`);
+        if (out.status === 403) assert.match(out.body, /hold timeout/);
+        assert.ok(dt >= 500 && dt < 1000, `expired at arrival + deadline (took ${dt} ms)`);
+        await waitHlog(/"note":"denied: hold timeout"/, 'the 403 hold-timeout to be logged');
+        const fresh = await post(fa, 'FRESH1');
+        await waitFor(() => pendingWith('FRESH1'), 'fresh request to park promptly', 1000);
+        // The dripper finishing late must not park a second request.
+        holder.rest('d'.repeat(100));
+        await nap(300);
+        assert.equal(hp.pending().length, 1, 'only the fresh request is parked');
+        assert.ok(pendingWith('FRESH1'));
+        fresh.s.destroy();
+      } finally { clearInterval(drip); await finish(); }
+    });
+
+    it('a client that dies during the DNS check does not leak the slot', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      // An IP literal skips the resolver, so use a name the stub resolves slowly.
+      const slow = async () => { await nap(200); return '127.0.0.1'; };
+      hp = createProxy({ port: 0,
+        logFile: join(HRT, 'mitm.log'), upstreamCa: CA, runtime: HRT,
+        clientIdleMs: 500,
+        unsafeTestOnly: { allowLoopback: true, resolveUpstream: slow },
+        hold: { match: '/hold', timeoutMs: 'never', pollMs: 25 } });
+      await hp.ready;
+      try {
+        const fa = hp.addAgent('fa');
+        const raw = async (marker) => {
+          const s = net.connect(fa);
+          socks.push(s);
+          s.on('error', () => {});
+          await once(s, 'connect');
+          s.write(`POST http://slow.test/hold HTTP/1.1\r\nHost: slow.test\r\nContent-Length: 8\r\nConnection: close\r\n\r\nm=${marker}`);
+          return s;
+        };
+        const dead = await raw('GONE00');
+        await nap(50);
+        dead.destroy();
+        await nap(500); // past the DNS await: reserve ran with the client already gone
+        const t0 = Date.now();
+        await raw('AFTER1');
+        await waitFor(() => pendingWith('AFTER1'), 'fresh request to park promptly', 1000);
+        assert.ok(Date.now() - t0 < 1500);
+        assert.equal(hp.pending().length, 1);
       } finally { await finish(); }
     });
 

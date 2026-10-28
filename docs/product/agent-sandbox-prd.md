@@ -407,7 +407,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 3. **`ask` / `auto` / `trust` as bareguard presets**, with the floor in every mode.
 4. **The `gate` option**: none means a preset; otherwise a passed bareguard `Gate` or any object with the same `check(action)` contract. Matched by shape.
 5. **Reuse instead of barebox's own copies**:
-   - bareguard's `isPrivateIp` replaces barebox's `denyReasonForIp`. bareguard's version already decodes the hex `::ffff:7f00:1` form that barebox's misses.
+   - barebox's `denyReasonForIp` already covers every embedded form: mapped (`::ffff:7f00:1`, `::ffff:127.0.0.1`), compat, uncompressed `0:0:0:0:0:0:0:1`, NAT64 `64:ff9b::/96` and 6to4 `2002::/16`, with public sites behind NAT64/6to4 still reachable. Adopt bareguard's `isPrivateIp` only once it covers NAT64, 6to4 and the uncompressed `::1` and is exported — see `docs/logs/bareguard-isprivateip-spike.md`.
    - bareguard's redaction replaces barebox's `SENSITIVE_HEADERS` scrub.
 
 **Done when:**
@@ -425,7 +425,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | F1 | bareguard | `rwx.askOn` accepts only `"none"` or `"loose"`. `auto` needs "x asks" and `ask` needs "w and x ask"; today a letter above the ceiling is **denied**, not asked. Proposal: `askOn` takes letters, e.g. `["x"]`. | M3 | to file |
 | F2 | rwxmap | Labels are keyed `<vendor>.<operationId>`, but the proxy sees `METHOD` + URL. Needs a matcher primitive: request → key + letter (OpenAPI path templates). barebox must not write its own matcher. | M3 | to file |
 | F3 | bareguard | barebox's transport lines (request, response status, wall denial) must land in the gate's audit file in its shape. Check in the POC whether `gate.record` covers this; if not, ask for an append API. | M2.5 / M3 | verify in POC |
-| F4 | bareguard | `isPrivateIp` coverage of NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) forms is unverified. If missing, fix it there; barebox imports it. | M3 | verify |
+| F4 | bareguard | `isPrivateIp` misses NAT64, 6to4 and the uncompressed `::1` (verified against 0.27.0; barebox's wall covers them). Adopt it once fixed and exported. | M3 | verified: misses 3 forms; see `docs/logs/bareguard-isprivateip-spike.md` |
 
 ### M4. Undo layer
 

@@ -223,7 +223,7 @@ export function normalizeDecision(input, { approveAlias = false } = {}) {
  * @param {OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle or abandon
  * @param {(entry: object) => void} opts.onApprove forward the parked request upstream
  * @param {(entry: object, reason: string) => void} opts.onDeny refuse the parked request
- * @returns {{ add: (entry: object) => string, reserve: (agent: string, cbs: { onReady: () => void, onExpire: (reason: string) => void }) => { state: 'now'|'queued'|'full', arrivedAt: number, cancel: () => void }, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
+ * @returns {{ add: (entry: object) => string|null, reserve: (agent: string, cbs: { onReady: () => void, onExpire: (reason: string) => void }) => { state: 'now'|'queued'|'full', arrivedAt: number, cancel: () => void }, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
  */
 export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   maxBody = 1048576, runtime = null, onAsk = null, pollMs = DEFAULT_POLL_MS,
@@ -285,17 +285,46 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   const queue = new Map();
   /**
    * One hold slot per agent: `holder` is the reservation holding it (or the
-   * parked entry's marker), `line` the FIFO of waiters still unread.
+   * parked entry's marker), `line` the FIFO of waiting reservation handles.
    *
-   * @type {Map<string, { holder: object|null, line: Array<{ handle: object, onReady: () => void, onExpire: (reason: string) => void, timer: object|null }> }>}
+   * @type {Map<string, { holder: object|null, line: Array<object> }>}
    */
   const slots = new Map();
-  /** Internal reserve state by returned handle identity. @type {WeakMap<object, { consumed: boolean, done: boolean }>} */
+  /** Internal reserve state by returned handle identity. @type {WeakMap<object, { agent: string, onReady: () => void, onExpire: (reason: string) => void, timer: ReturnType<typeof setTimeout>|null, consumed: boolean, done: boolean }>} */
   const handleState = new WeakMap();
 
   /**
-   * The single writer of slot state: drop the current holder and hand the
-   * slot to the next waiter in line, or forget the agent when nobody waits.
+   * The one expiry path for every reservation timer: mark it done, take it
+   * out of the line or hand its slot to the next waiter (whose own timer
+   * keeps running from its arrival), then expire it. Once.
+   *
+   * @param {string} agent agent name
+   * @param {object} handle the reservation's handle
+   * @param {string} reason expiry reason
+   * @returns {void}
+   */
+  function expireReservation(agent, handle, reason) {
+    const st = handleState.get(handle);
+    if (!st || st.done) return;
+    st.done = true;
+    st.timer = null;
+    const s = slots.get(agent);
+    if (s) {
+      if (s.holder === handle) {
+        releaseSlot(agent);
+      } else {
+        const i = s.line.indexOf(handle);
+        if (i >= 0) s.line.splice(i, 1);
+        if (!s.holder && s.line.length === 0) slots.delete(agent);
+      }
+    }
+    st.onExpire(reason);
+  }
+
+  /**
+   * Drop the current holder and hand the slot to the next waiter in line,
+   * or forget the agent when nobody waits. A promoted waiter keeps its own
+   * arrival timer: nothing here arms, clears or resets one.
    *
    * @param {string} agent agent name
    * @returns {void}
@@ -309,10 +338,9 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       slots.delete(agent);
       return;
     }
-    if (next.timer) clearTimeout(next.timer);
-    next.timer = null;
-    s.holder = next.handle;
-    next.onReady();
+    s.holder = next;
+    const hst = handleState.get(next);
+    if (hst) hst.onReady();
   }
 
   const pub = (h) => ({
@@ -454,13 +482,19 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   const holds = {
     /**
      * Park a held request. With `slot` (from `reserve`) the parked entry
-     * takes over that slot; with `arrivedAt` the deadline counts from
-     * arrival, not from now. Without either, parks exactly as before.
+     * takes over that slot, clearing the reservation's timer; with
+     * `arrivedAt` the deadline counts from arrival, not from now. A
+     * finished slot (expired, cancelled, closed, or no longer the holder)
+     * parks nothing and returns `null`. Without `slot`, parks exactly as
+     * before, without limit.
      *
      * @param {object} entry queue entry
-     * @returns {string} hold id
+     * @returns {string|null} hold id, or null for a finished slot
      */
     add({ agent, method, url, headers, body, sock, cres, note, slot, arrivedAt }) {
+      const hst = typeof slot === 'object' && slot !== null ? handleState.get(slot) : undefined;
+      const s = slots.get(agent);
+      if (slot && (!hst || hst.done || !s || s.holder !== slot)) return null;
       const id = `h${++n}`;
       const ms = deadlineMs();
       const t0 = typeof arrivedAt === 'number' ? arrivedAt : Date.now();
@@ -472,18 +506,14 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       };
       // Unref: a parked `never` hold must not keep the process alive by itself.
       if (entry.timer?.unref) entry.timer.unref();
-      const hst = typeof slot === 'object' && slot !== null ? handleState.get(slot) : undefined;
-      if (slot && hst && !hst.done) {
-        const s = slots.get(agent);
-        if (s && s.holder === slot) {
-          hst.consumed = true;
-          hst.done = true;
-          s.holder = { parked: id };
-          entry.slot = slot;
-        }
+      if (slot && hst && s && s.holder === slot) {
+        if (hst.timer) clearTimeout(hst.timer);
+        hst.timer = null;
+        hst.consumed = true;
+        s.holder = { parked: id };
+        entry.slot = slot;
       }
       queue.set(id, entry);
-      const s = slots.get(agent);
       log({ ev: 'hold', id, agent, method, url, reason: note ?? undefined,
         timeoutMs: ms, waiting: queue.size, queued: s ? s.line.length : 0 });
       void park(entry, ms, note ?? '');
@@ -500,7 +530,10 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       const arrivedAt = Date.now();
       // Internal slot state, keyed by the returned handle's identity: `add`
       // receives that same object as `slot`, so holder comparisons use it.
-      const st = { consumed: false, done: false };
+      // The one deadline timer lives here, armed below for 'now' and
+      // 'queued' alike; expiry runs through `expireReservation` only.
+      /** @type {{ agent: string, onReady: () => void, onExpire: (reason: string) => void, timer: ReturnType<typeof setTimeout>|null, consumed: boolean, done: boolean }} */
+      const st = { agent, onReady, onExpire, timer: null, consumed: false, done: false };
       const s0 = slots.get(agent);
       /** @type {'now'|'queued'|'full'} */
       const state = !s0 ? 'now' : (s0.line.length >= MAX_WAITING_PER_AGENT ? 'full' : 'queued');
@@ -510,6 +543,8 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
         cancel() {
           if (st.done) return;
           st.done = true;
+          if (st.timer) clearTimeout(st.timer);
+          st.timer = null;
           if (st.consumed) return;
           const s = slots.get(agent);
           if (!s) return;
@@ -517,10 +552,9 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
             releaseSlot(agent);
             return;
           }
-          const i = s.line.findIndex((w) => w.handle === handle);
+          const i = s.line.indexOf(handle);
           if (i >= 0) {
-            const [w] = s.line.splice(i, 1);
-            if (w.timer) clearTimeout(w.timer);
+            s.line.splice(i, 1);
             if (!s.holder && s.line.length === 0) slots.delete(agent);
           }
         },
@@ -528,31 +562,18 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       handleState.set(handle, st);
       if (state === 'now') {
         slots.set(agent, { holder: handle, line: [] });
-        return handle;
-      }
-      if (state === 'full') {
+      } else if (state === 'full') {
         log({ ev: 'hold-queue-full', agent });
         return handle;
+      } else {
+        if (!s0) throw new Error(`reserve: no slot record for ${agent}`);
+        s0.line.push(handle);
       }
-      if (!s0) throw new Error(`reserve: no slot record for ${agent}`);
       const ms = deadlineMs();
-      /** @type {{ handle: object, onReady: () => void, onExpire: (reason: string) => void, timer: object|null }} */
-      const waiter = { handle, onReady, onExpire, timer: null };
       if (ms !== null) {
-        waiter.timer = setTimeout(() => {
-          if (st.done) return;
-          st.done = true;
-          const cur = slots.get(agent);
-          if (cur) {
-            const i = cur.line.indexOf(waiter);
-            if (i >= 0) cur.line.splice(i, 1);
-            if (!cur.holder && cur.line.length === 0) slots.delete(agent);
-          }
-          onExpire('hold timeout');
-        }, ms);
-        if (waiter.timer.unref) waiter.timer.unref();
+        st.timer = setTimeout(() => expireReservation(agent, handle, 'hold timeout'), ms);
+        if (st.timer.unref) st.timer.unref();
       }
-      s0.line.push(waiter);
       return handle;
     },
 
@@ -582,12 +603,16 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
 
     close() {
       if (pollTimer) clearInterval(pollTimer);
-      for (const [, s] of [...slots]) {
-        for (const w of s.line.splice(0)) {
-          if (w.timer) clearTimeout(w.timer);
-          const hst = handleState.get(w.handle);
-          if (hst) hst.done = true;
-          w.onExpire('proxy closing');
+      for (const s of [...slots.values()]) {
+        const handles = [...s.line];
+        if (s.holder && !('parked' in s.holder)) handles.push(s.holder);
+        for (const handle of handles) {
+          const hst = handleState.get(handle);
+          if (!hst) continue;
+          if (hst.timer) clearTimeout(hst.timer);
+          hst.timer = null;
+          hst.done = true;
+          hst.onExpire('proxy closing');
         }
       }
       slots.clear();

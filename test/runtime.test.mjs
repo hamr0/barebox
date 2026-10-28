@@ -12,6 +12,12 @@ import { claimRuntime, runtimePaths, shellQuote } from '../src/runtime.js';
 
 const RUNTIME_URL = new URL('../src/runtime.js', import.meta.url).href;
 
+/** Spawn a script in a child node process. */
+function spawnChild(body, args) {
+  return spawn(process.execPath, ['--input-type=module', '-e',
+    `import { claimRuntime } from ${JSON.stringify(RUNTIME_URL)};\n${body}`, '--', ...args]);
+}
+
 /**
  * Run a script in a child node process.
  *
@@ -20,11 +26,6 @@ const RUNTIME_URL = new URL('../src/runtime.js', import.meta.url).href;
  * @param {number} timeoutMs kill after this long
  * @returns {Promise<{code: number|null, signal: string|null, stdout: string, stderr: string, timedOut: boolean}>} how it ended
  */
-function spawnChild(body, args) {
-  return spawn(process.execPath, ['--input-type=module', '-e',
-    `import { claimRuntime } from ${JSON.stringify(RUNTIME_URL)};\n${body}`, '--', ...args]);
-}
-
 function runChild(body, args, timeoutMs) {
   return new Promise((resolve) => {
     const child = spawnChild(body, args);

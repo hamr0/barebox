@@ -428,6 +428,7 @@ export function createProxy(opts) {
         const body = finishLog();
         // Parked: the tunnel stays open until the ask channel decides. The
         // hold reason travels as `note` so the ask file carries its `rule`.
+        // null: the reservation already expired and onExpire answered 403.
         queue.add({ agent, method, url: urlStr,
           headers: { ...creq.headers }, body, sock, cres, note: reason,
           slot, arrivedAt: slot.arrivedAt });
@@ -443,6 +444,9 @@ export function createProxy(opts) {
       creq.resume();
       return;
     }
+    // The client may have died during the wall's DNS await, before this
+    // listener existed: its 'close' is already past, so release here.
+    if (sock.destroyed) { slot.cancel(); return; }
     cres.on('close', () => slot.cancel());
     if (slot.state === 'now') readHeld();
   }

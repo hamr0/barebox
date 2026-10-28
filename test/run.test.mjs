@@ -8,7 +8,7 @@ for (const v of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
 }
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { Writable } from 'node:stream';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync,
   existsSync, renameSync, rmSync } from 'node:fs';
@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { run, shouldHoldForMode } from '../src/run.js';
 import { claimRuntime, runtimePaths } from '../src/runtime.js';
+import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
 import { setupOverlay } from '../src/overlay.js';
 import { startHttp } from './fixtures/upstream.mjs';
 
@@ -29,13 +30,9 @@ function canUnix() {
     s.listen(p, () => s.close(() => { try { rmSync(p); } catch {} resolve(true); }));
   });
 }
-function hasBin(n) {
-  try { execFileSync('which', [n], { stdio: 'ignore' }); return true; }
-  catch { return false; }
-}
 const UNIX_OK = await canUnix();
-const CAN_RUN = existsSync('/usr/bin/bwrap') && UNIX_OK && hasBin('socat') && hasBin('curl');
-const SKIP_WHY = !existsSync('/usr/bin/bwrap') ? 'needs bwrap'
+const CAN_RUN = bwrapUsable() && UNIX_OK && hasBin('socat') && hasBin('curl');
+const SKIP_WHY = !bwrapUsable() ? 'needs bwrap'
   : (!UNIX_OK ? 'unix socket bind blocked here'
     : (!hasBin('socat') || !hasBin('curl') ? 'needs socat and curl' : ''));
 

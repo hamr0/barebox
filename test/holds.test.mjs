@@ -312,23 +312,26 @@ describe('one held request per agent', () => {
   const noop = () => {};
 
   it('first is now, second queues, decision hands over', async () => {
-    const { q } = mkQ({ timeoutMs: 150 });
+    // Under one-timer-per-reservation the promoted waiter keeps its own
+    // timer, so a handover the caller ignores would expire: like the real
+    // proxy, add B on ready.
+    const { denied, q } = mkQ({ timeoutMs: 200 });
     try {
       const rA = q.reserve('a', { onReady: noop, onExpire: noop });
       assert.equal(rA.state, 'now');
       q.add(entry('a', rA, rA.arrivedAt));
       let ready = 0;
       const expired = [];
-      const rB = q.reserve('a', {
-        onReady: () => { ready++; },
+      let rB;
+      rB = q.reserve('a', {
+        onReady: () => { ready++; q.add(entry('a', rB, rB.arrivedAt)); },
         onExpire: (reason) => expired.push(reason),
       });
       assert.equal(rB.state, 'queued');
       await waitFor(() => ready === 1, 'handover to B');
-      await new Promise((r) => setTimeout(r, 400));
+      await waitFor(() => denied.length === 2, 'both settle on their own clocks');
       assert.equal(ready, 1, 'onReady exactly once');
-      assert.deepEqual(expired, [], 'no expiry after handover (waiter timer cleared)');
-      rB.cancel();
+      assert.deepEqual(expired, [], 'add cleared the reservation timer');
     } finally {
       q.close();
     }
@@ -348,28 +351,153 @@ describe('one held request per agent', () => {
     }
   });
 
-  it('a waiter still in line at its deadline expires unread', async () => {
-    // A holds the slot through its reservation (body still being read, so
-    // nothing settles): the only way a waiter can still be in line when its
-    // own deadline passes.
+  it('an un-added holder expires first, then the promoted waiter expires on its own arrival deadline', async () => {
+    // One timer per reservation, from arrival: A arrived first, so A expires
+    // first and B is promoted — then B (never added) expires at B's arrival
+    // deadline, not at its promotion.
     const { q } = mkQ({ timeoutMs: 200 });
     try {
-      const rA = q.reserve('a', { onReady: noop, onExpire: noop });
+      const expiredA = [];
+      const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expiredA.push(reason) });
       assert.equal(rA.state, 'now');
       let ready = 0;
-      const expired = [];
+      const expiredB = [];
       const rB = q.reserve('a', {
         onReady: () => { ready++; },
-        onExpire: (reason) => expired.push(reason),
+        onExpire: (reason) => expiredB.push(reason),
       });
       assert.equal(rB.state, 'queued');
-      await waitFor(() => expired.length === 1, 'B expires in line');
-      assert.deepEqual(expired, ['hold timeout']);
-      assert.equal(ready, 0, 'onReady never fires for an expired waiter');
-      await new Promise((r) => setTimeout(r, 250));
-      assert.equal(ready, 0);
+      await waitFor(() => ready === 1, 'A expires, B promoted');
+      assert.deepEqual(expiredA, ['hold timeout']);
+      await waitFor(() => expiredB.length === 1, 'B expires on its own arrival deadline');
+      assert.deepEqual(expiredB, ['hold timeout']);
       rA.cancel();
       rB.cancel();
+    } finally {
+      q.close();
+    }
+  });
+
+  it('a never-added holder expires on its own arrival deadline', async () => {
+    const { q } = mkQ({ timeoutMs: 200 });
+    try {
+      const expired = [];
+      const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push([Date.now(), reason]) });
+      assert.equal(rA.state, 'now');
+      const tA = rA.arrivedAt;
+      let readyB = 0;
+      const rB = q.reserve('a', { onReady: () => { readyB++; }, onExpire: noop });
+      assert.equal(rB.state, 'queued');
+      await waitFor(() => expired.length === 1, 'A expires');
+      assert.deepEqual(expired.map(([, reason]) => reason), ['hold timeout']);
+      const elapsed = expired[0][0] - tA;
+      assert.ok(elapsed >= 150 && elapsed < 2000, `at ~200ms after arrival (${elapsed}ms)`);
+      await waitFor(() => readyB === 1, 'B promoted');
+      rB.cancel();
+    } finally {
+      q.close();
+    }
+  });
+
+  it('a promoted waiter keeps its arrival deadline', async () => {
+    const { q } = mkQ({ timeoutMs: 300 });
+    try {
+      const rA = q.reserve('a', { onReady: noop, onExpire: noop });
+      const idA = q.add(entry('a', rA, rA.arrivedAt));
+      let readyAt = 0;
+      const expired = [];
+      const rB = q.reserve('a', {
+        onReady: () => { readyAt = Date.now(); },
+        onExpire: (reason) => expired.push([Date.now(), reason]),
+      });
+      assert.equal(rB.state, 'queued');
+      const tB = rB.arrivedAt;
+      await new Promise((r) => setTimeout(r, 180));
+      q.abandon(idA);
+      await waitFor(() => readyAt !== 0, 'B promoted');
+      await waitFor(() => expired.length === 1, 'B expires');
+      assert.deepEqual(expired.map(([, reason]) => reason), ['hold timeout']);
+      const elapsed = expired[0][0] - tB;
+      assert.ok(elapsed >= 250 && elapsed < 450, `at ~300ms after arrival, not promotion (${elapsed}ms)`);
+    } finally {
+      q.close();
+    }
+  });
+
+  it('add clears the reservation timer; the entry keeps its own', async () => {
+    const { denied, q } = mkQ({ timeoutMs: 150 });
+    try {
+      const expired = [];
+      const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push(reason) });
+      const id = q.add(entry('a', rA, rA.arrivedAt));
+      await waitFor(() => denied.length === 1, 'entry settles on its own clock');
+      assert.deepEqual(denied, [[id, 'hold timeout']]);
+      await new Promise((r) => setTimeout(r, 250));
+      assert.deepEqual(expired, [], 'no reservation expiry after add');
+      assert.equal(denied.length, 1, 'exactly one decision');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('cancel clears the reservation timer', async () => {
+    const { q } = mkQ({ timeoutMs: 150 });
+    try {
+      const expired = [];
+      const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push(reason) });
+      assert.equal(rA.state, 'now');
+      rA.cancel();
+      await new Promise((r) => setTimeout(r, 300));
+      assert.deepEqual(expired, [], 'no expiry after cancel');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('add with a finished slot parks nothing', async () => {
+    const { logs, q } = mkQ({ timeoutMs: 500 });
+    try {
+      const expiredA = [];
+      const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expiredA.push(reason) });
+      assert.equal(rA.state, 'now');
+      await new Promise((r) => setTimeout(r, 300));
+      const rB = q.reserve('a', { onReady: noop, onExpire: noop });
+      assert.equal(rB.state, 'queued');
+      await waitFor(() => expiredA.length === 1, 'A expires');
+      assert.equal(q.add(entry('a', rA, rA.arrivedAt)), null);
+      assert.deepEqual(q.pending(), [], 'nothing parked');
+      assert.ok(!logs.some((l) => l.ev === 'hold'), 'no hold log line');
+      const idB = q.add(entry('a', rB, rB.arrivedAt));
+      assert.equal(q.pending().length, 1, 'the promoted waiter still holds a live slot');
+      void idB;
+    } finally {
+      q.close();
+    }
+  });
+
+  it("close expires an un-added holder once", async () => {
+    const { q } = mkQ();
+    const expired = [];
+    try {
+      q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push(reason) });
+      q.close();
+      assert.deepEqual(expired, ['proxy closing']);
+      await new Promise((r) => setTimeout(r, 100));
+      assert.deepEqual(expired, ['proxy closing'], 'once, nothing afterwards');
+    } finally {
+      q.close();
+    }
+  });
+
+  it("timeoutMs 'never' arms no timer", async () => {
+    const { q } = mkQ({ timeoutMs: 'never' });
+    try {
+      const expired = [];
+      const r = q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push(reason) });
+      assert.equal(r.state, 'now');
+      await new Promise((r) => setTimeout(r, 300));
+      assert.deepEqual(expired, []);
+      r.cancel();
     } finally {
       q.close();
     }

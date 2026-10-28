@@ -22,10 +22,10 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { createProxy } from '../src/proxy.js';
 import { launch } from '../src/launcher.js';
 import { certFor } from '../src/certs.js';
+import { bwrapUsable, hasBin } from '../test/fixtures/probes.mjs';
 
 const N = 20;
 const CERT_HOSTS = 10;
@@ -42,11 +42,6 @@ function canUnix() {
     s.on('error', () => resolve(false));
     s.listen(p, () => s.close(() => { try { rmSync(p); } catch {} resolve(true); }));
   });
-}
-
-function hasBin(n) {
-  try { execFileSync('which', [n], { stdio: 'ignore' }); return true; }
-  catch { return false; }
 }
 
 /** Poll `cond` until truthy; throw naming the condition on timeout. */
@@ -111,7 +106,7 @@ function treeRss(rootPid, kids) {
 
 // --- main ------------------------------------------------------------------
 const unixOk = await canUnix();
-const why = !readdirSync('/usr/bin').includes('bwrap') ? 'needs bwrap (/usr/bin/bwrap missing)'
+const why = !bwrapUsable() ? 'needs bwrap (/usr/bin/bwrap missing)'
   : (!unixOk ? 'unix socket bind blocked here'
     : (!hasBin('socat') ? 'needs socat' : ''));
 if (why) {

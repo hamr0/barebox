@@ -32,12 +32,13 @@ import {
 import { runtimePaths } from '../src/runtime.js';
 import { launch } from '../src/launcher.js';
 import { run } from '../src/run.js';
+import { bwrapUsable } from './fixtures/probes.mjs';
 
 const execA = promisify(execFileCb);
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = join(ROOT, 'src/cli.js');
 
-const BWRAP_OK = existsSync('/usr/bin/bwrap');
+const BWRAP_OK = bwrapUsable();
 const BWRAP_SKIP = 'needs bwrap; run in a real shell or CI';
 const SOCKET_OK = await new Promise((resolve) => {
   const p = join(tmpdir(), `bb-oprobe-${process.pid}.sock`);
