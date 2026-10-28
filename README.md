@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/badge/status-POC-c0841a" alt="status: POC">
 </p>
 
-> **Status:** POC. The walls (M0), HTTPS inspection (M1), and hold-and-ask (M2) are proven and measured. The npm package is a name reservation — the API lands with the graduation rewrite next. Linux only.
+> **Status:** early. The walls (M0), HTTPS inspection (M1), hold-and-ask (M2), the one-call `run()` and file ask channel (M2.5) and the undo layer (M4) are built and measured; the decision rules (M3), key custody (M5) and the rest are not. Today's hold rule is interim: payment destinations, plus every non-GET/HEAD request in `ask` and `auto` modes. Linux only.
 
 ## Why
 
@@ -41,7 +41,7 @@ Three letters, each handled differently — the same `r`/`w`/`x` as [bareguard](
 
 The agent works in your house:
 
-- **Tracing paper (w).** The agent sees your real files, but every change lands on an overlay laid over them. At the end you commit it or roll it back.
+- **Tracing paper (w).** The agent sees your real files, but every change lands on an overlay laid over them. At the end you commit it or roll it back (`sbx run --overlay -- <cmd>`, then `sbx diff`, `sbx commit`, `sbx rollback`).
 - **Locked drawers (r).** It reads most things. Keys and password stores (`~/.ssh`, `~/secrets`, `~/.gnupg`, `~/.password-store`, keyrings), browser profiles, cloud and cluster credentials (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/op`) and token files (`~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.cargo/credentials.toml`) stay shut. The agent's own model credentials (`~/.claude`) do not; moving those out is M5.
 - **One front door with a doorman (x).** No network of its own. Lookups pass; anything that sends, pays, or publishes waits for your yes.
 - **Keys it never holds.** The agent types a placeholder; the doorman puts the real API key in the request header only after you approve that request.
@@ -112,7 +112,7 @@ M0–M2 are the go/no-go. Later: macOS (`sandbox-exec` + APFS clones), Windows v
 npm install barebox
 ```
 
-Requires Node.js >= 22. Zero production dependencies. Published 0.1.0 is the reservation scaffold — nothing to import yet.
+Requires Node.js >= 22. Zero production dependencies. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
 
 ## Try the POCs
 

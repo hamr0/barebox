@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Name: barebox (CLI `sbx`).
-> Status: M0–M2 PASS; graduation rewrite shipped as **barebox 0.2.0** on npm (Oct 27, provenance-signed). Next: M2.5 integration seam, then M4 → M3 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M0–M2 PASS; graduation rewrite shipped as **barebox 0.2.0** on npm (Oct 27, provenance-signed). M2.5 integration seam and M4 undo layer are built (unreleased; see CHANGELOG [Unreleased]). Next: M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 – Nov 4 2026 (10 days). Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -374,11 +374,11 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 2. **The file checkpoint**:
    - `<runtime>/asks/<id>.json` is written when a request parks, and `<runtime>/answers/<id>.json` is read once, then renamed away.
    - A stale or late answer is ignored and logged, as in fwdloop.
-   - An `ask <id> <agent> <method> <url> rule=<rule>` line goes to stdout (`{"ev":"ask",...}` with `--json`), so a human watching a terminal knows.
+   - `sbx run` prints an `ask <id> <agent> <method> <url> rule=<rule>` line to stdout (`{"ev":"ask",...}` with `--json`), so a human watching a terminal knows. The library prints nothing: a caller of `run()` or `createProxy` gets `asks/<id>.json` and the `onEvent` callback.
    - The control socket and its server are deleted.
 3. **A decision-ready ask payload**: `id`, `agent`, `method`, `url`, `rule` (`payment`, `card-in-body`, `x:unlabelled-POST`), `letter`, a body preview (redaction lands in M3, see item 6), `waitingSec`, `expiresAt`. barebox knows the request, not the intent; the caller adds its own context (step, goal).
-4. **`run({ proj, command, mode, gate, onAsk })`** → `{ exit, asks, audit }` (plus `diff` once M4 exists). It wraps `createProxy`, `addAgent` and `launch`, which stay public as the low-level parts.
-5. **`sbx run [--mode ask|auto|trust] [--json] -- <cmd>`**. With `--json`, stdout carries JSON lines (`{"ev":"ask",...}`, `{"ev":"done","exit":N}`), and the exit code mirrors the agent's.
+4. **`run({ proj, command, mode, onAsk })`** → `{ exit, asks, audit, diff, runtime }` (`diff` is the M4 overlay diff; `gate` is not an option today, the foundations rework removed it). It wraps `createProxy`, `addAgent` and `launch`, which stay public as the low-level parts.
+5. **`sbx run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd>`**. With `--json`, stdout carries JSON lines (`{"ev":"ask",...}`, `{"ev":"decided",...}` as each ask ends, `{"ev":"done","exit":N}`), and the exit code mirrors the agent's.
 6. **Audit lines in bareguard's shape** (see Decisions, "Audit"), so M3 shares the file without a migration. STATUS (Oct 27): the bareguard line shape is DEFERRED to M3 — the current log is barebox's own JSONL. Body-preview redaction is NOT DONE either: the preview is verbatim up to `ASK_BODY_LIMIT` (see `holds.js`), redaction waits for M3's bareguard `secrets`.
 
 **Done when:**
