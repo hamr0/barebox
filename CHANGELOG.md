@@ -4,38 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-28
+
+Breaking changes (pre-1.0): the control socket, `createProxy`'s `certDir` and `allowUpstream`, `run()`'s low-level options, the hold queue's `approve`/`deny`/`size` and the top-level `allowLoopback` option are removed or moved; `runtime` is now required. Each is marked **Breaking** below.
 
 ### Added
 
 - M2.5 integration seam: `ask`, `auto` (the default) and `trust` modes with the card/payment floor in every mode; the `onAsk` seam plus the file-checkpoint ask channel (`asks/<id>.json` → `answers/<id>.json`, control socket deleted); `run()` wrapping proxy + launch; `sbx run [--mode ask|auto|trust] [--json] [--overlay]`; a 0600 JSONL audit log (bareguard's line shape deferred to M3); `sbx pending` / `approve` / `deny` refuse when no live proxy owns the runtime.
-- M4 undo layer: per-run overlay tracing paper with `sbx diff` / `commit` / `rollback`, conflict flagging (refuse by default, `--skip-conflicts`), and `node_modules` invisibility (Q3). Diff walks the merged view with node inside the mount (no shell); `commit` stages into the project and swaps by journaled rename, undoing every step on failure (a full undo reports nothing was applied; a partial one names the steps not undone and keeps the commit folder with the originals); it strips setuid/setgid bits, and committed files get fresh mtimes. `rollback` reports diff's answer, or raw upper paths when the project is gone.
+- M4 undo layer: per-run overlay tracing paper with `sbx diff` / `commit` / `rollback`, conflict flagging (refuse by default, `--skip-conflicts`), and `node_modules` invisibility. Diff walks the merged view with node inside the mount (no shell); `commit` stages into the project and swaps by journaled rename, undoing every step on failure (a full undo reports nothing was applied; a partial one names the steps not undone and keeps the commit folder with the originals); it strips setuid/setgid bits, and committed files get fresh mtimes. `rollback` reports diff's answer, or raw upper paths when the project is gone.
 - The agent always starts in the project dir.
-- The commit applies under read-only project folders (6.3).
-- Rollback always removes the overlay upper, whatever the agent left there (6.2).
-- The walker has no output cap, and node is resolved wherever it is installed (6.5, 6.6).
-- One proxy per runtime is enforced: a second live proxy on the same runtime throws naming the owner's pid; the claim dies with its process; nothing is ever taken over.
+- The commit applies under read-only project folders.
+- Rollback always removes the overlay upper, whatever the agent left there.
+- The walker has no output cap, and node is resolved wherever it is installed.
+- One proxy per runtime, enforced by a kernel-held lock: `createProxy` binds an abstract unix socket named from the runtime's real path, device and inode and holds it while the proxy lives. A second live proxy throws "in use" naming the owner's pid, before touching sockets or `asks/`. The kernel frees the lock when the process dies (SIGKILL included), so there is no stale claim and no takeover. `<runtime>/owner` (0600) only names the pid.
+- `sbx pending`, `approve` and `deny` need a live proxy on the runtime and refuse otherwise.
+- `SBX_OVERLAY_IGNORE=a,b` extends the list of folders the overlay layer ignores (`node_modules` is always ignored).
+- Locked credential paths: `launch` hides 21 credential stores from the agent (keys, password stores, keyrings, browser profiles, cloud/cluster/container credentials, `gh`/`op` CLIs, token files). Folders are masked with an empty tmpfs and files read empty; a symlinked drawer is masked at its real target inside `$HOME` or the project. `~/.claude` is deliberately left visible.
+- The upstream wall lives in `src/wall.js`: every resolved IP is checked after DNS, unresolvable names fail closed, and the dial is pinned to the checked IPs. One writer (`denyRes`) produces every HTTP error response.
+- The agent sandbox always runs with bwrap `--new-session`, so its stdin is never the terminal.
 
 ### Security
 
+- The audit log is owner-only (0600) and scrubs sensitive header values to `[redacted]` before any user `redact` hook runs.
 - Ask and answer files are owner-only (0600); `sbx approve`/`deny` accept only `h<n>` ids; `sbx pending` and `sbx run` strip terminal control sequences from agent-controlled fields before printing.
 
 ### Removed
 
-- Control socket (`createProxy`'s `controlSocket` option, `SBX_SOCK`): decisions flow through the file checkpoint (`<runtime>/asks` + `<runtime>/answers`) or `hold.onAsk`; the migration guards are deleted.
-- `createProxy`'s `certDir`. Certificates always live in `<runtime>/certs`, and `runtime` is now required.
-- `createProxy`'s `allowUpstream`. There is no escape hatch around the upstream wall.
-- `run()`'s `gate`, `match`, `shouldHold`, `pollMs`, `proxyPort` and `extraEnv`. Use `createProxy` + `launch` for low-level control.
-- The hold queue's `approve(id)`, `deny(id)` and `size()`, and `body` on `pending()` entries (the ask payload carries `bodyPreview`).
-- The library's `ASK OPEN <id>` write to stderr. The library never prints.
+- **Breaking:** Control socket (`createProxy`'s `controlSocket` option, `SBX_SOCK`): decisions flow through the file checkpoint (`<runtime>/asks` + `<runtime>/answers`) or `hold.onAsk`; the migration guards are deleted.
+- **Breaking:** `createProxy`'s `certDir`. Certificates always live in `<runtime>/certs`, and `runtime` is now required.
+- **Breaking:** `createProxy`'s `allowUpstream`. There is no escape hatch around the upstream wall.
+- **Breaking:** `run()`'s `gate`, `match`, `shouldHold`, `pollMs`, `proxyPort` and `extraEnv`. Use `createProxy` + `launch` for low-level control.
+- **Breaking:** The hold queue's `approve(id)`, `deny(id)` and `size()`, and `body` on `pending()` entries (the ask payload carries `bodyPreview`).
+- **Breaking:** The library's `ASK OPEN <id>` write to stderr. The library never prints.
 
 ### Changed
 
-- Test-only options moved under one key: `createProxy({ unsafeTestOnly: { allowLoopback, resolveUpstream } })`, `run({ unsafeTestOnly: { allowLoopback } })`. The CLI variable is renamed from `SBX_ALLOW_LOOPBACK` to `SBX_UNSAFE_TEST_ALLOW_LOOPBACK`.
+- **Breaking:** Test-only options moved under one key: `createProxy({ unsafeTestOnly: { allowLoopback, resolveUpstream } })`, `run({ unsafeTestOnly: { allowLoopback } })`. The CLI variable is renamed from `SBX_ALLOW_LOOPBACK` to `SBX_UNSAFE_TEST_ALLOW_LOOPBACK`.
 - `onEvent(e)` on `createHolds` / `createProxy`'s `hold` / `run()`: `{ type: 'ask', ask }` when a hold parks, `{ type: 'decided', id, decision, reason }` when it settles. `run()`'s `asks` result is built from these events.
 - `sbx run` prints how each ask ended: `decided <id> <allow|deny> [(reason)]`, or `{"ev":"decided","id","decision","reason"}` with `--json`, between the `ask` and `done` lines. A hold whose client went away reports `deny` / `client gone` (also in `run()`'s `asks`).
 - Decisions are written as `allow` / `deny` everywhere, the audit log included. `approve` is still accepted, as an alias in answer files only.
-- `sbx` results go to stdout; every error, refusal and usage-on-error goes to stderr through `err`. `--help` stays on stdout, exit 0. Exit codes don't change. (Item 4 changed no output streams.)
+- `sbx` results go to stdout; every error, refusal and usage-on-error goes to stderr through `err`. `--help` stays on stdout, exit 0. Exit codes don't change.
 
 ## [0.2.0] - 2026-10-27
 
@@ -84,6 +92,6 @@ Graduation rewrite: the M0–M2 POCs become a library. The POCs (Oct 26, `poc/`,
 
 - Reserved `barebox` on npm; repo scaffold (docs, M0 throwaway POC, publish workflow).
 
-[Unreleased]: https://github.com/hamr0/barebox/compare/v0.2.0...HEAD
+[0.3.0]: https://github.com/hamr0/barebox/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hamr0/barebox/compare/1f144f4...v0.2.0
 [0.1.0]: https://github.com/hamr0/barebox/commit/1f144f4
