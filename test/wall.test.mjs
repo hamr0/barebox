@@ -2,6 +2,7 @@
 // Pure functions only: no sockets, no bwrap, green everywhere.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import { checkUpstream, denyReasonForIp } from '../src/wall.js';
 
 describe('denyReasonForIp: every spelling', () => {
@@ -60,5 +61,49 @@ describe('checkUpstream: DNS answers in embedded forms', () => {
   it('NAT64 of a public address stays allowed', async () => {
     const r = await checkUpstream('cdn.test', gate(['64:ff9b::808:808']));
     assert.equal(r.ok, true);
+  });
+});
+
+describe("host-local: every spelling of the host's own address", () => {
+  const realInterfaces = os.networkInterfaces;
+  const stub = (ifs) => { os.networkInterfaces = () => ifs; };
+  const restore = () => { os.networkInterfaces = realInterfaces; };
+
+  const v6rows = [
+    ['2001:db8::1', 'host-local'],
+    ['2001:db8:0:0:0:0:0:1', 'host-local'],
+    ['2001:0db8::1', 'host-local'],
+    ['2001:DB8::0:1', 'host-local'],
+    ['[2001:db8::1]', 'host-local'],
+    ['2001:db8::2', null],
+  ];
+  for (const [addr, want] of v6rows) {
+    it(`${addr} → ${want ?? 'allowed'}`, () => {
+      stub({ eth0: [{ address: '2001:db8::1', family: 'IPv6', internal: false }] });
+      try {
+        assert.equal(denyReasonForIp(addr, false), want, addr);
+      } finally {
+        restore();
+      }
+    });
+  }
+
+  it('the IPv4 path is untouched', () => {
+    stub({ eth0: [{ address: '203.0.113.7', family: 'IPv4', internal: false }] });
+    try {
+      assert.equal(denyReasonForIp('203.0.113.7', false), 'host-local');
+      assert.equal(denyReasonForIp('::ffff:203.0.113.7', false), 'host-local');
+    } finally {
+      restore();
+    }
+  });
+
+  it('a throwing networkInterfaces loses host-local, nothing throws', () => {
+    os.networkInterfaces = () => { throw new Error('hidden'); };
+    try {
+      assert.equal(denyReasonForIp('2001:db8::1', false), null);
+    } finally {
+      restore();
+    }
   });
 });

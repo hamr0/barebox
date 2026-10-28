@@ -93,7 +93,7 @@ function v4Reason(v4, allowLoopback) {
   return null;
 }
 
-/** This machine's own interface addresses, one spelling (see `normIp`). */
+/** This machine's own interface addresses: IPv6 keyed by parsed groups, IPv4 dotted (see `normIp`). */
 function localIps() {
   const out = new Set();
   let ifs = {};
@@ -106,7 +106,10 @@ function localIps() {
   }
   for (const addrs of Object.values(ifs)) {
     for (const a of addrs ?? []) {
-      if (a && a.address) out.add(normIp(a.address));
+      if (!a || !a.address) continue;
+      const norm = normIp(a.address);
+      const g = v6Groups(norm);
+      out.add(g ? g.join(':') : norm);
     }
   }
   return out;
@@ -139,7 +142,7 @@ export function denyReasonForIp(rawIp, allowLoopback) {
   if (g[0] === 0x2002) return v4Reason(v4Of(g, 1), allowLoopback);
   if ((g[0] & 0xffc0) === 0xfe80) return 'link-local';
   if ((g[0] & 0xfe00) === 0xfc00) return 'private';
-  if (localIps().has(ip)) return 'host-local';
+  if (localIps().has(g.join(':'))) return 'host-local';
   return null;
 }
 

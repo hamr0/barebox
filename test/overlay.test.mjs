@@ -2,7 +2,7 @@
 //
 // Two gates, loud like the rest of the suite:
 // - bwrap mounts (agentWrite + every diff/commit over a non-empty upper):
-//   needs /usr/bin/bwrap; green in a real shell and CI. This sandbox runs
+//   needs bwrap on PATH; green in a real shell and CI. This sandbox runs
 //   them (bwrap works here; only unix sockets are blocked).
 // - unix sockets (launch/run/sbx-run through the front door): skipped where
 //   socket bind is blocked; green in a real shell and CI.

@@ -106,7 +106,7 @@ function treeRss(rootPid, kids) {
 
 // --- main ------------------------------------------------------------------
 const unixOk = await canUnix();
-const why = !bwrapUsable() ? 'needs bwrap (/usr/bin/bwrap missing)'
+const why = !bwrapUsable() ? 'needs bwrap on PATH'
   : (!unixOk ? 'unix socket bind blocked here'
     : (!hasBin('socat') ? 'needs socat' : ''));
 if (why) {

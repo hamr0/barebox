@@ -10,8 +10,7 @@ export function hasBin(name) {
 }
 
 /**
- * True when bwrap runs: `bwrap --version` must exit 0. This checks it is
- * usable, not just present.
+ * True when bwrap is on `PATH` and runs `bwrap --version` with exit 0.
  *
  * @returns {boolean}
  */

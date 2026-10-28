@@ -620,7 +620,7 @@ describe('holds', () => {
   // client arg built after the proxy starts always resolves to a real file.
   const HCA = join(HRT, 'certs', 'ca.pem');
   const hlog = () => readFileSync(join(HRT, 'mitm.log'), 'latin1');
-  const waitHlog = (re, what) => waitFor(() => re.test(hlog()), what);
+  const waitHlog = (re, what, from = 0, ms) => waitFor(() => re.test(hlog().slice(from)), what, ms);
   const answersDir = () => join(HRT, 'answers');
   const askFile = (id) => join(HRT, 'asks', `${id}.json`);
   const answerFile = (id) => join(answersDir(), `${id}.json`);
@@ -1214,6 +1214,7 @@ describe('holds', () => {
       let drip = null;
       try {
         const fa = hp.addAgent('fa');
+        const logFrom = hlog().length; // earlier tests already logged this note; the deny logs before the reply, so 1 s is ample
         const t0 = Date.now();
         const holder = await partialPost(fa, 'DRIP0', 100, 'd');
         let sent = 1;
@@ -1226,7 +1227,7 @@ describe('holds', () => {
         assert.ok(out.status === 403 || out.status === 'reset' || out.status === 'closed', `got ${out.status}`);
         if (out.status === 403) assert.match(out.body, /hold timeout/);
         assert.ok(dt >= 500 && dt < 1000, `expired at arrival + deadline (took ${dt} ms)`);
-        await waitHlog(/"note":"denied: hold timeout"/, 'the 403 hold-timeout to be logged');
+        await waitHlog(/"note":"denied: hold timeout"/, 'the 403 hold-timeout to be logged', logFrom, 1000);
         const fresh = await post(fa, 'FRESH1');
         await waitFor(() => pendingWith('FRESH1'), 'fresh request to park promptly', 1000);
         // The dripper finishing late must not park a second request.
