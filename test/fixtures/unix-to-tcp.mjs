@@ -13,7 +13,8 @@ net.createServer = function (...args) {
   const srv = origCreateServer.apply(this, args);
   const origListen = srv.listen;
   srv.listen = function (first, ...rest) {
-    if (typeof first === 'string') {
+    // Abstract names ('\0...') are the runtime claim lock: they bind fine here.
+    if (typeof first === 'string' && !first.startsWith('\0')) {
       return origListen.call(this, 0, '127.0.0.1', ...rest);
     }
     return origListen.call(this, first, ...rest);

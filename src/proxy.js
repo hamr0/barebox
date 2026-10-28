@@ -119,7 +119,7 @@ function scrubSecrets(entry) {
  * @param {ProxyOptions} opts
  * @returns live proxy: `ready` resolves when listeners + CA are up; the shape is inferred, see `Proxy`
  * @when Reach for this HARNESS-ONLY to run the front door: it terminates agent TLS, sees every request, and parks the ones a human must decide. It decides nothing itself; pair with the launcher for sandboxes and `sbx` for decisions.
- * @fails Throws synchronously on a missing `logFile` or `runtime`. Throws when another live proxy owns the runtime; a dead owner's claim is taken over. At runtime, dead upstreams, malformed input, over-cap and timed-out holds all become loud logged HTTP errors, never silence and never a crash. A second proxy on the same port rejects `ready`, never crashes the process.
+ * @fails Throws synchronously on a missing `logFile` or `runtime`. Throws when another live proxy owns the runtime; the claim dies with its process; nothing is ever taken over. At runtime, dead upstreams, malformed input, over-cap and timed-out holds all become loud logged HTTP errors, never silence and never a crash. A second proxy on the same port rejects `ready`, never crashes the process.
  * @example
  * import { createProxy } from "barebox";
  * const proxy = createProxy({ port: 0, runtime: "./sbx-runtime", logFile: "./mitm.log" });

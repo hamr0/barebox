@@ -14,7 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The commit applies under read-only project folders (6.3).
 - Rollback always removes the overlay upper, whatever the agent left there (6.2).
 - The walker has no output cap, and node is resolved wherever it is installed (6.5, 6.6).
-- One proxy per runtime is enforced: a second live proxy on the same runtime throws naming the owner's pid; a dead owner's runtime is taken over.
+- One proxy per runtime is enforced: a second live proxy on the same runtime throws naming the owner's pid; the claim dies with its process; nothing is ever taken over.
 
 ### Security
 
