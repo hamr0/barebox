@@ -20,13 +20,13 @@ import {
   copyFileSync, realpathSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Writable } from 'node:stream';
 import net from 'node:net';
 import {
   setupOverlay, diffOverlay, commitOverlay, rollbackOverlay, undoJournal,
-  finishFailedCommit, changedSince, fpNow, OverlayConflictError, DEFAULT_IGNORE,
+  finishFailedCommit, changedSince, overlaySupportError, fpNow, OverlayConflictError, DEFAULT_IGNORE,
 } from '../src/overlay.js';
 import { runtimePaths } from '../src/runtime.js';
 import { launch } from '../src/launcher.js';
@@ -1423,6 +1423,69 @@ describe('end-to-end through a real mount (needs bwrap)', { skip: BWRAP_OK ? fal
     agentWrite({ ...ov, lower: proj, script: 'printf \'orig\\n\' > "$M/edit.txt"' });
     assert.deepEqual(diffOverlay({ runtime: rt, agent: 'e' }), []);
     assert.deepEqual(commitOverlay({ runtime: rt, agent: 'e' }), { committed: [], skipped: [] });
+  });
+});
+
+describe('overlay needs bubblewrap >= 0.11.0', () => {
+  it('overlaySupportError judges the version text', () => {
+    assert.match(overlaySupportError('bubblewrap 0.9.0\n')?.message ?? '',
+      /needs bubblewrap >= 0\.11\.0 \(found 0\.9\.0\)/);
+    assert.ok(overlaySupportError('bubblewrap 0.10.0') instanceof Error);
+    for (const v of ['0.11.0', '0.12.0', '0.13.2', '1.0']) {
+      assert.equal(overlaySupportError(`bubblewrap ${v}`), null, v);
+    }
+    for (const v of ['', 'nope']) {
+      assert.match(overlaySupportError(v)?.message ?? '', /found unknown/);
+    }
+  });
+
+  // A fake 0.9.0 bwrap on PATH, in a child (the version check is cached per
+  // process): the same fake-bin pattern as launcher.test.mjs.
+  const CHILD = `
+    import { mkdirSync, writeFileSync, existsSync, mkdtempSync } from 'node:fs';
+    import { join } from 'node:path';
+    import { tmpdir } from 'node:os';
+    const { launch } = await import(process.env.BB_ROOT + '/src/launcher.js');
+    const { setupOverlay, diffOverlay } = await import(process.env.BB_ROOT + '/src/overlay.js');
+    const t = mkdtempSync(join(tmpdir(), 'bb-bv-'));
+    const proj = join(t, 'proj'); mkdirSync(proj); writeFileSync(join(proj, 'a'), 'a');
+    const rt = join(t, 'rt');
+    const msg = (f) => { try { f(); return 'no throw'; } catch (e) { return e.message; } };
+    const out = {};
+    out.launchOverlay = msg(() => launch({ runtime: rt, agent: 'w', proj, command: ['true'], overlay: true }));
+    out.overlayDir = existsSync(join(rt, 'overlay', 'w'));
+    setupOverlay({ runtime: join(t, 'rt2'), agent: 'w', proj });
+    writeFileSync(join(t, 'rt2', 'overlay', 'w', 'upper', 'x'), 'x');
+    out.diff = msg(() => diffOverlay({ runtime: join(t, 'rt2'), agent: 'w' }));
+    out.launchPlain = msg(() => { launch({ runtime: join(t, 'rt3'), agent: 'w', proj, command: ['true'], overlay: false }).kill(); });
+    console.log(JSON.stringify(out));
+  `;
+  let binDir, res;
+  before(() => {
+    binDir = mkdtempSync(join(tmpdir(), 'bb-fakebin-'));
+    writeFileSync(join(binDir, 'bwrap'),
+      '#!/bin/sh\n[ "$1" = "--version" ] && { echo "bubblewrap 0.9.0"; exit 0; }\nexit 1\n');
+    chmodSync(join(binDir, 'bwrap'), 0o755);
+    const r = spawnSync(process.execPath, ['--input-type=module', '-e', CHILD], {
+      encoding: 'utf8',
+      env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH}`, BB_ROOT: ROOT },
+    });
+    assert.equal(r.status, 0, r.stderr);
+    res = JSON.parse(r.stdout);
+  });
+  after(() => rmSync(binDir, { recursive: true, force: true }));
+
+  it('launch({ overlay: true }) refuses before any overlay setup', () => {
+    assert.match(res.launchOverlay, /needs bubblewrap >= 0\.11\.0 \(found 0\.9\.0\)/);
+    assert.equal(res.overlayDir, false, 'a refused run leaves no overlay record');
+  });
+
+  it('diffOverlay over a non-empty upper refuses before the walk', () => {
+    assert.match(res.diff, /needs bubblewrap >= 0\.11\.0 \(found 0\.9\.0\)/);
+  });
+
+  it('a run without the overlay never hits the version check', () => {
+    assert.doesNotMatch(res.launchPlain, /needs bubblewrap/);
   });
 });
 

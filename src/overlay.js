@@ -35,6 +35,45 @@ import { assertAgentName, runtimeTempDir, runtimePaths, safe } from './runtime.j
 
 const MANIFEST_VERSION = 1;
 
+const OVERLAY_MIN_BWRAP = [0, 11, 0];
+
+/**
+ * Judge `bwrap --version` output for overlay support: `--overlay-src` / `--overlay` exist from bubblewrap 0.11.0.
+ *
+ * @param {string} versionOutput text printed by `bwrap --version` (for example `bubblewrap 0.12.0`)
+ * @returns {Error|null} null when the version is at least 0.11.0, otherwise the refusal to throw (unparseable output counts as `unknown`)
+ * @fails Never throws; returns the error instead.
+ */
+export function overlaySupportError(versionOutput) {
+  const m = /bubblewrap\s+(\d+)\.(\d+)(?:\.(\d+))?/.exec(String(versionOutput));
+  if (m) {
+    const v = [Number(m[1]), Number(m[2]), Number(m[3] ?? 0)];
+    const ok = v[0] !== OVERLAY_MIN_BWRAP[0] ? v[0] > OVERLAY_MIN_BWRAP[0]
+      : v[1] !== OVERLAY_MIN_BWRAP[1] ? v[1] > OVERLAY_MIN_BWRAP[1]
+        : v[2] >= OVERLAY_MIN_BWRAP[2];
+    if (ok) return null;
+  }
+  return new Error(`the overlay needs bubblewrap >= 0.11.0 (found ${m ? m.slice(1).filter((x) => x !== undefined).join('.') : 'unknown'}): upgrade bubblewrap, or run without --overlay`);
+}
+
+/** @type {Error|null|undefined} */
+let overlaySupport;
+
+/**
+ * Refuse the overlay on a bubblewrap older than 0.11.0. Runs `bwrap --version` once per process.
+ *
+ * @returns {void}
+ * @fails Throws `the overlay needs bubblewrap >= 0.11.0 (found X)` when bwrap is older or its version is unreadable. A missing bwrap does not throw here: the real bwrap call then fails as it always did.
+ */
+export function assertOverlaySupport() {
+  if (overlaySupport === undefined) {
+    const res = spawnSync('bwrap', ['--version'], { encoding: 'utf8' });
+    // Missing bwrap (ENOENT): no new message; the caller's own bwrap spawn fails as before.
+    overlaySupport = res.error ? null : overlaySupportError(res.stdout);
+  }
+  if (overlaySupport) throw overlaySupport;
+}
+
 /** Path segments invisible to the layer (Q3): never snapshotted, diffed, committed or deleted. */
 export const DEFAULT_IGNORE = ['node_modules'];
 
@@ -365,6 +404,7 @@ function loadOverlay({ runtime, agent }) {
  * @param {Set<string>|null} [opts.upperPaths] upper relative paths to hash and stage, or null for all
  */
 function bwrapWalk({ lower, upper, work, ignore, scratch, stageDir = null, upperPaths = null }) {
+  assertOverlaySupport();
   mkdirSync(scratch, { recursive: true });
   const merged = runtimeTempDir(scratch, 'merged');
   const outDir = runtimeTempDir(scratch, 'walk');
@@ -467,7 +507,7 @@ function snapLower(ov, stageDir = null) {
  * @param {string} opts.agent agent name whose upper to read
  * @returns {OverlayChange[]} one entry per added/modified/deleted path, each flagging a mid-run project change
  * @when Reach for this to review one run's tracing paper: it lists every file the sandboxed run added, modified or deleted, flagging the ones the project changed meanwhile.
- * @fails Throws when no overlay exists for the agent, when the project is gone, when a leftover commit folder blocks, or when the overlay view cannot be mounted; never writes anything.
+ * @fails Throws when no overlay exists for the agent, when the project is gone, when a leftover commit folder blocks, when bubblewrap is older than 0.11.0, or when the overlay view cannot be mounted; never writes anything.
  * @example
  * import { diffOverlay } from "barebox";
  * const changes = diffOverlay({ runtime: "/tmp/sbx-abc", agent: "agent" });
@@ -586,7 +626,7 @@ export function undoJournal(journal, proj) {
  * @param {string} [opts.onConflict] `refuse` (default) throws before writing anything; `skip` commits the rest and reports the skipped paths
  * @returns {{committed: string[], skipped: {path: string, reason: string}[]}} committed project-relative paths, plus conflicts left uncommitted under `skip`
  * @when Reach for this to press one run's tracing paper down: it stages the sandbox's changes and swaps them into the project by rename, refusing loudly on mid-run conflicts.
- * @fails Throws (writing nothing) when any changed file was also changed in the project mid-run, unless onConflict is `skip`; throws on unsupported file kinds and on a project that moved mid-commit. A phase-2 failure undoes every journaled step: a full undo reports `nothing was applied`, a partial one throws `SBX_COMMIT_FAILED` listing exactly the steps not undone and keeping the commit folder (originals in `old/`) named in the error. Setuid/setgid bits are stripped from committed modes; mtimes are not preserved. A killed commit leaves a folder that blocks the next diff/commit/setup until removed.
+ * @fails Throws (writing nothing) when any changed file was also changed in the project mid-run, unless onConflict is `skip`; throws on unsupported file kinds, on a project that moved mid-commit, and when bubblewrap is older than 0.11.0. A phase-2 failure undoes every journaled step: a full undo reports `nothing was applied`, a partial one throws `SBX_COMMIT_FAILED` listing exactly the steps not undone and keeping the commit folder (originals in `old/`) named in the error. Setuid/setgid bits are stripped from committed modes; mtimes are not preserved. A killed commit leaves a folder that blocks the next diff/commit/setup until removed.
  * @example
  * import { commitOverlay } from "barebox";
  * const { committed, skipped } = commitOverlay({ runtime: "/tmp/sbx-abc", agent: "agent" });

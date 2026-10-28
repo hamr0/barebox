@@ -116,6 +116,7 @@ the layer (extend with `SBX_OVERLAY_IGNORE=a,b`). Commit strips setuid/setgid
 and does not keep mtimes; a killed commit leaves a `.sbx-commit-*` folder in
 the project that blocks the next diff/commit/run until you remove it. The
 library equivalents are `diffOverlay`, `commitOverlay` and `rollbackOverlay`.
+The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap.
 
 ## Gotchas
 

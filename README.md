@@ -112,11 +112,11 @@ M0–M2 are the go/no-go. Later: macOS (`sandbox-exec` + APFS clones), Windows v
 npm install barebox
 ```
 
-Requires Node.js >= 22. Zero production dependencies. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
+Requires Node.js >= 22. Zero production dependencies. Needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
 
 ## Try the POCs
 
-Linux with `bwrap`, `socat`, `openssl`, Node >= 22 and Python 3. Needs a normal shell (namespaces + listening sockets), not a tool sandbox. The POCs are throwaway proofs, not the product.
+Linux with `bwrap` (>= 0.11.0 only for the overlay), `socat`, `openssl`, Node >= 22 and Python 3. Needs a normal shell (namespaces + listening sockets), not a tool sandbox. The POCs are throwaway proofs, not the product.
 
 ```
 git clone https://github.com/hamr0/barebox && cd barebox

@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative, dirname } from 'node:path';
 import { assertAgentName, isInside, realPathOf, runtimePaths } from './runtime.js';
-import { setupOverlay } from './overlay.js';
+import { assertOverlaySupport, setupOverlay } from './overlay.js';
 
 // Locked drawers (relative to $HOME): masked wherever they exist — a folder
 // with an empty tmpfs, a file with /dev/null (bwrap cannot mount a tmpfs on
@@ -160,6 +160,7 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   /** @type {{upper: string, work: string} | null} */
   let ov = null;
   if (overlay) {
+    assertOverlaySupport();
     // The upper/work dirs live under the runtime: a runtime inside the
     // project would put them inside their own lower, which overlayfs
     // forbids — so that layout throws here, before anything is snapshotted.

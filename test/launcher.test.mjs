@@ -94,7 +94,7 @@ describe('mount order for a project under $HOME (no sandbox needed)', () => {
     binDir = mkdtempSync(join(tmpdir(), 'bb-fakebin-'));
     const out = join(binDir, 'args');
     writeFileSync(join(binDir, 'bwrap'),
-      '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$BB_ARGS_FILE"\nexit 0\n');
+      '#!/bin/sh\n[ "$1" = "--version" ] && { echo "bubblewrap 0.12.0"; exit 0; }\nprintf \'%s\\n\' "$@" > "$BB_ARGS_FILE"\nexit 0\n');
     chmodSync(join(binDir, 'bwrap'), 0o755);
     prevPath = process.env.PATH;
     process.env.PATH = `${binDir}${delimiter}${prevPath}`;
@@ -219,7 +219,7 @@ describe('locked file masks (no sandbox needed)', () => {
   before(() => {
     binDir = mkdtempSync(join(tmpdir(), 'bb-fakebin-'));
     writeFileSync(join(binDir, 'bwrap'),
-      '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$BB_ARGS_FILE"\nexit 0\n');
+      '#!/bin/sh\n[ "$1" = "--version" ] && { echo "bubblewrap 0.12.0"; exit 0; }\nprintf \'%s\\n\' "$@" > "$BB_ARGS_FILE"\nexit 0\n');
     chmodSync(join(binDir, 'bwrap'), 0o755);
     prevPath = process.env.PATH;
     process.env.PATH = `${binDir}${delimiter}${prevPath}`;

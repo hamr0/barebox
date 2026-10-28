@@ -7,7 +7,7 @@
       "when": "Reach for this to press one run's tracing paper down: it stages the sandbox's changes and swaps them into the project by rename, refusing loudly on mid-run conflicts.",
       "import": "import { commitOverlay } from 'barebox'",
       "signature": "commitOverlay(opts: object) => {committed: string[], skipped: {path: string, reason: string}[]}",
-      "fails": "Throws (writing nothing) when any changed file was also changed in the project mid-run, unless onConflict is `skip`; throws on unsupported file kinds and on a project that moved mid-commit. A phase-2 failure undoes every journaled step: a full undo reports `nothing was applied`, a partial one throws `SBX_COMMIT_FAILED` listing exactly the steps not undone and keeping the commit folder (originals in `old/`) named in the error. Setuid/setgid bits are stripped from committed modes; mtimes are not preserved. A killed commit leaves a folder that blocks the next diff/commit/setup until removed.",
+      "fails": "Throws (writing nothing) when any changed file was also changed in the project mid-run, unless onConflict is `skip`; throws on unsupported file kinds, on a project that moved mid-commit, and when bubblewrap is older than 0.11.0. A phase-2 failure undoes every journaled step: a full undo reports `nothing was applied`, a partial one throws `SBX_COMMIT_FAILED` listing exactly the steps not undone and keeping the commit folder (originals in `old/`) named in the error. Setuid/setgid bits are stripped from committed modes; mtimes are not preserved. A killed commit leaves a folder that blocks the next diff/commit/setup until removed.",
       "example": "import { commitOverlay } from \"barebox\";\nconst { committed, skipped } = commitOverlay({ runtime: \"/tmp/sbx-abc\", agent: \"agent\" });\nconsole.log(`committed ${committed.length} file(s), skipped ${skipped.length}`);"
     },
     {
@@ -25,7 +25,7 @@
       "when": "Reach for this to review one run's tracing paper: it lists every file the sandboxed run added, modified or deleted, flagging the ones the project changed meanwhile.",
       "import": "import { diffOverlay } from 'barebox'",
       "signature": "diffOverlay(opts: object) => OverlayChange[]",
-      "fails": "Throws when no overlay exists for the agent, when the project is gone, when a leftover commit folder blocks, or when the overlay view cannot be mounted; never writes anything.",
+      "fails": "Throws when no overlay exists for the agent, when the project is gone, when a leftover commit folder blocks, when bubblewrap is older than 0.11.0, or when the overlay view cannot be mounted; never writes anything.",
       "example": "import { diffOverlay } from \"barebox\";\nconst changes = diffOverlay({ runtime: \"/tmp/sbx-abc\", agent: \"agent\" });\nfor (const c of changes) console.log(c.status, c.path, c.conflict ? \"(CONFLICT)\" : \"\");"
     },
     {
