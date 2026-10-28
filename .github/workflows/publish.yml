@@ -188,7 +188,7 @@ jobs:
           import manifest from "barebox/primitives.json" with { type: "json" };
           const child = launch({ runtime: "/tmp/sbx", agent: "fx", proj: "/tmp/proj", command: ["true"] });
           const code: number | null = child.exitCode;
-          const proxy = createProxy({ port: 3129, certDir: "./certs", logFile: "./mitm.log" });
+          const proxy = createProxy({ runtime: "/tmp/sbx-rt", port: 3129, logFile: "./mitm.log" });
           const queued: number = proxy.pending().length;
           const names: string[] = manifest.primitives.map((p) => p.name);
           proxy.close();
