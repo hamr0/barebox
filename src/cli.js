@@ -1,10 +1,13 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S node --max-semi-space-size=1
 // sbx — second-terminal CLI for the hold queue (M2.5 file channel):
 // sbx pending | approve <id> | deny <id> [reason]
 // Reads `<runtime>/asks/<id>.json`, answers by atomically writing
 // `<runtime>/answers/<id>.json` (tmp file + rename, so the proxy never sees
 // a partial). The runtime comes from SBX_RUNTIME only; there is no
 // cwd-relative default.
+//
+// Settings (mode, holdTimeoutSec) come from the one config file, see config.js;
+// a flag beats the file. A bad file is a usage-class error (exit 2).
 //
 // sbx run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]
 // Runs one sandboxed agent start-to-finish in this process (project = cwd).
@@ -27,6 +30,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
+import { resolveConfig } from './config.js';
 import { writeFileAtomic } from './holds.js';
 import { run as sandboxRun } from './run.js';
 import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
@@ -157,8 +161,17 @@ async function run(args) {
   } catch {
     usage();
   }
-  const mode = values.mode ?? 'auto';
-  if (mode !== 'ask' && mode !== 'auto' && mode !== 'trust') usage();
+  if (values.mode !== undefined && !['ask', 'auto', 'trust'].includes(values.mode)) usage();
+  /** @type {{ mode: string, holdTimeoutSec: number|string }} */
+  let cfg;
+  try {
+    cfg = resolveConfig({ mode: values.mode });
+  } catch (e) {
+    err(e instanceof Error ? e.message : String(e));
+    process.exit(2);
+  }
+  const { mode } = cfg;
+  const timeoutMs = cfg.holdTimeoutSec === 'never' ? 'never' : Number(cfg.holdTimeoutSec) * 1000;
   if (!command.length) usage();
   const json = values.json ?? false;
   const overlay = values.overlay ?? false;
@@ -187,7 +200,7 @@ async function run(args) {
     const extraIgnore = (process.env.SBX_OVERLAY_IGNORE ?? '').split(',')
       .map((s) => s.trim()).filter(Boolean);
     result = await sandboxRun({
-      runtime, proj: process.cwd(), command, mode,
+      runtime, proj: process.cwd(), command, mode, timeoutMs,
       unsafeTestOnly: { allowLoopback: process.env.SBX_UNSAFE_TEST_ALLOW_LOOPBACK === '1' },
       overlay,
       ...(extraIgnore.length ? { overlayIgnore: ['node_modules', ...extraIgnore] } : {}),

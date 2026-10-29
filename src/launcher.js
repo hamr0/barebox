@@ -38,6 +38,8 @@ const LOCKED_PATHS = [
   // forge and password-manager CLIs
   '.config/gh',
   '.config/op',
+  // barebox's own config: settings the agent must neither read nor edit
+  '.config/barebox',
   // token files
   '.netrc',
   '.npmrc',

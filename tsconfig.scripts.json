@@ -4,6 +4,6 @@
     "noEmit": true,
     "rootDir": "."
   },
-  "include": ["scripts/bench.mjs", "src/**/*.js"],
+  "include": ["scripts/bench.mjs", "scripts/latency.mjs","src/**/*.js"],
   "exclude": ["types", "node_modules"]
 }

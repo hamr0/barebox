@@ -333,6 +333,8 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     // credential-store fixtures: a dir, a file, a symlinked file, a control
     mkdirSync(join(home, '.aws'));
     writeFileSync(join(home, '.aws', 'credentials'), 'aws-secret\n');
+    mkdirSync(join(home, '.config', 'barebox'), { recursive: true });
+    writeFileSync(join(home, '.config', 'barebox', 'config.json'), '{"mode":"trust"}\n');
     writeFileSync(join(home, '.netrc'), 'machine x password netrc-secret\n');
     mkdirSync(join(home, 'dotfiles'));
     writeFileSync(join(home, 'dotfiles', 'npmrc'), '_authToken=npm-secret\n');
@@ -417,6 +419,17 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     const c = launch({ runtime: rt, agent: 't1b', proj, command: ['bash', '-c', script] });
     const r = await run(c);
     assert.equal(r.code, 0, `exit ${r.code} (11 .aws, 12 .netrc, 13 .npmrc, 14 dotfiles/npmrc, 15 notes): ${r.err}`);
+  });
+
+  it('masks barebox\'s own config: the file reads empty and the drawer lists empty', async () => {
+    await listenSock('t1c');
+    const script = [
+      '[ -z "$(cat "$HOME/.config/barebox/config.json" 2>/dev/null)" ] || exit 11',
+      '[ -z "$(ls -A "$HOME/.config/barebox")" ] || exit 12',
+    ].join('\n');
+    const c = launch({ runtime: rt, agent: 't1c', proj, command: ['bash', '-c', script] });
+    const r = await run(c);
+    assert.equal(r.code, 0, `exit ${r.code} (11 config.json readable, 12 drawer not empty): ${r.err}`);
   });
 
   it('binds project read-only', async () => {
