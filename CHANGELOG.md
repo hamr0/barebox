@@ -4,18 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.4.0] - 2026-10-29
 
 ### Changed
 
 - Held requests are one per agent (pre-1.0 behaviour change): each agent has at most one held request being read or parked; later ones wait in line, unread, in order. At most 16 wait; the next gets `429 hold queue full`.
 - The hold deadline counts from arrival (default 120 s, `never` supported), time in line and reading the body included; a request past its deadline is denied `hold timeout` whether waiting, sending, or parked.
+- `proxy.removeAgent(name)` ends that agent's open connections, and its held requests end `deny` / `client gone` at once. `run()` calls it when the sandbox exits, so shutting down no longer races a held request into a `proxy closing` log line.
+- An existing runtime dir you don't own (e.g. `SBX_RUNTIME=/tmp`, which 0.3.0 accepted) is now refused with a message naming the dir, its owner and a subdir to use, such as `/tmp/sbx`.
 - The TCP door is one agent: every connection through `createProxy`'s TCP `port` counts as the agent `tcp` and shares one hold line. Use `addAgent` sockets (`sbx run` does) for separate lines.
 
 ### Security
 
 - The upstream wall checks an IPv4 embedded in IPv6 in every spelling: IPv4-mapped (`::ffff:7f00:1` as well as `::ffff:127.0.0.1`) and compat forms, uncompressed loopback (`0:0:0:0:0:0:0:1`), NAT64 `64:ff9b::/96` (local-use `64:ff9b:1::/48` denied outright) and 6to4 `2002::/16`. NAT64 and 6to4 of public sites stay reachable.
-- Runtime folders are owner-only (0700) whatever the umask: the runtime root, `asks/`, `answers/` and `socks/`.
+- Runtime folders are owner-only (0700) whatever the umask: the runtime root, `asks/`, `answers/` and `socks/`. A runtime dir you own is tightened to 0700.
+- Each minted certificate gets a random 128-bit serial instead of a shared serial file (`ca.srl`) that concurrent mints could corrupt (a failed mint reached the agent as a 502); at most 4 mints run at once.
 
 ### Fixed
 
