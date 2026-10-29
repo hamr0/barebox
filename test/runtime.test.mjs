@@ -201,10 +201,10 @@ describe('claimRuntime: kernel lock across processes', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('stampede: 8 processes claim at once, no two ever hold the runtime together', async () => {
+  it('stampede: 10 processes claim, 2 of them mid-hold, no two ever hold the runtime together', async () => {
     const body = `
-      const [rt, at] = process.argv.slice(1);
-      while (Date.now() < Number(at)) {}
+      const [rt, at, lateMs] = process.argv.slice(1);
+      while (Date.now() < Number(at) + Number(lateMs)) {}
       try {
         const release = claimRuntime(rt);
         console.log('WON ' + Date.now());
@@ -214,10 +214,14 @@ describe('claimRuntime: kernel lock across processes', () => {
       } catch (e) {
         console.log('ERR ' + e.message);
       }`;
+    // 8 children start together; 2 late ones start mid-hold (winner holds 1000 ms),
+    // so a lock that frees early lets a late child win inside the winner's [t1, t2].
+    let refusedTotal = 0;
     for (let round = 0; round < 20; round++) {
       const rt = mkdtempSync(join(root, 'rt-'));
       const at = String(Date.now() + 1500);
-      const outs = await Promise.all(Array.from({ length: 8 }, () => runChild(body, [rt, at], 15000)));
+      const lateMs = [0, 0, 0, 0, 0, 0, 0, 0, 500, 500];
+      const outs = await Promise.all(lateMs.map((late) => runChild(body, [rt, at, String(late)], 15000)));
       const held = [];
       let refused = 0;
       const other = [];
@@ -230,12 +234,15 @@ describe('claimRuntime: kernel lock across processes', () => {
       }
       assert.deepEqual(other, [], `round ${round}: unexpected outcomes`);
       assert.ok(held.length >= 1, `round ${round}: no winner (refused ${refused})`);
-      assert.equal(held.length + refused, 8, `round ${round}: winners ${held.length} + refused ${refused}`);
+      assert.equal(held.length + refused, 10, `round ${round}: winners ${held.length} + refused ${refused}`);
       held.sort((a, b) => a.t1 - b.t1);
       for (let i = 1; i < held.length; i++) {
         assert.ok(held[i].t1 >= held[i - 1].t2, `round ${round}: claims overlap ${JSON.stringify(held[i - 1])} ${JSON.stringify(held[i])}`);
       }
+      refusedTotal += refused;
     }
+    // Per round, contention can vanish on a loaded host; across 20 rounds it cannot.
+    assert.ok(refusedTotal > 0, 'no claim was ever refused: the overlap check proved nothing');
   });
 
   it('SIGKILL frees the runtime at once, with no manual step', async () => {

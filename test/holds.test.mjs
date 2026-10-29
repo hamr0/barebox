@@ -1,7 +1,7 @@
 // Holds unit tests: decision normalization and the event channel, with no
 // proxy, sandbox, or sockets involved. The file channel works on a temp
 // runtime dir; the `onAsk` channel needs no runtime at all.
-import { describe, it, before, after, mock } from 'node:test';
+import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync, readdirSync, statSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -311,13 +311,13 @@ describe('one held request per agent', () => {
 
   const noop = () => {};
 
-  it('first is now, second queues, decision hands over', () => {
+  it('first is now, second queues, decision hands over', (t) => {
     // Under one-timer-per-reservation the promoted waiter keeps its own
     // timer, so a handover the caller ignores would expire: like the real
     // proxy, add B on ready.
     // The clock is mocked because A's hold timer and B's reservation timer
     // share a deadline: after a loop stall they tie and B can expire first.
-    mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const { denied, q } = mkQ({ timeoutMs: 200 });
     try {
       const rA = q.reserve('a', { onReady: noop, onExpire: noop });
@@ -331,16 +331,15 @@ describe('one held request per agent', () => {
         onExpire: (reason) => expired.push(reason),
       });
       assert.equal(rB.state, 'queued');
-      mock.timers.tick(200);
+      t.mock.timers.tick(200);
       assert.equal(ready, 1, 'handover to B');
       assert.deepEqual(expired, [], 'add cleared the reservation timer');
-      mock.timers.tick(1);
+      t.mock.timers.tick(1);
       assert.deepEqual(denied.map(([, r]) => r), ['hold timeout', 'hold timeout'],
         'both settle on their own clocks');
       assert.equal(ready, 1, 'onReady exactly once');
     } finally {
       q.close();
-      mock.timers.reset();
     }
   });
 
@@ -406,26 +405,29 @@ describe('one held request per agent', () => {
     }
   });
 
-  it('a promoted waiter keeps its arrival deadline', async () => {
+  it('a promoted waiter keeps its arrival deadline', (t) => {
+    // Mocked clock: a real-time upper bound fails whenever the loop stalls.
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const { q } = mkQ({ timeoutMs: 300 });
     try {
       const rA = q.reserve('a', { onReady: noop, onExpire: noop });
       const idA = q.add(entry('a', rA, rA.arrivedAt));
-      let readyAt = 0;
+      let ready = 0;
       const expired = [];
       const rB = q.reserve('a', {
-        onReady: () => { readyAt = Date.now(); },
+        onReady: () => { ready++; },
         onExpire: (reason) => expired.push([Date.now(), reason]),
       });
       assert.equal(rB.state, 'queued');
       const tB = rB.arrivedAt;
-      await new Promise((r) => setTimeout(r, 180));
+      t.mock.timers.tick(180);
       q.abandon(idA);
-      await waitFor(() => readyAt !== 0, 'B promoted');
-      await waitFor(() => expired.length === 1, 'B expires');
+      assert.equal(ready, 1, 'B promoted');
+      t.mock.timers.tick(119);
+      assert.deepEqual(expired, [], 'not expired 1 ms before its arrival deadline');
+      t.mock.timers.tick(1);
       assert.deepEqual(expired.map(([, reason]) => reason), ['hold timeout']);
-      const elapsed = expired[0][0] - tB;
-      assert.ok(elapsed >= 250 && elapsed < 450, `at ~300ms after arrival, not promotion (${elapsed}ms)`);
+      assert.equal(expired[0][0] - tB, 300, 'at 300ms after arrival, not promotion');
     } finally {
       q.close();
     }
@@ -510,9 +512,10 @@ describe('one held request per agent', () => {
     }
   });
 
-  it('a handed-over ask keeps its arrival deadline', async () => {
+  it('a handed-over ask keeps its arrival deadline', (t) => {
+    // Mocked clock: real-time bounds fail whenever the loop stalls.
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const { denied, q } = mkQ({ timeoutMs: 300 });
-    const t0 = Date.now();
     try {
       const rA = q.reserve('a', { onReady: noop, onExpire: noop });
       const idA = q.add(entry('a', rA, rA.arrivedAt));
@@ -523,14 +526,15 @@ describe('one held request per agent', () => {
       });
       assert.equal(rB.state, 'queued');
       const tB = rB.arrivedAt;
-      await new Promise((r) => setTimeout(r, 200));
+      t.mock.timers.tick(200);
       q.abandon(idA);
-      await waitFor(() => ready === 1, 'handover to B');
+      assert.equal(ready, 1, 'handover to B');
       const idB = q.add(entry('a', rB, rB.arrivedAt));
-      await waitFor(() => denied.some(([id]) => id === idB), 'B denied on its arrival deadline');
+      t.mock.timers.tick(99);
+      assert.equal(denied.some(([id]) => id === idB), false, 'B not denied 1 ms before its arrival deadline');
+      t.mock.timers.tick(1);
       assert.deepEqual(denied.find(([id]) => id === idB), [idB, 'hold timeout']);
-      assert.ok(Date.now() - tB < 450, `B denied ~300ms after arrival, not 500ms (${Date.now() - tB}ms)`);
-      assert.ok(Date.now() - t0 < 600, 'sanity: whole test inside one window');
+      assert.equal(Date.now() - tB, 300, 'B denied 300ms after arrival, not 500ms');
     } finally {
       q.close();
     }
