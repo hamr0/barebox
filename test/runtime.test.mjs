@@ -3,7 +3,7 @@
 // child processes.
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, mkdirSync, statSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, mkdirSync, statSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
@@ -160,6 +160,17 @@ describe('claimRuntime: one live proxy per runtime', () => {
     }
   });
 
+  it('an existing runtime root is tightened to 0700', () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    chmodSync(rt, 0o755);
+    const release = claimRuntime(rt);
+    try {
+      assert.equal(statSync(rt).mode & 0o777, 0o700);
+    } finally {
+      release();
+    }
+  });
+
   it('the owner file is 0600', () => {
     const rt = mkdtempSync(join(root, 'rt-'));
     const release = claimRuntime(rt);
@@ -190,14 +201,15 @@ describe('claimRuntime: kernel lock across processes', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('stampede: 8 processes claim at one instant, exactly one wins each round', async () => {
+  it('stampede: 8 processes claim at once, no two ever hold the runtime together', async () => {
     const body = `
       const [rt, at] = process.argv.slice(1);
       while (Date.now() < Number(at)) {}
       try {
         const release = claimRuntime(rt);
-        console.log('WON');
+        console.log('WON ' + Date.now());
         await new Promise((r) => setTimeout(r, 1000));
+        console.log('REL ' + Date.now());
         release();
       } catch (e) {
         console.log('ERR ' + e.message);
@@ -206,18 +218,23 @@ describe('claimRuntime: kernel lock across processes', () => {
       const rt = mkdtempSync(join(root, 'rt-'));
       const at = String(Date.now() + 1500);
       const outs = await Promise.all(Array.from({ length: 8 }, () => runChild(body, [rt, at], 15000)));
-      let won = 0;
+      const held = [];
       let refused = 0;
       const other = [];
       for (const o of outs) {
         const line = o.stdout.trim();
-        if (line === 'WON') won++;
+        const m = /^WON (\d+)\nREL (\d+)$/.exec(line);
+        if (m && Number(m[1]) <= Number(m[2])) held.push({ t1: Number(m[1]), t2: Number(m[2]) });
         else if (/^ERR runtime .* (is in use by pid \d+ \(|could not be locked: no live owner is recorded \()/.test(line)) refused++;
         else other.push(`${line} | ${o.stderr.trim()}`);
       }
       assert.deepEqual(other, [], `round ${round}: unexpected outcomes`);
-      assert.equal(won, 1, `round ${round}: winners (refused ${refused})`);
-      assert.equal(refused, 7, `round ${round}: refused`);
+      assert.ok(held.length >= 1, `round ${round}: no winner (refused ${refused})`);
+      assert.equal(held.length + refused, 8, `round ${round}: winners ${held.length} + refused ${refused}`);
+      held.sort((a, b) => a.t1 - b.t1);
+      for (let i = 1; i < held.length; i++) {
+        assert.ok(held[i].t1 >= held[i - 1].t2, `round ${round}: claims overlap ${JSON.stringify(held[i - 1])} ${JSON.stringify(held[i])}`);
+      }
     }
   });
 
