@@ -186,7 +186,7 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
     await proxy.close().catch(() => {});
     throw e;
   }
-  /** @type {string} */
+  /** @type {string|undefined} */
   let sock;
   // `addAgent` and `launch` run INSIDE the try: a synchronous throw there
   // (a broken socket folder, uncommitted overlay changes, a runtime inside
@@ -210,6 +210,9 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
       child.on('close', (code) => resolve(code ?? 1));
     });
   } finally {
+    // The sandbox is gone: end the agent's holds as client gone now, not
+    // as 'proxy closing' if close() beats the sockets' async 'close'.
+    if (sock) proxy.removeAgent(agent);
     await proxy.close();
   }
   // M2.5 item 4: the result carries the M4 diff. Without overlay there is no

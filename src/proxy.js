@@ -575,11 +575,19 @@ export function createProxy(opts) {
     return sockPath;
   }
 
+  // Ends the agent's door AND its open connections: its parked holds end
+  // synchronously as deny / client gone (no waiting on the socket's async
+  // 'close'), then each socket is destroyed.
   function removeAgent(name) {
     const srv = agentServers.get(name);
     if (!srv) return;
     agentServers.delete(name);
     srv.close();
+    for (const s of [...clients]) {
+      if (s[AGENT] !== name) continue;
+      holds?.abandonSocket(s);
+      s.destroy();
+    }
     try { fs.unlinkSync(runtimePaths(runtime).socket(name)); } catch {}
   }
 

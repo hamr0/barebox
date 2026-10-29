@@ -171,6 +171,18 @@ describe('claimRuntime: one live proxy per runtime', () => {
     }
   });
 
+  it('a runtime dir owned by another uid is refused, untouched', () => {
+    const me = process.getuid();
+    const foreign = ['/', '/tmp', '/usr'].find((d) => statSync(d).uid !== me);
+    if (foreign === undefined) assert.fail('suite runs as root or owns /, /tmp and /usr: no foreign-owned dir to test against; run as a normal user');
+    const before = statSync(foreign);
+    assert.throws(() => claimRuntime(foreign),
+      (e) => /owned by uid \d+, not you/.test(e.message) && e.message.includes(join(foreign, 'sbx')) && e.message.includes(foreign));
+    const after = statSync(foreign);
+    assert.equal(after.mode, before.mode);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+  });
+
   it('the owner file is 0600', () => {
     const rt = mkdtempSync(join(root, 'rt-'));
     const release = claimRuntime(rt);
