@@ -199,10 +199,10 @@ srt starts a proxy per sandbox, so that is about 1 GB for 10 agents and about 2 
 
 | Setup | 20 agents |
 |---|---|
-| Own walls (rewrite bench): ~72 MB proxy + 20 × 7.8 MB | ~228 MB |
+| Own walls (rewrite bench): ~78 MB proxy + 20 × 7.8 MB | ~234 MB |
 | srt | ~2 GB |
 
-The own-walls figure will grow. The proxy still has to load TLS handling, rwxmap and bareguard, and none of that is measured. Treat 228 MB as a floor to check, not a promise.
+The own-walls figure will grow. The proxy still has to load TLS handling, rwxmap and bareguard, and none of that is measured. Treat 234 MB as a floor to check, not a promise.
 
 ### M0 measured run (Oct 26, PASS 14/14)
 
@@ -276,7 +276,7 @@ Signed off by the user.
 | Memory per sandbox | ~100 MB (Node 82 + socat ~12 + bash ~8) | ~8 MB (socat 4.1 + walls peak ~3.8) |
 | Proxy | one per sandbox | one shared |
 | Start time | 1.87 / 2.05 / 1.98 s | 0.02–0.03 s (walls only) |
-| 20 agents | ~2 GB | ~228 MB rough sum (~72 MB proxy + 20 × 7.8 MB, rewrite bench) |
+| 20 agents | ~2 GB | ~234 MB rough sum (~78 MB proxy + 20 × 7.8 MB, rewrite bench) |
 | Blocks work | yes | yes |
 
 Memory is priority 1, and the per-sandbox proxy is the cost. We build the thin walls ourselves (a launcher of about 50 lines). srt stays as prior art. We borrow these ideas from it:
