@@ -7,6 +7,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync
 import { join, relative, dirname } from 'node:path';
 import { assertAgentName, isInside, realPathOf, runtimePaths } from './runtime.js';
 import { assertOverlaySupport, setupOverlay } from './overlay.js';
+import { configPath } from './config.js';
 
 // Locked drawers (relative to $HOME): masked wherever they exist — a folder
 // with an empty tmpfs, a file with /dev/null (bwrap cannot mount a tmpfs on
@@ -38,8 +39,6 @@ const LOCKED_PATHS = [
   // forge and password-manager CLIs
   '.config/gh',
   '.config/op',
-  // barebox's own config: settings the agent must neither read nor edit
-  '.config/barebox',
   // token files
   '.netrc',
   '.npmrc',
@@ -55,12 +54,14 @@ const LOCKED_PATHS = [
  * spellings; a target outside `$HOME` and the project is not bound into the
  * sandbox at all, so there is nothing to mask.
  *
- * @param {string} abs the locked path under `$HOME`
+ * @param {string} abs the locked path (under `$HOME` or the project to matter)
  * @param {string} home `$HOME`
  * @param {string} proj project dir
  * @returns {string[]} `--tmpfs <dir>` or `--dev-bind /dev/null <file>`, or `[]`
  */
 function lockMask(abs, home, proj) {
+  // Neither under $HOME nor the project: not bound into the sandbox at all.
+  if (!isInside(home, abs) && !isInside(proj, abs)) return [];
   let target = abs;
   let st;
   try {
@@ -200,6 +201,9 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   // or a project that contains one of these paths (a project that IS $HOME,
   // or holds its own `.ssh`) would leak the real drawer through the overlay.
   for (const p of LOCKED_PATHS) args.push(...lockMask(`${home}/${p}`, home, proj));
+  // barebox's own config: settings the agent must neither read nor edit.
+  // Masked wherever it resolves (XDG_CONFIG_HOME may move it).
+  args.push(...lockMask(dirname(configPath(process.env)), home, proj));
   // The runtime tree holds the file-checkpoint dirs (`asks/`, `answers/`
   // — the approve/deny capability) and every agent's socket (identity). A
   // read-only bind does NOT stop connect(2) to a unix socket, so wherever

@@ -36,8 +36,14 @@
 // bareguard) — the queue only parks what the decision function flags, and
 // everything flagged today is irreversible. Headers are excluded from the
 // payload (they carry Authorization secrets); the body preview is capped at
-// ASK_BODY_LIMIT bytes but otherwise verbatim — M3's bareguard `secrets`
-// redaction takes over redaction there.
+// ASK_BODY_LIMIT bytes with card numbers masked (`bodyPreview`) — M3's
+// bareguard `secrets` redaction takes over the rest.
+//
+// A held request's body lives on disk, never whole in memory: the proxy
+// spools it to `<runtime>/held/<id>` and this queue only keeps the preview
+// and byte count. The file ends with the hold: deny, timeout, abandon and
+// close delete it here (`dropBody`); an approve hands it to the proxy, which
+// deletes it once the upstream has read it.
 //
 // Answer payload (`answers/<id>.json`): `{ decision: 'allow' | 'deny',
 // reason? }`. `'approve'` is accepted as an alias of `'allow'`. Writers
@@ -45,9 +51,24 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { ensurePrivateDir, runtimePaths } from './runtime.js';
+import { maskCards } from './cardscan.js';
 
 /** Body preview cap for `asks/<id>.json` (bytes). */
 export const ASK_BODY_LIMIT = 4096;
+
+/** Default cap on a held body (bytes): over it the request is denied at the door. */
+export const DEFAULT_HOLD_MAX_BODY = 52428800;
+
+/**
+ * The one body preview, for the ask file and the audit log alike: the first
+ * ASK_BODY_LIMIT bytes as utf8, with card numbers masked.
+ *
+ * @param {Buffer} head the body's first bytes (anything past ASK_BODY_LIMIT is ignored)
+ * @returns {string} masked preview
+ */
+export function bodyPreview(head) {
+  return maskCards(head.subarray(0, ASK_BODY_LIMIT).toString('utf8'));
+}
 
 /** Default answer poll interval in ms (PRD Q9). */
 export const DEFAULT_POLL_MS = 250;
@@ -57,7 +78,7 @@ const MAX_WAITING_PER_AGENT = 16;
 
 /**
  * A parked request, as returned by {@link pending}. Plain objects only —
- * the queue itself never leaves this module. No body: returning whole 1 MB
+ * the queue itself never leaves this module. No body: returning whole
  * bodies from a status call is never needed, and the ask payload in
  * `asks/<id>.json` carries the preview.
  *
@@ -94,7 +115,7 @@ const MAX_WAITING_PER_AGENT = 16;
  * @property {string} url full URL
  * @property {string} rule hold-reason string from the decision function
  * @property {string} letter always `'x'` until M3 owns letters
- * @property {string} bodyPreview request body preview, utf8, capped at ASK_BODY_LIMIT bytes
+ * @property {string} bodyPreview request body preview, utf8, capped at ASK_BODY_LIMIT bytes, card numbers masked
  * @property {boolean} truncated true when the body exceeded ASK_BODY_LIMIT
  * @property {number} waitingSec 0 at park; readers use the file mtime for a live value
  * @property {string|null} expiresAt ISO-8601 UTC deadline, or null when `timeoutMs: 'never'`
@@ -216,17 +237,17 @@ export function normalizeDecision(input, { approveAlias = false } = {}) {
  * @param {ShouldHold} [opts.shouldHold] decision function (default: path-substring `match`)
  * @param {string} [opts.match] path substring that parks a request (default impl when `shouldHold` is absent)
  * @param {number|string} [opts.timeoutMs] hold deadline in ms, or `'never'` (default 120000)
- * @param {number} [opts.maxBody] bodies over this are denied at the door, never queued (default 1048576)
+ * @param {number} [opts.maxBody] bodies over this are denied at the door, never queued (default 52428800)
  * @param {string|null} [opts.runtime] runtime dir; required for the default file checkpoint (writes `asks/`, polls `answers/`)
  * @param {OnAsk|null} [opts.onAsk] ask seam (bareguard `humanChannel` shape); when present no files are involved
  * @param {number} [opts.pollMs] answer poll interval in ms for the default file checkpoint (default 250, PRD Q9)
  * @param {OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle or abandon
  * @param {(entry: object) => void} opts.onApprove forward the parked request upstream
  * @param {(entry: object, reason: string) => void} opts.onDeny refuse the parked request
- * @returns {{ add: (entry: object) => string|null, reserve: (agent: string, cbs: { onReady: () => void, onExpire: (reason: string) => void }) => { state: 'now'|'queued'|'full', arrivedAt: number, cancel: () => void }, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
+ * @returns {{ add: (entry: object) => string|null, dropBody: (id: string) => void, reserve: (agent: string, cbs: { onReady: () => void, onExpire: (reason: string) => void }) => { state: 'now'|'queued'|'full', id: string, arrivedAt: number, cancel: () => void }, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
  */
 export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
-  maxBody = 1048576, runtime = null, onAsk = null, pollMs = DEFAULT_POLL_MS,
+  maxBody = DEFAULT_HOLD_MAX_BODY, runtime = null, onAsk = null, pollMs = DEFAULT_POLL_MS,
   onEvent = null, onApprove, onDeny }) {
   // The default IS matchPath: one definition of the path-substring rule (see below).
   const decide = shouldHold ?? (match ? matchPath(match) : () => null);
@@ -255,6 +276,13 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   if (paths) {
     ensurePrivateDir(paths.asksDir);
     ensurePrivateDir(paths.answersDir);
+    ensurePrivateDir(paths.heldDir);
+    // Held bodies of a dead queue are orphans (ids restart at h1).
+    try {
+      for (const name of fs.readdirSync(paths.heldDir)) {
+        try { fs.unlinkSync(path.join(paths.heldDir, name)); } catch {}
+      }
+    } catch {}
   }
   // A dead queue's leftovers must never decide the next queue's holds
   // (ids restart at h1): clear both folders at start, logging one audit
@@ -290,7 +318,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
    * @type {Map<string, { holder: object|null, line: Array<object> }>}
    */
   const slots = new Map();
-  /** Internal reserve state by returned handle identity. @type {WeakMap<object, { agent: string, onReady: () => void, onExpire: (reason: string) => void, timer: ReturnType<typeof setTimeout>|null, consumed: boolean, done: boolean }>} */
+  /** Internal reserve state by returned handle identity. @type {WeakMap<object, { agent: string, onReady: () => void, onExpire: (reason: string) => void, timer: ReturnType<typeof setTimeout>|null, consumed: boolean, done: boolean, id: string }>} */
   const handleState = new WeakMap();
 
   /**
@@ -357,7 +385,6 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
    * @returns {AskPayload}
    */
   function askPayload(entry, ms, rule) {
-    const body = Buffer.isBuffer(entry.body) ? entry.body : Buffer.from(String(entry.body ?? ''));
     return {
       id: entry.id,
       agent: entry.agent,
@@ -366,8 +393,8 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       rule,
       // M3 owns letters; everything the queue parks today is irreversible.
       letter: 'x',
-      bodyPreview: body.subarray(0, ASK_BODY_LIMIT).toString('utf8'),
-      truncated: body.length > ASK_BODY_LIMIT,
+      bodyPreview: entry.preview,
+      truncated: entry.bodyBytes > ASK_BODY_LIMIT,
       waitingSec: 0,
       // ISO-8601 UTC (not epoch ms): readable in `sbx pending` and logs.
       expiresAt: ms === null ? null : new Date(entry.t0 + ms).toISOString(),
@@ -379,6 +406,18 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
     try {
       fs.unlinkSync(paths.askFile(id));
     } catch {}
+  }
+
+  /**
+   * The one deleter of a held body file (the proxy calls it too, after an
+   * approved upstream has read it, or when a reservation never parks).
+   *
+   * @param {string} id hold id
+   * @returns {void}
+   */
+  function dropBody(id) {
+    if (!paths) return;
+    try { fs.unlinkSync(paths.heldFile(id)); } catch {}
   }
 
   function settle(id, approved, reason) {
@@ -393,6 +432,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       log({ ev: 'decide', id, agent: h.agent, decision, reason: reason || undefined });
       onApprove(h);
     } else {
+      dropBody(id);
       log({ ev: 'decide', id, agent: h.agent, decision, reason });
       onDeny(h, reason);
     }
@@ -488,18 +528,21 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
      * parks nothing and returns `null`. Without `slot`, parks exactly as
      * before, without limit.
      *
+     * The entry carries the masked `preview`, the full `bodyBytes` and, when
+     * the body was spooled, its `bodyFile`; never the body itself.
+     *
      * @param {object} entry queue entry
      * @returns {string|null} hold id, or null for a finished slot
      */
-    add({ agent, method, url, headers, body, sock, cres, note, slot, arrivedAt }) {
+    add({ agent, method, url, headers, preview = '', bodyBytes = 0, bodyFile = null, sock, cres, note, slot, arrivedAt }) {
       const hst = typeof slot === 'object' && slot !== null ? handleState.get(slot) : undefined;
       const s = slots.get(agent);
       if (slot && (!hst || hst.done || !s || s.holder !== slot)) return null;
-      const id = `h${++n}`;
+      const id = hst?.id ?? `h${++n}`;
       const ms = deadlineMs();
       const t0 = typeof arrivedAt === 'number' ? arrivedAt : Date.now();
       const entry = {
-        id, agent, method, url, headers, body, sock, cres, note, t0,
+        id, agent, method, url, headers, preview, bodyBytes, bodyFile, sock, cres, note, t0,
         slot: null,
         timer: ms === null ? null
           : setTimeout(() => settle(id, false, 'hold timeout'), Math.max(0, ms - (Date.now() - t0))),
@@ -524,7 +567,9 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
      * Ask for this agent's hold slot before reading a held request's body.
      * @param {string} agent
      * @param {{ onReady: () => void, onExpire: (reason: string) => void }} cbs
-     * @returns {{ state: 'now'|'queued'|'full', arrivedAt: number, cancel: () => void }}
+     * The handle's `id` is the id its hold will have (empty when `full`), so
+     * the body file can be named before the hold parks.
+     * @returns {{ state: 'now'|'queued'|'full', id: string, arrivedAt: number, cancel: () => void }}
      */
     reserve(agent, { onReady, onExpire }) {
       const arrivedAt = Date.now();
@@ -532,13 +577,15 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       // receives that same object as `slot`, so holder comparisons use it.
       // The one deadline timer lives here, armed below for 'now' and
       // 'queued' alike; expiry runs through `expireReservation` only.
-      /** @type {{ agent: string, onReady: () => void, onExpire: (reason: string) => void, timer: ReturnType<typeof setTimeout>|null, consumed: boolean, done: boolean }} */
-      const st = { agent, onReady, onExpire, timer: null, consumed: false, done: false };
+      /** @type {{ agent: string, onReady: () => void, onExpire: (reason: string) => void, timer: ReturnType<typeof setTimeout>|null, consumed: boolean, done: boolean, id: string }} */
+      const st = { agent, onReady, onExpire, timer: null, consumed: false, done: false, id: '' };
       const s0 = slots.get(agent);
       /** @type {'now'|'queued'|'full'} */
       const state = !s0 ? 'now' : (s0.line.length >= MAX_WAITING_PER_AGENT ? 'full' : 'queued');
+      if (state !== 'full') st.id = `h${++n}`;
       const handle = {
         state,
+        id: st.id,
         arrivedAt,
         cancel() {
           if (st.done) return;
@@ -586,6 +633,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       if (h.timer) clearTimeout(h.timer);
       if (h.slot) releaseSlot(h.agent);
       removeAskFile(id);
+      dropBody(id);
       log({ ev: 'hold-abandoned', id, agent: h.agent, method: h.method, url: h.url });
       onDeny(h, 'client gone');
       onEvent?.({ type: 'decided', id, decision: 'deny', reason: 'client gone' });
@@ -598,6 +646,8 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
     },
 
     decide(req) { return decide(req); },
+
+    dropBody,
 
     pending() { return [...queue.values()].map(pub); },
 

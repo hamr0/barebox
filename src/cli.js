@@ -6,7 +6,7 @@
 // a partial). The runtime comes from SBX_RUNTIME only; there is no
 // cwd-relative default.
 //
-// Settings (mode, holdTimeoutSec) come from the one config file, see config.js;
+// Settings (mode, holdTimeoutSec, heldBodyMaxMB) come from the one config file, see config.js;
 // a flag beats the file. A bad file is a usage-class error (exit 2).
 //
 // sbx run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]
@@ -162,7 +162,7 @@ async function run(args) {
     usage();
   }
   if (values.mode !== undefined && !['ask', 'auto', 'trust'].includes(values.mode)) usage();
-  /** @type {{ mode: string, holdTimeoutSec: number|string }} */
+  /** @type {{ mode: string, holdTimeoutSec: number|string, heldBodyMaxMB?: number }} */
   let cfg;
   try {
     cfg = resolveConfig({ mode: values.mode });
@@ -201,6 +201,7 @@ async function run(args) {
       .map((s) => s.trim()).filter(Boolean);
     result = await sandboxRun({
       runtime, proj: process.cwd(), command, mode, timeoutMs,
+      ...(cfg.heldBodyMaxMB ? { heldBodyMaxBytes: cfg.heldBodyMaxMB * 1048576 } : {}),
       unsafeTestOnly: { allowLoopback: process.env.SBX_UNSAFE_TEST_ALLOW_LOOPBACK === '1' },
       overlay,
       ...(extraIgnore.length ? { overlayIgnore: ['node_modules', ...extraIgnore] } : {}),

@@ -8,6 +8,7 @@
 // Timeout shape: the client idle clock is the server's keep-alive timeout —
 // by construction it only ticks when no request is in flight. The upstream
 // response gets its own much longer clock.
+import crypto from 'node:crypto';
 import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
@@ -15,7 +16,8 @@ import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ensureCA, certFor, HOST_RE } from './certs.js';
-import { createHolds } from './holds.js';
+import { createCardScanner } from './cardscan.js';
+import { ASK_BODY_LIMIT, DEFAULT_HOLD_MAX_BODY, bodyPreview, createHolds } from './holds.js';
 import { claimRuntime, ensurePrivateDir, runtimePaths } from './runtime.js';
 import { checkUpstream } from './wall.js';
 
@@ -24,13 +26,18 @@ const SECURE = Symbol('secure');
 const IP_RE = /^\d+\.\d+\.\d+\.\d+$/;
 // Hop-by-hop headers must not be forwarded: node's HTTP stack re-frames.
 const HOP_REQ = new Set(['proxy-connection', 'proxy-authorization']);
+// Bodies up to this size are read whole (under the agent's working slot) so
+// the card floor can scan them; a bigger body streams on, unchecked.
+const WORK_BODY_LIMIT = 65536;
+const CARD_REASON = 'card number in body (floor)';
+const EMPTY = Buffer.alloc(0);
 const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
   'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
 
 // Secrets never land in the audit log verbatim: Authorization-style header
 // values are replaced with a fixed marker before an entry is written. The
 // user's `redact` hook runs after this scrubbing, so it sees (and further
-// shapes) an already-safe entry. Bodies stay logged as-is.
+// shapes) an already-safe entry. Bodies are logged as a masked preview only.
 const REDACTED = '[redacted]';
 // Interim set (M3 replaces this with bareguard's `secrets` redaction): header names whose values never land verbatim.
 const SENSITIVE_HEADERS = new Set(['authorization', 'proxy-authorization',
@@ -73,7 +80,6 @@ function scrubSecrets(entry) {
  * @property {(host: string) => Promise<string[] | string | null>} [unsafeTestOnly.resolveUpstream]
  *   DNS stub: replaces the wall's resolver so rebinding is testable. Production omits it.
  * @property {number} [clientIdleMs] kill a client tunnel idle this long; never fires mid-request (default 60000)
- * @property {number} [maxLogBody] log at most this many request-body bytes, then `truncated: true` (default 1048576)
  * @property {(entry: Record<string, unknown>) => Record<string, unknown>} [redact] log redaction hook, applied after built-in secret scrubbing (default: identity)
  */
 
@@ -84,7 +90,7 @@ function scrubSecrets(entry) {
  * @property {string} [match] path substring that parks a request (default decision)
  * @property {import('./holds.js').ShouldHold} [shouldHold] decision function; overrides `match`
  * @property {number|string} [timeoutMs] hold deadline in ms, or `'never'` (default 120000)
- * @property {number} [maxBody] bodies over this are denied at the door, never queued (default 1048576)
+ * @property {number} [maxBody] bodies over this are denied at the door, never queued; held bodies spool to `<runtime>/held` (default 52428800)
  * @property {import('./holds.js').OnAsk|null} [onAsk] ask seam (bareguard `humanChannel` shape).
  *   When present no files are involved; omit it for the default file checkpoint
  *   (`<runtime>/asks` + `<runtime>/answers`, `sbx pending/approve/deny`).
@@ -100,8 +106,9 @@ function scrubSecrets(entry) {
  * @property {string} method HTTP method
  * @property {string} url full URL
  * @property {Record<string, string | string[] | undefined>} headers
- * @property {Buffer} [body] buffered body (approve path)
- * @property {import('node:http').IncomingMessage} [stream] live body (direct path)
+ * @property {Buffer} [body] buffered body
+ * @property {Buffer} [prefix] bytes already read from `stream`, written upstream before it
+ * @property {import('node:stream').Readable} [stream] live body: the request itself, or a held body's file
  * @property {import('node:http').ServerResponse} cres parked or live client response
  */
 
@@ -113,7 +120,7 @@ function scrubSecrets(entry) {
 
 /**
  * Start the front-door proxy. Every request is logged with its method, URL,
- * headers and body; bytes go upstream untouched. Requests the hold rule
+ * headers and a masked body preview, byte count and SHA-256; bytes go upstream untouched. Requests the hold rule
  * flags park for a human decision instead of forwarding.
  *
  * @param {ProxyOptions} opts
@@ -131,7 +138,7 @@ export function createProxy(opts) {
     upstreamCa = null, hold = null,
     upstreamTimeoutMs = 120000, clientIdleMs = 60000,
     unsafeTestOnly = null,
-    maxLogBody = 1048576, redact = (e) => e } = opts ?? {};
+    redact = (e) => e } = opts ?? {};
   const { allowLoopback = false, resolveUpstream = null } = unsafeTestOnly ?? {};
   const gate = { allowLoopback, resolveUpstream: resolveUpstream ?? undefined };
   if (!logFile) throw new Error('createProxy: logFile is required');
@@ -143,7 +150,8 @@ export function createProxy(opts) {
   // Always `<runtime>/certs`: one layout, owned by runtime.js, so there is
   // nothing to contain and no check to fail.
   const certDir = runtimePaths(runtime).certsDir;
-  const holdMaxBody = hold?.maxBody ?? 1048576;
+  const holdMaxBody = hold?.maxBody ?? DEFAULT_HOLD_MAX_BODY;
+  const heldFile = runtimePaths(runtime).heldFile;
 
   // Open the audit log synchronously: a bad `logFile` (a directory, a
   // missing parent, no permission) throws here, where the claim can still
@@ -218,18 +226,29 @@ export function createProxy(opts) {
   // Enforcement sits here (every forward, incl. the approve path) AND at
   // the door (request handler + CONNECT): a parked hold is re-checked on
   // approve, so a DNS change while parked cannot slip through.
+  // A body stream nobody will pipe: a held file is closed (its owner then
+  // deletes it); a live request is drained so its response can go out.
+  /** @param {import('node:stream').Readable|undefined} stream */
+  function discard(stream) {
+    try {
+      if (stream instanceof fs.ReadStream) stream.destroy();
+      else stream?.resume();
+    } catch {}
+  }
+
   /** @param {ForwardArgs} args */
-  async function forward({ agent, method, url, headers, body, stream, cres }) {
+  async function forward({ agent, method, url, headers, body, prefix, stream, cres }) {
     let u;
     try {
       u = new URL(url);
     } catch {
+      discard(stream);
       denyRes(cres, 400, 'bad request target');
       return;
     }
     const verdict = await checkUpstream(u.hostname, gate);
     if (!verdict.ok) {
-      try { stream?.resume(); } catch {}
+      discard(stream);
       denyRes(cres, 403, verdict.reason);
       return;
     }
@@ -237,19 +256,19 @@ export function createProxy(opts) {
     // throw before it can answer must still be loud, never a floating reject.
     // The dial is pinned to the checked IPs: no second DNS resolution.
     try {
-      forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIps: verdict.ips });
+      forwardInner({ agent, method, url, headers, body, prefix, stream, cres, u, upstreamIps: verdict.ips });
     } catch (e) {
       // The live stream arrives paused (see handleRequest): unpause so no
       // paused stream leaks on this path.
-      try { stream?.resume(); } catch {}
+      discard(stream);
       denyRes(cres, 502, `upstream failed: ${e.message}`);
     }
   }
 
   /** @param {ForwardArgs & { u: URL, upstreamIps: string[] }} args */
-  function forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIps }) {
+  function forwardInner({ agent, method, url, headers, body, prefix, stream, cres, u, upstreamIps }) {
     const sock = cres.socket;
-    if (!sock) return; // no transport left to answer on
+    if (!sock) { discard(stream); return; } // no transport left to answer on
     const secure = u.protocol === 'https:';
     /** @type {Record<string, string | string[] | undefined>} */
     const fwdHeaders = {};
@@ -320,8 +339,16 @@ export function createProxy(opts) {
       if (!done && !cres.writableEnded) { done = true; upstreams.delete(up); up.destroy(); }
     });
     if (body) up.end(body);
-    else if (stream) stream.pipe(up);
-    else up.end();
+    else if (stream) {
+      // A held body's file: closed when the request is done with it, and a
+      // read failure (the file vanished) fails the request, never crashes.
+      if (stream instanceof fs.ReadStream) {
+        up.once('close', () => stream.destroy());
+        stream.once('error', (e) => up.destroy(e));
+      }
+      if (prefix?.length) up.write(prefix);
+      stream.pipe(up);
+    } else up.end();
   }
 
   // The rest of setup is infallible synchronously except this call, so a
@@ -339,8 +366,15 @@ export function createProxy(opts) {
       onAsk: hold.onAsk,
       pollMs: hold.pollMs,
       onEvent: hold.onEvent,
-      onApprove: (h) => forward({ agent: h.agent, method: h.method, url: h.url,
-        headers: h.headers, body: h.body, cres: h.cres }),
+      onApprove: (h) => {
+        const common = { agent: h.agent, method: h.method, url: h.url, cres: h.cres };
+        if (!h.bodyFile) return forward({ ...common, headers: h.headers, body: EMPTY });
+        // The file is the exact body; the client's own framing (length or
+        // chunked) still describes it. Its owner deletes it once the upstream is done.
+        const rs = fs.createReadStream(h.bodyFile);
+        rs.on('close', () => holds?.dropBody(h.id));
+        return forward({ ...common, headers: h.headers, stream: rs });
+      },
       onDeny: (h, reason) => denyRes(h.cres, 403, `denied: ${reason}`),
     }) : null;
   } catch (e) {
@@ -379,65 +413,182 @@ export function createProxy(opts) {
     }
     const queue = holds;
     const reason = queue ? queue.decide({ agent, method, url: urlStr, headers: creq.headers }) : null;
+    const cl = Number(creq.headers['content-length'] ?? 0);
+    const hasBody = creq.headers['transfer-encoding'] !== undefined || cl > 0;
 
-    // Tee the body for the log (capped). A held request buffers it whole —
-    // bounded by maxBody — so approve can forward it after the human decides.
-    // Anything else streams straight through; the tee only feeds the log.
-    const chunks = [];
-    let size = 0;
-    let over = false;
-    const finishLog = () => {
-      const body = Buffer.concat(chunks);
-      log({ ev: 'req', agent, method: creq.method, url: urlStr,
-        headers: creq.headers, body: body.toString('utf8'),
-        ...(over ? { truncated: true, bodyBytes: size } : {}) });
-      return body;
-    };
-    if (!reason || !queue) {
-      // Pause before any body listener: the tee below would otherwise put
-      // the stream in flowing mode, and forward() awaits a second wall
-      // check before forwardInner pipes to upstream — body bytes arriving
-      // during that wait would go to the tee only, starving upstream
-      // against Content-Length. Buffered here, pipe() resumes the flow,
-      // so both the tee and upstream see the whole body.
-      creq.pause();
-      creq.on('data', (c) => {
-        size += c.length;
-        if (size > maxLogBody || over) { over = true; return; }
-        chunks.push(c);
-      });
-      creq.on('end', finishLog);
-      creq.on('error', () => {});
-      forward({ agent, method, url: urlStr,
-        headers: { ...creq.headers }, stream: creq, cres });
+    // Pause before any body listener: a listener would put the stream in
+    // flowing mode and starve whoever reads it next. The tee sees every body
+    // byte once, whatever path reads it, and feeds only the log: a masked
+    // 4 KB preview, the byte count and a SHA-256 (constant memory).
+    creq.pause();
+    const tee = makeTee();
+    creq.on('data', (c) => tee.push(c));
+    creq.on('end', () => {
+      log({ ev: 'req', agent, method, url: urlStr, headers: creq.headers,
+        bodyPreview: bodyPreview(tee.head), bodyBytes: tee.bytes, bodySha256: tee.digest() });
+    });
+    creq.on('error', () => {});
+
+    // Nothing to inspect or hold: straight through. pipe() resumes the flow.
+    if (!queue || (!reason && !hasBody)) {
+      forward({ agent, method, url: urlStr, headers: { ...creq.headers }, stream: creq, cres });
       return;
     }
-    // One held request per agent reads its body at a time; the rest wait
-    // unread in line. No body listener (it would resume the stream) until
-    // `onReady`. A request that never parks frees its slot when `cres` closes.
-    creq.pause();
-    const readHeld = () => {
-      creq.on('data', (c) => {
-        size += c.length;
-        if (size > holdMaxBody) { over = true; return; }
-        chunks.push(c);
-      });
-      creq.on('error', () => { denyRes(cres, 502, 'client body failed'); });
-      creq.on('end', () => {
-        if (over) { denyRes(cres, 403, 'body too large to hold'); return; }
-        const body = finishLog();
-        // Parked: the tunnel stays open until the ask channel decides. The
-        // hold reason travels as `note` so the ask file carries its `rule`.
-        // null: the reservation already expired and onExpire answered 403.
-        queue.add({ agent, method, url: urlStr,
-          headers: { ...creq.headers }, body, sock, cres, note: reason,
-          slot, arrivedAt: slot.arrivedAt });
-      });
-      creq.resume();
+    if (!reason) {
+      // An allowed request with a body: one body at a time per agent, read
+      // whole up to 64 KB so the card floor can scan it.
+      const free = await takeWorkSlot(agent, cres);
+      try {
+        if (sock.destroyed) return;
+        const r = await readBounded(creq, WORK_BODY_LIMIT);
+        if (r.aborted) return;
+        const head = { agent, method, url: urlStr, headers: { ...creq.headers }, cres };
+        if (r.over) {
+          // Past 64 KB: send what was read, pipe the rest, unchecked (known gap).
+          await forward({ ...head, prefix: Buffer.concat(r.chunks), stream: creq });
+          return;
+        }
+        const body = Buffer.concat(r.chunks);
+        if (createCardScanner().push(body)) {
+          holdBuffered(queue, body, tee, head);
+          return;
+        }
+        await forward({ ...head, body });
+      } finally {
+        free();
+      }
+      return;
+    }
+    holdStreamed(queue, reason, hasBody, tee, creq, cres, sock, agent, method, urlStr);
+  }
+
+  /**
+   * Constant-memory tee of a request body: the first ASK_BODY_LIMIT bytes,
+   * the byte count and a running SHA-256.
+   */
+  function makeTee() {
+    const hash = crypto.createHash('sha256');
+    let head = EMPTY;
+    let bytes = 0;
+    return {
+      push(/** @type {Buffer} */ c) {
+        hash.update(c);
+        bytes += c.length;
+        if (head.length < ASK_BODY_LIMIT) head = Buffer.concat([head, c.subarray(0, ASK_BODY_LIMIT - head.length)]);
+      },
+      get head() { return head; },
+      get bytes() { return bytes; },
+      digest: () => hash.copy().digest('hex'),
     };
+  }
+
+  // One working slot per agent: a FIFO of body reads. A slot frees when its
+  // holder calls the returned function, or when its response closes (a dead
+  // client never wedges the line). Waiters stay paused and unread.
+  /** @type {Map<string, Promise<void>>} */
+  const workTail = new Map();
+  /**
+   * @param {string} agent agent name
+   * @param {import('node:http').ServerResponse} cres the request's response
+   * @returns {Promise<() => void>} resolves with `free` once the slot is ours
+   */
+  function takeWorkSlot(agent, cres) {
+    const prev = workTail.get(agent) ?? Promise.resolve();
+    /** @type {() => void} */
+    let free = () => {};
+    const mine = new Promise((resolve) => { free = () => resolve(undefined); });
+    const tail = prev.then(() => mine);
+    workTail.set(agent, tail);
+    void tail.then(() => { if (workTail.get(agent) === tail) workTail.delete(agent); });
+    cres.once('close', free);
+    return prev.then(() => free);
+  }
+
+  /**
+   * Read a paused request's body until it ends or passes `limit` bytes
+   * (then pause again, keeping everything read so far in `chunks`).
+   *
+   * @param {import('node:http').IncomingMessage} creq paused request
+   * @param {number} limit byte limit
+   * @returns {Promise<{ chunks: Buffer[], over: boolean, aborted: boolean }>}
+   */
+  function readBounded(creq, limit) {
+    return new Promise((resolve) => {
+      /** @type {Buffer[]} */
+      const chunks = [];
+      let size = 0;
+      /** @param {boolean} over @param {boolean} aborted */
+      const done = (over, aborted) => {
+        creq.off('data', onData);
+        creq.off('end', onEnd);
+        creq.off('close', onGone);
+        creq.off('error', onGone);
+        resolve({ chunks, over, aborted });
+      };
+      const onData = (/** @type {Buffer} */ c) => {
+        chunks.push(c);
+        size += c.length;
+        if (size > limit) { creq.pause(); done(true, false); }
+      };
+      const onEnd = () => done(false, false);
+      const onGone = () => done(false, true);
+      creq.on('data', onData);
+      creq.on('end', onEnd);
+      creq.on('close', onGone);
+      creq.on('error', onGone);
+      creq.resume();
+    });
+  }
+
+  /**
+   * An allowed request whose small body holds a card number becomes a hold
+   * in every mode (the floor). The body is already in hand: spool it to its
+   * file, then enter the agent's line like any other hold.
+   */
+  function holdBuffered(queue, body, tee, head) {
+    const { agent, cres } = head;
+    const sock = cres.socket;
+    let parked = false;
     const slot = queue.reserve(agent, {
-      onReady: readHeld,
-      onExpire: (why) => { denyRes(cres, 403, `denied: ${why}`); creq.resume(); },
+      onReady: () => park(),
+      onExpire: (why) => { queue.dropBody(slot.id); denyRes(cres, 403, `denied: ${why}`); },
+    });
+    if (slot.state === 'full') { denyRes(cres, 429, 'hold queue full'); return; }
+    const file = heldFile(slot.id);
+    try {
+      fs.writeFileSync(file, body, { mode: 0o600 });
+    } catch (e) {
+      slot.cancel();
+      denyRes(cres, 500, `cannot hold body: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    cres.on('close', () => { if (!parked) { slot.cancel(); queue.dropBody(slot.id); } });
+    function park() {
+      if (!sock || sock.destroyed) { slot.cancel(); queue.dropBody(slot.id); return; }
+      parked = queue.add({ agent, method: head.method, url: head.url, headers: head.headers,
+        preview: bodyPreview(tee.head), bodyBytes: tee.bytes, bodyFile: file,
+        sock, cres, note: CARD_REASON, slot, arrivedAt: slot.arrivedAt }) !== null;
+    }
+    if (slot.state === 'now') park();
+  }
+
+  /**
+   * A request `decide()` holds: reserve the agent's hold slot first, then
+   * (at the front of the line) spool its body to `<runtime>/held/<id>` as it
+   * is read, capped at `holdMaxBody`; the queue keeps only the preview.
+   */
+  function holdStreamed(queue, reason, hasBody, tee, creq, cres, sock, agent, method, urlStr) {
+    /** @type {(() => void)|null} */
+    let abort = null;
+    let parked = false;
+    const slot = queue.reserve(agent, {
+      onReady: () => readHeld(),
+      onExpire: (why) => {
+        abort?.();
+        queue.dropBody(slot.id);
+        denyRes(cres, 403, `denied: ${why}`);
+        creq.resume();
+      },
     });
     if (slot.state === 'full') {
       denyRes(cres, 429, 'hold queue full');
@@ -447,8 +598,68 @@ export function createProxy(opts) {
     // The client may have died during the wall's DNS await, before this
     // listener existed: its 'close' is already past, so release here.
     if (sock.destroyed) { slot.cancel(); return; }
-    cres.on('close', () => slot.cancel());
+    cres.on('close', () => {
+      if (parked) return;
+      abort?.();
+      slot.cancel();
+      queue.dropBody(slot.id);
+    });
     if (slot.state === 'now') readHeld();
+
+    function readHeld() {
+      const file = heldFile(slot.id);
+      let ws = null;
+      let over = false;
+      let dead = false;
+      let size = 0;
+      abort = () => {
+        if (dead) return;
+        dead = true;
+        ws?.destroy();
+        queue.dropBody(slot.id);
+      };
+      if (hasBody) {
+        try {
+          // Open synchronously: a later unlink can then never race the create.
+          ws = fs.createWriteStream('', { fd: fs.openSync(file, 'wx', 0o600) });
+        } catch (e) {
+          abort();
+          denyRes(cres, 500, `cannot hold body: ${e instanceof Error ? e.message : String(e)}`);
+          creq.resume();
+          return;
+        }
+        ws.on('error', (e) => {
+          abort?.();
+          denyRes(cres, 500, `cannot hold body: ${e.message}`);
+          creq.resume();
+        });
+      }
+      creq.on('data', (c) => {
+        if (dead || over) return;
+        size += c.length;
+        if (size > holdMaxBody) { over = true; abort?.(); return; }
+        if (ws && !ws.write(c)) {
+          creq.pause();
+          ws.once('drain', () => creq.resume());
+        }
+      });
+      creq.on('error', () => { abort?.(); denyRes(cres, 502, 'client body failed'); });
+      creq.on('end', () => {
+        if (over) { denyRes(cres, 403, 'body too large to hold'); return; }
+        if (dead) return;
+        const parkIt = () => {
+          if (dead) return;
+          // Parked: the tunnel stays open until the ask channel decides. The
+          // hold reason travels as `note` so the ask file carries its `rule`.
+          // null: the reservation already expired and onExpire answered 403.
+          parked = queue.add({ agent, method, url: urlStr, headers: { ...creq.headers },
+            preview: bodyPreview(tee.head), bodyBytes: tee.bytes, bodyFile: ws ? file : null,
+            sock, cres, note: reason, slot, arrivedAt: slot.arrivedAt }) !== null;
+        };
+        if (ws) { ws.once('finish', parkIt); ws.end(); } else parkIt();
+      });
+      creq.resume();
+    }
   }
   // Idle tunnels die here; a request in flight is never idle by definition.
   server.keepAliveTimeout = clientIdleMs;

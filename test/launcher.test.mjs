@@ -432,6 +432,44 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     assert.equal(r.code, 0, `exit ${r.code} (11 config.json readable, 12 drawer not empty): ${r.err}`);
   });
 
+  it('masks the config where XDG_CONFIG_HOME puts it', async () => {
+    await listenSock('t1d');
+    mkdirSync(join(home, 'altcfg', 'barebox'), { recursive: true });
+    writeFileSync(join(home, 'altcfg', 'barebox', 'config.json'), '{"mode":"trust"}\n');
+    const script = [
+      '[ -z "$(cat "$HOME/altcfg/barebox/config.json" 2>/dev/null)" ] || exit 11',
+      '[ -z "$(ls -A "$HOME/altcfg/barebox")" ] || exit 12',
+    ].join('\n');
+    const prev = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = join(home, 'altcfg');
+    let c;
+    try {
+      c = launch({ runtime: rt, agent: 't1d', proj, command: ['bash', '-c', script] });
+    } finally {
+      if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prev;
+    }
+    const r = await run(c);
+    assert.equal(r.code, 0, `exit ${r.code} (11 altcfg config readable, 12 drawer not empty): ${r.err}`);
+  });
+
+  it('held bodies fall under the runtime mask: invisible inside', async () => {
+    const rtHome = join(home, 'rt-held');
+    mkdirSync(join(rtHome, 'held'), { recursive: true });
+    mkdirSync(join(rtHome, 'socks'), { recursive: true });
+    writeFileSync(join(rtHome, 'held', 'h1'), 'held-body-secret');
+    const srv = net.createServer((s) => s.resume());
+    await new Promise((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(join(rtHome, 'socks', 'th.sock'), resolve);
+    });
+    servers.push(srv);
+    const c = launch({ runtime: rtHome, agent: 'th', proj,
+      command: ['bash', '-c', 'test ! -e "$HOME/rt-held/held" && test ! -e "$HOME/rt-held/held/h1" && ! cat "$HOME/rt-held/held/h1" 2>/dev/null'] });
+    const r = await run(c);
+    assert.equal(r.code, 0, `held/ must not show through: ${r.err}`);
+  });
+
   it('binds project read-only', async () => {
     await listenSock('t2');
     const c = launch({ runtime: rt, agent: 't2', proj,

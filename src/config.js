@@ -1,7 +1,7 @@
 // barebox's one config file: `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`.
 // Only the CLI reads it; library callers (`run`, `createProxy`) pass options.
 // Later modules add keys here, not a second file. The sandbox never sees it
-// (`.config/barebox` is in the launcher's locked paths).
+// (the launcher masks the directory this file lives in).
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,6 +14,7 @@ const KEYS = {
   mode: (v) => (MODES.includes(v) ? null : `must be one of ${MODES.join(', ')}`),
   holdTimeoutSec: (v) => (v === 'never' || (Number.isInteger(v) && v > 0)
     ? null : 'must be a positive integer or "never"'),
+  heldBodyMaxMB: (v) => (Number.isInteger(v) && v > 0 ? null : 'must be a positive integer'),
 };
 
 /**
@@ -31,7 +32,7 @@ export function configPath(env = process.env) {
  * Read the config file over the defaults. No file means defaults.
  *
  * @param {NodeJS.ProcessEnv} [env] environment to read (default `process.env`)
- * @returns {{ mode: string, holdTimeoutSec: number|string }} effective settings
+ * @returns {{ mode: string, holdTimeoutSec: number|string, heldBodyMaxMB?: number }} effective settings (`heldBodyMaxMB` absent means the library default)
  * @throws {Error} naming the file (and the key) on invalid JSON, an unknown key or a bad value
  */
 export function loadConfig(env = process.env) {
@@ -66,7 +67,7 @@ export function loadConfig(env = process.env) {
  * @param {object} [flags] values given on the command line
  * @param {string} [flags.mode] `--mode`
  * @param {NodeJS.ProcessEnv} [env] environment to read (default `process.env`)
- * @returns {{ mode: string, holdTimeoutSec: number|string }} effective settings
+ * @returns {{ mode: string, holdTimeoutSec: number|string, heldBodyMaxMB?: number }} effective settings (`heldBodyMaxMB` absent means the library default)
  * @throws {Error} as {@link loadConfig}
  */
 export function resolveConfig(flags = {}, env = process.env) {

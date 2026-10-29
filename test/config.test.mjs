@@ -63,6 +63,18 @@ describe('config file', () => {
     }
   });
 
+  it('heldBodyMaxMB: a positive integer is read, absent means the library default, bad values name the key', () => {
+    const ok = xdg('{"heldBodyMaxMB":8}');
+    assert.equal(resolveConfig({}, { XDG_CONFIG_HOME: ok.XDG_CONFIG_HOME }).heldBodyMaxMB, 8);
+    assert.equal('heldBodyMaxMB' in loadConfig({ XDG_CONFIG_HOME: xdg().XDG_CONFIG_HOME }), false);
+    for (const text of ['{"heldBodyMaxMB":0}', '{"heldBodyMaxMB":-1}', '{"heldBodyMaxMB":1.5}',
+      '{"heldBodyMaxMB":"50"}', '{"heldBodyMaxMB":null}', '{"heldBodyMaxMB":"never"}']) {
+      const { XDG_CONFIG_HOME, file } = xdg(text);
+      assert.throws(() => loadConfig({ XDG_CONFIG_HOME }),
+        (e) => e.message.includes(file) && e.message.includes('"heldBodyMaxMB"'), text);
+    }
+  });
+
   it('bad JSON is refused, naming the file', () => {
     const { XDG_CONFIG_HOME, file } = xdg('{not json');
     assert.throws(() => loadConfig({ XDG_CONFIG_HOME }),

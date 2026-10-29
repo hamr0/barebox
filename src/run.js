@@ -9,9 +9,10 @@
 // no per-letter policy — only this interim hold rule:
 //   - the card/payment FLOOR holds in every mode, including `trust`: a
 //     request whose path names a payment destination (`/checkout`,
-//     `/payment`, `/orders`, `/purchase`). The card-in-body half of the
-//     floor is NOT enforced here: the decide seam sees method/URL/headers
-//     but never the body, so body inspection waits for M3's in-proxy rules.
+//     `/payment`, `/orders`, `/purchase`). The card-in-body half is
+//     enforced in the proxy (not by this rule): an allowed request whose
+//     body is <= 64 KB and holds a card number parks as an ask in every
+//     mode. Bodies over 64 KB stream through unchecked for cards (known gap).
 //     Known payment DOMAINS are likewise M3 (they need rwxmap).
 //   - `ask`/`auto` additionally park every non-GET/HEAD request (the PRD's
 //     "unsure? tag it x" default: GET/HEAD = r, anything else = x). The two
@@ -110,6 +111,7 @@ export function shouldHoldForMode(mode) {
  * @property {string} [runtime] runtime dir (created when absent: a short `sbx-*` temp dir, keeping unix socket paths under the ~108-char limit)
  * @property {string} [agent] agent name (default `'agent'`)
  * @property {number|string} [timeoutMs] hold deadline in ms, or `'never'` (default 120000)
+ * @property {number} [heldBodyMaxBytes] cap on a held request's body, in bytes (default 52428800); over it the request is denied
  * @property {object} [unsafeTestOnly] TEST-ONLY escape hatch, forwarded to the proxy (see `createProxy`): everything under it weakens the sandbox wall
  * @property {NodeJS.WritableStream} [stdout] where the agent's stdout goes (default process.stdout)
  * @property {NodeJS.WritableStream} [stderr] where the agent's stderr goes (default process.stderr)
@@ -129,6 +131,7 @@ export function shouldHoldForMode(mode) {
  * @param {string|null} [opts.runtime] runtime dir (created when absent: a short `sbx-*` temp dir, keeping unix socket paths under the ~108-char limit)
  * @param {string} [opts.agent] agent name (default `'agent'`)
  * @param {number|string} [opts.timeoutMs] hold deadline in ms, or `'never'` (default 120000)
+ * @param {number} [opts.heldBodyMaxBytes] cap on a held request's body, in bytes (default 52428800); over it the request is denied
  * @param {object|null} [opts.unsafeTestOnly] TEST-ONLY escape hatch, forwarded to the proxy (see `createProxy`)
  * @param {NodeJS.WritableStream|null} [opts.stdout] where the agent's stdout goes (default process.stdout)
  * @param {NodeJS.WritableStream|null} [opts.stderr] where the agent's stderr goes (default process.stderr)
@@ -142,7 +145,7 @@ export function shouldHoldForMode(mode) {
  * const { exit, asks, audit } = await run({ proj: "/tmp/proj", command: ["bash", "-c", "echo hi"] });
  */
 export async function run({ proj, command, mode = 'auto', onAsk = null,
-  onEvent = null, runtime = null, agent = 'agent', timeoutMs,
+  onEvent = null, runtime = null, agent = 'agent', timeoutMs, heldBodyMaxBytes,
   unsafeTestOnly = null, stdout = null, stderr = null,
   overlay = false, overlayIgnore }) {
   if (typeof proj !== 'string' || !proj) throw new Error('run: proj must be a non-empty string');
@@ -178,7 +181,7 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
 
   const proxy = createProxy({
     runtime: rt, logFile: audit, unsafeTestOnly,
-    hold: { shouldHold: decide, onAsk, timeoutMs, onEvent: holdOnEvent },
+    hold: { shouldHold: decide, onAsk, timeoutMs, maxBody: heldBodyMaxBytes, onEvent: holdOnEvent },
   });
   try {
     await proxy.ready;

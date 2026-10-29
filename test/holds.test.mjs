@@ -86,7 +86,7 @@ describe('hold queue events (2.1, 2.2, 2.4)', () => {
 
   const park = (q, note = 'test hold') => q.add({
     agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
-    body: Buffer.from('m=1'), sock: {}, cres: {}, note,
+    preview: 'm=1', bodyBytes: 3, sock: {}, cres: {}, note,
   });
 
   it('a file answer parks then settles, reported as ask + decided', async () => {
@@ -181,7 +181,7 @@ describe('hold queue events (2.1, 2.2, 2.4)', () => {
       try {
         q.add({
           agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
-          body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'r',
+          preview: 'm=1', bodyBytes: 3, sock: {}, cres: {}, note: 'r',
         });
         const decided = await waitFor(() => seen.find((e) => e.type === 'decided'), 'decide');
         assert.equal(decided.decision, 'deny');
@@ -204,7 +204,7 @@ describe('hold queue events (2.1, 2.2, 2.4)', () => {
     try {
       q.add({
         agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
-        body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'r',
+        preview: 'm=1', bodyBytes: 3, sock: {}, cres: {}, note: 'r',
       });
       const decided = await waitFor(() => seen.find((e) => e.type === 'decided'), 'decide');
       assert.equal(decided.decision, 'deny');
@@ -255,7 +255,7 @@ describe('no answer outlives its queue (r1 item 2)', () => {
       assert.equal(stale.length, 1, 'the leftover answer is logged once');
       const id = q.add({
         agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
-        body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'test hold',
+        preview: 'm=1', bodyBytes: 3, sock: {}, cres: {}, note: 'test hold',
       });
       assert.equal(id, 'h1');
       await new Promise((r) => setTimeout(r, 700));
@@ -277,7 +277,7 @@ describe('no answer outlives its queue (r1 item 2)', () => {
     });
     q.add({
       agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
-      body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'test hold',
+      preview: 'm=1', bodyBytes: 3, sock: {}, cres: {}, note: 'test hold',
     });
     await waitFor(() => readdirSync(join(rt, 'asks')).length >= 1, 'ask file parked');
     q.close();
@@ -305,7 +305,7 @@ describe('one held request per agent', () => {
 
   const entry = (agent, slot, arrivedAt) => ({
     agent, method: 'POST', url: 'http://x/hold', headers: {},
-    body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'r',
+    preview: 'm=1', bodyBytes: 3, sock: {}, cres: {}, note: 'r',
     ...(slot ? { slot, arrivedAt } : {}),
   });
 
@@ -688,7 +688,7 @@ describe('one held request per agent', () => {
     try {
       const park = () => q.add({
         agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
-        body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'r',
+        preview: 'm=1', bodyBytes: 3, sock: {}, cres: {}, note: 'r',
       });
       park();
       park();
