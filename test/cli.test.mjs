@@ -17,6 +17,7 @@ import { claimRuntime } from '../src/runtime.js';
 import { writeFileAtomic } from '../src/holds.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
+import { pathGate } from './fixtures/gates.mjs';
 import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
 
 // test/setup-env.mjs (via --import) already dropped the sandbox's egress proxy
@@ -217,7 +218,7 @@ describe('sbx cli over the file channel', () => {
     proxy = createProxy({ port: 0,
       logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
       clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
-      hold: { match: '/hold', timeoutMs: 30000, pollMs: 25 } });
+      gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 30000, pollMs: 25 } });
     ({ port: PORT } = await proxy.ready);
   });
   after(async () => {

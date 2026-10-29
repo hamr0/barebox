@@ -128,7 +128,9 @@ try {
     logFile: path.join(runtime, 'mitm.log'),
     port: 0,
     unsafeTestOnly: { allowLoopback: true },
-    hold: { shouldHold: () => 'bench-park', timeoutMs: 'never' },
+    // A plain check object: every request asks, so every one parks.
+    gateFor: () => ({ check: async () => ({ outcome: 'askHuman', rule: 'bench-park' }) }),
+    hold: { timeoutMs: 'never' },
   });
   await proxy.ready;
 

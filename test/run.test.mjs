@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
-import { run, shouldHoldForMode } from '../src/run.js';
+import { run } from '../src/run.js';
 import { claimRuntime, runtimePaths } from '../src/runtime.js';
 import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
 import { setupOverlay } from '../src/overlay.js';
@@ -51,37 +51,6 @@ async function waitFor(cond, what, timeoutMs = 15000) {
     await new Promise((r) => setTimeout(r, 50));
   }
 }
-
-describe('shouldHoldForMode (no sandbox needed)', () => {
-  const get = (url = 'http://x/') => ({ agent: 'a', method: 'GET', url, headers: {} });
-  const post = (url = 'http://x/') => ({ agent: 'a', method: 'POST', url, headers: {} });
-
-  it('rejects an unknown mode', () => {
-    assert.throws(() => shouldHoldForMode('nope'), /mode must be ask\|auto\|trust/);
-  });
-
-  it('auto parks non-GET/HEAD, forwards GET/HEAD', () => {
-    const decide = shouldHoldForMode('auto');
-    assert.equal(decide(get()), null);
-    assert.equal(decide({ ...get(), method: 'HEAD' }), null);
-    assert.match(decide(post()) ?? '', /not GET\/HEAD/);
-  });
-
-  it('ask behaves like auto until M3 owns letters', () => {
-    const decide = shouldHoldForMode('ask');
-    assert.equal(decide(get()), null);
-    assert.ok(decide(post()));
-  });
-
-  it('trust forwards everything but the payment floor', () => {
-    const decide = shouldHoldForMode('trust');
-    assert.equal(decide(get()), null);
-    assert.equal(decide(post()), null);
-    assert.match(decide(post('http://x/checkout')) ?? '', /floor/);
-    assert.match(decide(get('http://x/payment')) ?? '', /floor/);
-  });
-
-});
 
 describe('run validation (no sandbox needed)', () => {
   it('rejects a missing proj, an empty command, and a bad mode', async () => {
@@ -226,7 +195,7 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
     assert.match(out.text(), /RUNONASK/);
     assert.ok(seenAsk, 'onAsk saw the ask');
     assert.equal(seenAsk.letter, 'x');
-    assert.match(seenAsk.rule, /not GET\/HEAD/);
+    assert.equal(seenAsk.rule, 'rwx.ask');
     assert.equal(res.asks.length, 1);
     assert.equal(res.asks[0].decision, 'allow');
     assert.match(res.asks[0].url, /\/hold/);

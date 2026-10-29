@@ -5,9 +5,16 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { MODES } from './policy.js';
 
-const MODES = ['ask', 'auto', 'trust'];
-const DEFAULTS = { mode: 'auto', holdTimeoutSec: 120 };
+const DEFAULTS = { mode: 'auto', holdTimeoutSec: 120, localLlm: [] };
+
+/** One `host:port` (host without a colon, port 1-65535). @param {unknown} v @returns {boolean} */
+const isHostPort = (v) => {
+  if (typeof v !== 'string') return false;
+  const m = /^([^\s:/@]+):(\d{1,5})$/.exec(v);
+  return m !== null && Number(m[2]) >= 1 && Number(m[2]) <= 65535;
+};
 
 /** Validators by key; each returns an error string or null. */
 const KEYS = {
@@ -15,6 +22,8 @@ const KEYS = {
   holdTimeoutSec: (v) => (v === 'never' || (Number.isInteger(v) && v > 0)
     ? null : 'must be a positive integer or "never"'),
   heldBodyMaxMB: (v) => (Number.isInteger(v) && v > 0 ? null : 'must be a positive integer'),
+  localLlm: (v) => (Array.isArray(v) && v.every(isHostPort)
+    ? null : 'must be an array of "host:port" strings (port 1-65535)'),
 };
 
 /**
@@ -32,7 +41,7 @@ export function configPath(env = process.env) {
  * Read the config file over the defaults. No file means defaults.
  *
  * @param {NodeJS.ProcessEnv} [env] environment to read (default `process.env`)
- * @returns {{ mode: string, holdTimeoutSec: number|string, heldBodyMaxMB?: number }} effective settings (`heldBodyMaxMB` absent means the library default)
+ * @returns {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], heldBodyMaxMB?: number }} effective settings (`heldBodyMaxMB` absent means the library default)
  * @throws {Error} naming the file (and the key) on invalid JSON, an unknown key or a bad value
  */
 export function loadConfig(env = process.env) {
@@ -67,7 +76,7 @@ export function loadConfig(env = process.env) {
  * @param {object} [flags] values given on the command line
  * @param {string} [flags.mode] `--mode`
  * @param {NodeJS.ProcessEnv} [env] environment to read (default `process.env`)
- * @returns {{ mode: string, holdTimeoutSec: number|string, heldBodyMaxMB?: number }} effective settings (`heldBodyMaxMB` absent means the library default)
+ * @returns {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], heldBodyMaxMB?: number }} effective settings (`heldBodyMaxMB` absent means the library default)
  * @throws {Error} as {@link loadConfig}
  */
 export function resolveConfig(flags = {}, env = process.env) {

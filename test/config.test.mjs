@@ -35,17 +35,17 @@ describe('config file', () => {
 
   it('no file means the defaults', () => {
     const { XDG_CONFIG_HOME } = xdg();
-    assert.deepEqual(loadConfig({ XDG_CONFIG_HOME }), { mode: 'auto', holdTimeoutSec: 120 });
+    assert.deepEqual(loadConfig({ XDG_CONFIG_HOME }), { mode: 'auto', holdTimeoutSec: 120, localLlm: [] });
   });
 
   it('the file\'s mode and holdTimeoutSec are used', () => {
     const { XDG_CONFIG_HOME } = xdg('{"mode":"ask","holdTimeoutSec":"never"}');
-    assert.deepEqual(resolveConfig({}, { XDG_CONFIG_HOME }), { mode: 'ask', holdTimeoutSec: 'never' });
+    assert.deepEqual(resolveConfig({}, { XDG_CONFIG_HOME }), { mode: 'ask', holdTimeoutSec: 'never', localLlm: [] });
   });
 
   it('a CLI --mode beats the file; the file still beats the default for the rest', () => {
     const { XDG_CONFIG_HOME } = xdg('{"mode":"ask","holdTimeoutSec":30}');
-    assert.deepEqual(resolveConfig({ mode: 'trust' }, { XDG_CONFIG_HOME }), { mode: 'trust', holdTimeoutSec: 30 });
+    assert.deepEqual(resolveConfig({ mode: 'trust' }, { XDG_CONFIG_HOME }), { mode: 'trust', holdTimeoutSec: 30, localLlm: [] });
   });
 
   it('an unknown key is refused, naming the file and the key', () => {
@@ -72,6 +72,20 @@ describe('config file', () => {
       const { XDG_CONFIG_HOME, file } = xdg(text);
       assert.throws(() => loadConfig({ XDG_CONFIG_HOME }),
         (e) => e.message.includes(file) && e.message.includes('"heldBodyMaxMB"'), text);
+    }
+  });
+
+  it('localLlm: host:port strings are read, default is empty, bad values name the key', () => {
+    const ok = xdg('{"localLlm":["127.0.0.1:11434","localhost:8080"]}');
+    assert.deepEqual(resolveConfig({}, { XDG_CONFIG_HOME: ok.XDG_CONFIG_HOME }).localLlm,
+      ['127.0.0.1:11434', 'localhost:8080']);
+    assert.deepEqual(loadConfig({ XDG_CONFIG_HOME: xdg().XDG_CONFIG_HOME }).localLlm, []);
+    for (const text of ['{"localLlm":"127.0.0.1:1"}', '{"localLlm":[1]}', '{"localLlm":["nohost"]}',
+      '{"localLlm":["a:0"]}', '{"localLlm":["a:70000"]}', '{"localLlm":["http://a:80"]}',
+      '{"localLlm":["a:80/x"]}', '{"localLlm":[null]}']) {
+      const { XDG_CONFIG_HOME, file } = xdg(text);
+      assert.throws(() => loadConfig({ XDG_CONFIG_HOME }),
+        (e) => e.message.includes(file) && e.message.includes('"localLlm"'), text);
     }
   });
 

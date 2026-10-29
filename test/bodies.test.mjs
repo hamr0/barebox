@@ -18,9 +18,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createProxy } from '../src/proxy.js';
 import { startHttp } from './fixtures/upstream.mjs';
+import { pathGate } from './fixtures/gates.mjs';
 
 const CARD = '4242 4242 4242 4242';
-const CARD_RULE = 'card number in body (floor)';
+const CARD_RULE = 'flags.cardLike';
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const nap = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -58,8 +59,8 @@ async function withProxy(holdExtra, fn) {
   const logFile = join(rt, 'mitm.log');
   const proxy = createProxy({ port: 0, logFile, runtime: rt, clientIdleMs: 5000,
     unsafeTestOnly: { allowLoopback: true },
-    hold: { shouldHold: (r) => (new URL(r.url).pathname.includes('/hold') ? 'test hold' : null),
-      timeoutMs: 15000, pollMs: 25, ...holdExtra } });
+    gateFor: pathGate('/hold'),
+    hold: { timeoutMs: 15000, pollMs: 25, ...holdExtra } });
   const { port } = await proxy.ready;
   const t = {
     rt, proxy, port,
@@ -327,7 +328,7 @@ describe('held bodies live on disk', () => {
     try {
       mkdirSync(join(rt, 'held'), { recursive: true });
       writeFileSync(join(rt, 'held', 'h1'), 'orphan');
-      const p = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), runtime: rt, hold: { match: '/x' } });
+      const p = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), runtime: rt, gateFor: pathGate('/x') });
       await p.ready;
       assert.deepEqual(readdirSync(join(rt, 'held')), []);
       await p.close();

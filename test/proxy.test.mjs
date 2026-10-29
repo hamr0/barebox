@@ -26,6 +26,7 @@ import { createProxy } from '../src/proxy.js';
 import { denyReasonForIp } from '../src/wall.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
+import { pathGate } from './fixtures/gates.mjs';
 
 const execA = promisify(execFileCb);
 
@@ -641,13 +642,15 @@ describe('holds', () => {
   afterEach(() => { for (const s of socks.splice(0)) { try { s.destroy(); } catch {} } });
   // Raw held POST over an agent's unix socket; `res` resolves with the
   // first response, `closed` when the proxy or client drops the socket.
-  async function post(sockPath, marker) {
+  // `pad` extra body bytes: past 64 KB the rest of the body stays unread
+  // until the request reaches the front of its line.
+  async function post(sockPath, marker, pad = 0) {
     const s = net.connect(sockPath);
     socks.push(s);
     s.on('error', () => {});
     await once(s, 'connect');
     const up = `127.0.0.1:${plainUp.port}`;
-    const body = `m=${marker}`;
+    const body = `m=${marker}${'x'.repeat(pad)}`;
     s.write(`POST http://${up}/hold HTTP/1.1\r\nHost: ${up}\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
     const res = readOneResponse(s);
     res.catch(() => {});
@@ -668,7 +671,7 @@ describe('holds', () => {
     hp = createProxy({ port: 0,
       logFile: join(HRT, 'mitm.log'), upstreamCa: CA, runtime: HRT,
       clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
-      hold: { match: '/hold', timeoutMs: 1500, pollMs: 25, ...holdExtra } });
+      gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 1500, pollMs: 25, ...holdExtra } });
     ({ port: hport } = await hp.ready);
     return `http://127.0.0.1:${hport}`;
   }
@@ -866,7 +869,7 @@ describe('holds', () => {
     const op = createProxy({ port: 0,
       logFile: join(HRT, 'mitm.log'), upstreamCa: CA, runtime: HRT,
       clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
-      hold: { match: '/hold', timeoutMs: 5000,
+      gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 5000,
         onAsk: async (ask) => {
           assert.equal(ask.letter, 'x');
           assert.equal(ask.rule, 'path matches /hold');
@@ -1037,10 +1040,10 @@ describe('holds', () => {
         const fa = hp.addAgent('fa');
         const r1 = await post(fa, 'ONE1');
         const held1 = await waitFor(() => pendingWith('ONE1'), 'first hold to park');
-        const r2 = await post(fa, 'TWO2');
+        const r2 = await post(fa, 'TWO2', 70000);
         await nap(400);
         assert.equal(hp.pending().length, 1, 'only one parked');
-        assert.ok(!/m=TWO2/.test(hlog()), 'queued body must not have been read');
+        assert.ok(!/m=TWO2/.test(hlog()), 'queued body past 64 KB must not have been read');
         answer(held1.id, { decision: 'allow' });
         const a = await r1.res;
         assert.equal(a.status, 200);
@@ -1111,7 +1114,7 @@ describe('holds', () => {
         const fa = hp.addAgent('fa');
         const r1 = await post(fa, 'LINE1');
         const held1 = await waitFor(() => pendingWith('LINE1'), 'first hold to park');
-        const dead = await post(fa, 'DEAD2');
+        const dead = await post(fa, 'DEAD2', 70000);
         await post(fa, 'LIVE3');
         await nap(300);
         dead.s.destroy();
@@ -1204,7 +1207,7 @@ describe('holds', () => {
         await post(fa, 'DL0');
         await waitFor(() => pendingWith('DL0'), 'first hold to park');
         await nap(100);
-        const w = await post(fa, 'DL1');
+        const w = await post(fa, 'DL1', 70000);
         await nap(100);
         assert.equal(hp.pending().length, 1, 'waiter is queued, not parked');
         assert.ok(!/m=DL1/.test(hlog()), 'waiter body unread');
@@ -1237,8 +1240,9 @@ describe('holds', () => {
         const fa = hp.addAgent('fa');
         const logFrom = hlog().length; // earlier tests already logged this note; the deny logs before the reply, so 1 s is ample
         const t0 = Date.now();
-        const holder = await partialPost(fa, 'DRIP0', 100, 'd');
-        let sent = 1;
+        // Past 64 KB the body is spooled under the hold's deadline; the drip is the rest.
+        const holder = await partialPost(fa, 'DRIP0', 65700, 'd'.repeat(65600));
+        let sent = 0;
         drip = setInterval(() => { if (sent < 100) { sent++; holder.rest('d'); } }, 100);
         // The client is still dripping when the proxy answers and closes, so
         // under load the kernel may deliver an RST before curl-like reads the 403.
@@ -1267,7 +1271,7 @@ describe('holds', () => {
         logFile: join(HRT, 'mitm.log'), upstreamCa: CA, runtime: HRT,
         clientIdleMs: 500,
         unsafeTestOnly: { allowLoopback: true, resolveUpstream: slow },
-        hold: { match: '/hold', timeoutMs: 'never', pollMs: 25 } });
+        gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 'never', pollMs: 25 } });
       await hp.ready;
       try {
         const fa = hp.addAgent('fa');
@@ -1334,7 +1338,7 @@ describe('one proxy owns a runtime (claim)', () => {
     const p1 = createProxy({ port: 0,
       logFile: join(rt, 'mitm.log'), upstreamCa: CA, runtime: rt,
       clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
-      hold: { match: '/hold', timeoutMs: 5000, pollMs: 25 } });
+      gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 5000, pollMs: 25 } });
     try {
       const { port } = await p1.ready;
       const p = execA('curl', ['-s', '--max-time', '5', '-x', `http://127.0.0.1:${port}`,
@@ -1411,7 +1415,7 @@ describe('two agents keep identity under interleave', () => {
       const tp = createProxy({ port: 0,
         logFile: join(TRT, 'mitm.log'), upstreamCa: CA, runtime: TRT,
         clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true },
-        hold: { match: '/hold', timeoutMs: 15000, pollMs: 25 } });
+        gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 15000, pollMs: 25 } });
       await tp.ready;
       const sa = [];
       try {

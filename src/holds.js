@@ -32,9 +32,9 @@
 // (the hold-reason string), `letter`, `bodyPreview` + `truncated`,
 // `waitingSec` (0 at park; readers use the file mtime for a live value),
 // `expiresAt` (ISO-8601 UTC string, or null when `timeoutMs: 'never'`).
-// `letter` is `'x'` for every parked ask: letters are M3's job (rwxmap +
-// bareguard) — the queue only parks what the decision function flags, and
-// everything flagged today is irreversible. Headers are excluded from the
+// `rule` and `letter` come from the gate's ask (`rwx.ask`, `flags.cardLike`,
+// ...; the matched rwx letter, `'x'` when the ask names none): the queue only
+// parks what bareguard's `humanChannel` hands it. Headers are excluded from the
 // payload (they carry Authorization secrets); the body preview is capped at
 // ASK_BODY_LIMIT bytes with card numbers masked (`bodyPreview`) — M3's
 // bareguard `secrets` redaction takes over the rest.
@@ -87,7 +87,7 @@ const MAX_WAITING_PER_AGENT = 16;
  * @property {string} agent agent name (its socket), never `c<n>`
  * @property {string} method HTTP method
  * @property {string} url full URL
- * @property {string} rule hold-reason string from the decision function
+ * @property {string} rule the gate's ask rule (hold reason)
  * @property {number} waitingSec seconds since the hold parked
  */
 
@@ -113,8 +113,8 @@ const MAX_WAITING_PER_AGENT = 16;
  * @property {string} agent agent name (its socket)
  * @property {string} method HTTP method
  * @property {string} url full URL
- * @property {string} rule hold-reason string from the decision function
- * @property {string} letter always `'x'` until M3 owns letters
+ * @property {string} rule the gate's ask rule
+ * @property {string} letter the matched rwx letter, `'x'` when the ask names none
  * @property {string} bodyPreview request body preview, utf8, capped at ASK_BODY_LIMIT bytes, card numbers masked
  * @property {boolean} truncated true when the body exceeded ASK_BODY_LIMIT
  * @property {number} waitingSec 0 at park; readers use the file mtime for a live value
@@ -125,13 +125,6 @@ const MAX_WAITING_PER_AGENT = 16;
  * Decide a parked ask. Resolves `{ decision: 'allow' | 'deny', reason? }`.
  *
  * @typedef {(ask: AskPayload) => Promise<{ decision: string, reason?: string }>} OnAsk
- */
-
-/**
- * Decide whether a request parks. Return a human-readable reason, or null
- * to forward. M3 plugs the rwxmap + bareguard classifier into this one seam.
- *
- * @typedef {(req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null} ShouldHold
  */
 
 /**
@@ -234,8 +227,6 @@ export function normalizeDecision(input, { approveAlias = false } = {}) {
  *
  * @param {object} opts
  * @param {(o: Record<string, unknown>) => void} opts.log audit-log writer
- * @param {ShouldHold} [opts.shouldHold] decision function (default: path-substring `match`)
- * @param {string} [opts.match] path substring that parks a request (default impl when `shouldHold` is absent)
  * @param {number|string} [opts.timeoutMs] hold deadline in ms, or `'never'` (default 120000)
  * @param {number} [opts.maxBody] bodies over this are denied at the door, never queued (default 52428800)
  * @param {string|null} [opts.runtime] runtime dir; required for the default file checkpoint (writes `asks/`, polls `answers/`)
@@ -244,13 +235,11 @@ export function normalizeDecision(input, { approveAlias = false } = {}) {
  * @param {OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle or abandon
  * @param {(entry: object) => void} opts.onApprove forward the parked request upstream
  * @param {(entry: object, reason: string) => void} opts.onDeny refuse the parked request
- * @returns {{ add: (entry: object) => string|null, dropBody: (id: string) => void, reserve: (agent: string, cbs: { onReady: () => void, onExpire: (reason: string) => void }) => { state: 'now'|'queued'|'full', id: string, arrivedAt: number, cancel: () => void }, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
+ * @returns {{ add: (entry: object) => string|null, dropBody: (id: string) => void, reserve: (agent: string, cbs: { onReady: () => void, onExpire: (reason: string) => void }) => { state: 'now'|'queued'|'full', id: string, arrivedAt: number, cancel: () => void }, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
  */
-export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
+export function createHolds({ log, timeoutMs = 120000,
   maxBody = DEFAULT_HOLD_MAX_BODY, runtime = null, onAsk = null, pollMs = DEFAULT_POLL_MS,
   onEvent = null, onApprove, onDeny }) {
-  // The default IS matchPath: one definition of the path-substring rule (see below).
-  const decide = shouldHold ?? (match ? matchPath(match) : () => null);
   /** @returns {number|null} */
   const deadlineMs = () => {
     if (timeoutMs === 'never') return null;
@@ -391,8 +380,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       method: entry.method,
       url: entry.url,
       rule,
-      // M3 owns letters; everything the queue parks today is irreversible.
-      letter: 'x',
+      letter: entry.letter ?? 'x',
       bodyPreview: entry.preview,
       truncated: entry.bodyBytes > ASK_BODY_LIMIT,
       waitingSec: 0,
@@ -528,13 +516,15 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
      * parks nothing and returns `null`. Without `slot`, parks exactly as
      * before, without limit.
      *
-     * The entry carries the masked `preview`, the full `bodyBytes` and, when
-     * the body was spooled, its `bodyFile`; never the body itself.
+     * The entry carries the masked `preview` and the full `bodyBytes`, never
+     * the body itself (the proxy spooled it to `heldFile(id)`). `finish` is
+     * the proxy's resolver for the request's pending ask: the queue never
+     * calls it directly, `onApprove` / `onDeny` do.
      *
      * @param {object} entry queue entry
      * @returns {string|null} hold id, or null for a finished slot
      */
-    add({ agent, method, url, headers, preview = '', bodyBytes = 0, bodyFile = null, sock, cres, note, slot, arrivedAt }) {
+    add({ agent, method, url, preview = '', bodyBytes = 0, sock, note, letter, finish, slot, arrivedAt }) {
       const hst = typeof slot === 'object' && slot !== null ? handleState.get(slot) : undefined;
       const s = slots.get(agent);
       if (slot && (!hst || hst.done || !s || s.holder !== slot)) return null;
@@ -542,7 +532,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       const ms = deadlineMs();
       const t0 = typeof arrivedAt === 'number' ? arrivedAt : Date.now();
       const entry = {
-        id, agent, method, url, headers, preview, bodyBytes, bodyFile, sock, cres, note, t0,
+        id, agent, method, url, preview, bodyBytes, sock, note, letter, finish, t0,
         slot: null,
         timer: ms === null ? null
           : setTimeout(() => settle(id, false, 'hold timeout'), Math.max(0, ms - (Date.now() - t0))),
@@ -645,8 +635,6 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       }
     },
 
-    decide(req) { return decide(req); },
-
     dropBody,
 
     pending() { return [...queue.values()].map(pub); },
@@ -672,14 +660,4 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   };
 
   return holds;
-}
-
-/**
- * Default decision: park requests whose path contains `match`.
- *
- * @param {string} match path substring
- * @returns {ShouldHold} decision function
- */
-export function matchPath(match) {
-  return (req) => (new URL(req.url).pathname.includes(match) ? `path matches ${match}` : null);
 }

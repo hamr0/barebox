@@ -8,9 +8,12 @@
 // and 6to4 (RFC 3056). The check runs AFTER DNS resolution, so a
 // hostname that resolves to 127.0.0.1 is denied exactly like the literal.
 // Unresolvable names are denied too (fail closed, never 502-then-dial).
-// Only the TEST-ONLY `unsafeTestOnly.allowLoopback` (loopback + unspecified)
-// lets a denied destination through; only tests pass it. There is no
-// allowPrivate flag and no per-host escape hatch: the wall is default-deny.
+// Two things let a denied destination through. The TEST-ONLY
+// `unsafeTestOnly.allowLoopback` (loopback + unspecified) is for fixtures.
+// `allowLocal` (the `localLlm` setting) names exact `host:port` pairs, such as
+// a local model server: only those pass the private/loopback check, never
+// link-local (cloud metadata), and any other port on the same host is denied
+// as before. There is no allowPrivate flag: the wall is default-deny.
 import net from 'node:net';
 import os from 'node:os';
 import { lookup as dnsLookup } from 'node:dns/promises';
@@ -198,17 +201,20 @@ function interleaveIps(ips) {
  * rebinding, with fallback when the first address refuses).
  *
  * @param {string} host CONNECT/request hostname
- * @param {{ allowLoopback: boolean, resolveUpstream?: (host: string) => Promise<string[] | string | null> }} gate
+ * @param {{ allowLoopback: boolean, allowLocal?: ReadonlySet<string>, resolveUpstream?: (host: string) => Promise<string[] | string | null> }} gate
+ * @param {number} port destination port (matched against `gate.allowLocal`)
  * @returns {Promise<{ ok: true, ips: string[] } | { ok: false, ip: string, reason: string }>}
  */
-export async function checkUpstream(host, gate) {
+export async function checkUpstream(host, gate, port) {
   const ips = await resolveAllUpstream(host, gate.resolveUpstream);
   if (!ips || !ips.length) {
     return { ok: false, ip: host, reason: `unresolvable upstream denied: ${host}` };
   }
+  const listed = gate.allowLocal?.has(`${host.toLowerCase()}:${port}`) === true;
   for (const ip of ips) {
     const kind = denyReasonForIp(ip, gate.allowLoopback);
-    if (kind) {
+    // A listed host:port waives everything but link-local (cloud metadata).
+    if (kind && !(listed && kind !== 'link-local')) {
       const where = ip === host ? host : `${host} (${ip})`;
       return { ok: false, ip, reason: `${kind} upstream denied: ${where}` };
     }

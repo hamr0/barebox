@@ -14,6 +14,7 @@ import { launch } from '../src/launcher.js';
 import { createProxy } from '../src/proxy.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps } from './fixtures/upstream.mjs';
+import { pathGate } from './fixtures/gates.mjs';
 import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
 
 // test/setup-env.mjs (via --import) already dropped the sandbox's egress proxy
@@ -84,7 +85,7 @@ describe(`end-to-end (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}` : 
     proxy = createProxy({ runtime: rt,
       logFile: join(rt, 'mitm.log'), upstreamCa: join(rt, 'certs', 'ca.pem'),
       unsafeTestOnly: { allowLoopback: true },
-      hold: { match: '/hold', timeoutMs: 15000, pollMs: 100 } });
+      gateFor: pathGate('/hold'), hold: { timeoutMs: 15000, pollMs: 100 } });
     await proxy.ready;
     sock = proxy.addAgent('e2e');
   });
