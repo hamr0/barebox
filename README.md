@@ -15,10 +15,7 @@
   <img src="https://img.shields.io/github/package-json/v/hamr0/barebox?label=version&color=2a4f8c" alt="version (auto from package.json)">
   <img src="https://img.shields.io/badge/license-Apache%202.0-2a4f8c" alt="license: Apache 2.0">
   <img src="https://img.shields.io/badge/platform-Linux-2a4f8c" alt="platform: Linux">
-  <img src="https://img.shields.io/badge/status-POC-c0841a" alt="status: POC">
 </p>
-
-> **Status:** early. The walls (M0), HTTPS inspection (M1), hold-and-ask (M2), the one-call `run()` and file ask channel (M2.5) and the undo layer (M4) are built and measured; the decision rules (M3), key custody (M5) and the rest are not. Today's hold rule is interim: payment destinations, plus every non-GET/HEAD request in `ask` and `auto` modes. Linux only.
 
 ## Why
 
@@ -83,7 +80,7 @@ The agent works in your house:
 Measured, not estimated. Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22.
 
 | | barebox (measured) | [srt](https://github.com/anthropic-experimental/sandbox-runtime) 0.0.81 (measured) |
-|---|---|---|
+|---|---|
 | Memory per sandbox | **7.8 MB** mean, 7.9 MB max (20 concurrent) | ~100 MB |
 | Proxy | one shared, **~60 MB idle, ~78 MB loaded** (20 agents, each with 1 parked + 16 waiting; within the ≤ 80 MB budget) | one per sandbox |
 | Start + exit | **10 ms** (M0 POC; unmeasured on the rewrite — TODO re-measure) | 1.87–2.05 s |
@@ -93,16 +90,16 @@ Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 
 
 ## Roadmap
 
-| Module | What | Status |
-|---|---|---|
-| M0 | Walls + front door | **PASS** — 14/14, red-team 8/8 |
-| M1 | Proxy sees inside HTTPS (curl, node, python requests, git) | **PASS** — real-internet matrix + negatives, peak 63 MB |
-| M2 | Hold one `x` request, ask, keep everything else running | **PASS** — 9-scenario hold matrix, 120 s + never timeouts |
-| M3 | Decide r/w/x deterministically (rwxmap + bareguard), audit log | |
-| M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging | **PASS** — paper + review flow implemented, full bwrap+unix proof in a real shell |
-| M5 | Keys the agent never holds | |
-| M6 | Scale run: 20 agents + shared proxy | |
-| M7 | Demos: payment held for approval; prompt-injected `~/.ssh` exfil blocked | |
+| Module | What |
+|---|---|
+| M0 | Walls + front door |
+| M1 | Proxy sees inside HTTPS (curl, node, python requests, git) |
+| M2 | Hold one `x` request, ask, keep everything else running |
+| M3 | Decide r/w/x deterministically (rwxmap + bareguard), audit log |
+| M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging |
+| M5 | Keys the agent never holds |
+| M6 | Scale run: 20 agents + shared proxy |
+| M7 | Demos: payment held for approval; prompt-injected `~/.ssh` exfil blocked |
 
 M0–M2 are the go/no-go. Later: macOS (`sandbox-exec` + APFS clones), Windows via WSL2, Landlock/seccomp hardening. Full spec: [the PRD](docs/product/agent-sandbox-prd.md).
 
@@ -116,7 +113,7 @@ Requires Node.js >= 22. Zero production dependencies. Needs bubblewrap >= 0.11.0
 
 ## Try the POCs
 
-Linux with `bwrap` (>= 0.11.0 only for the overlay), `socat`, `openssl`, Node >= 22 and Python 3. Needs a normal shell (namespaces + listening sockets), not a tool sandbox. The POCs are throwaway proofs, not the product.
+Linux only, with `bwrap` (>= 0.11.0 only for the overlay), `socat`, `openssl`, Node >= 22 and Python 3. Needs a normal shell (namespaces + listening sockets), not a tool sandbox. The POCs are throwaway proofs, not the product.
 
 ```
 git clone https://github.com/hamr0/barebox && cd barebox

@@ -55,8 +55,8 @@ await proxy.close();
 
 ## Holds (human approval)
 
-Start the proxy with a hold rule, then decide from a second terminal
-through the file checkpoint (`<runtime>/asks` + `<runtime>/answers`):
+When a request needs a decision (see "Modes and the gate" below), it parks.
+Decide from a second terminal through the file checkpoint (`<runtime>/asks` + `<runtime>/answers`):
 
 ```bash
 SBX_RUNTIME=/tmp/sbx npx sbx pending
@@ -77,14 +77,9 @@ need the proxy to be alive: with no live proxy on the runtime `sbx pending`,
 
 `run()` starts the proxy, sandboxes one command, answers holds and returns
 the exit code with the ask and audit trail. Modes: `ask`, `auto` (default),
-`trust`. Payment destinations (`/checkout`, `/payment`, `/orders`,
-`/purchase`) hold in every mode; `ask` and `auto` also hold every
-non-GET/HEAD request (an interim rule until the policy module lands). The
-card floor also looks inside bodies: an allowed request whose body is 64 KB
-or less and holds a card number (13-19 digits, optional single space or dash,
-first digit 2-6, Luhn-valid) parks as an ask with rule `card number in body
-(floor)` in every mode, `trust` included; nothing is denied because of a card.
-`run()` takes `heldBodyMaxBytes` to change the held-body cap.
+`trust`; see "Modes and the gate" below. `run()` takes `heldBodyMaxBytes` to
+change the held-body cap and `allowLocal` (the `localLlm` setting) to let
+exact `host:port` pairs, such as a local model server, past the wall.
 
 ```js no-run
 import { run } from "barebox";
@@ -109,10 +104,52 @@ agent's.
 
 `sbx run` reads one optional config file,
 `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, with keys `mode`,
-`holdTimeoutSec` (positive integer or `"never"`) and `heldBodyMaxMB`
-(positive integer). A flag beats the file, the file beats the default; an
+`holdTimeoutSec` (positive integer or `"never"`), `heldBodyMaxMB`
+(positive integer) and `localLlm` (array of `"host:port"`). A flag beats the file, the file beats the default; an
 unknown key, bad value or bad JSON exits 2 naming the file and key. The file
 is hidden inside the sandbox wherever it resolves. The library does not read it.
+
+## Modes and the gate
+
+Every request becomes one bareguard `gate.check()`; `run()` builds one gate
+per agent (and one for the TCP door's `tcp` agent), all sharing one tools
+table. The mode picks the agent's rwx letters:
+
+| Mode | Letters | Asks for |
+|---|---|---|
+| `ask` | `r--` | `w`, `x` |
+| `auto` (default) | `rw-` | `x` |
+| `trust` | `rwx` | nothing |
+
+`GET`/`HEAD` are `r`; `POST`/`PUT`/`PATCH`/`DELETE` are `x`; any other method
+is denied in every mode (`rwx.unlisted`). Until rwxmap labels arrive every
+request is the tool `http.<METHOD>`. The floor is two bareguard flags,
+`cardLike` (a body of 64 KB or less holding a card number: 13-19 digits,
+optional single space or dash, first digit 2-6, Luhn-valid) and `paymentPath`
+(`/checkout`, `/payment`, `/orders`, `/purchase`); both ask in every mode,
+`trust` included. Nothing is denied because of a card. Bodies over 64 KB
+stream through unscanned. The body never enters the gate's action.
+
+barebox's hold queue is each gate's `humanChannel`: the ask files, `onAsk`
+and `sbx approve|deny` work as above, and the ask carries the gate's `rule`
+(`rwx.ask`, `flags.cardLike`, `flags.paymentPath`) and `letter`. A request
+with a body of 64 KB or less is read in the agent's working slot before the
+gate decides. Denials read `403 denied: <rule>[: reason]` (a human or timeout
+denial reads `denied: <reason>`).
+
+`createProxy` takes `gateFor(agent, { humanChannel })`, called once per agent,
+returning a bareguard `Gate` or any object with `async check(action)` that
+resolves `{ outcome: "allow" | "deny" | "askHuman", rule?, reason? }`;
+`askHuman` from a plain object goes to the same queue. Without `gateFor`
+nothing is checked and everything forwards. `policy.js` exports `MODES` and
+`gateFor({ agent, mode, auditPath, humanChannel })`. bareguard writes its
+decisions to `<runtime>/gate.jsonl` (`runtimePaths(runtime).gateAudit`); the
+proxy's own `logFile` is separate. `close()` waits up to 3 s for requests
+still inside a `check()`.
+
+`localLlm` (config key; `allowLocal` on `run()` and `createProxy()`) is an
+array of `"host:port"` strings. Only those exact pairs pass the wall's
+private/loopback check, never link-local (cloud metadata).
 
 ## Undo layer
 
@@ -154,9 +191,8 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
 
 ## What this package does not do
 
-Enforcement policy (which requests hold) arrives in a later module; until
-then holds follow the interim rules above (a path rule for `createProxy`;
-payment destinations plus non-GET/HEAD for `run()`). The card-in-body floor
-checks bodies of 64 KB or less; larger bodies stream through unchecked for
-cards. No Docker, no MCP server, no macOS/Windows —
+Per-API labels (rwxmap) arrive in a later release; until then every request
+is `http.<METHOD>`. The card-in-body floor checks bodies of 64 KB or less;
+larger bodies stream through unchecked for cards. The removed `hold.shouldHold`
+and `hold.match` are gone: pass `gateFor` instead. No Docker, no MCP server, no macOS/Windows —
 Linux only. POC harnesses live in `poc/` in the repo and never ship.

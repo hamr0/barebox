@@ -217,3 +217,19 @@ the card when a CVV follows.
 Why large bodies are not checked: random 16-digit numbers starting 2–6 pass Luhn about 1
 time in 10. Denying on a hit would break uploads full of ids. Bodies over 64 KB stream
 through unchecked for card numbers (known gap).
+
+## M3 — B1 gate wiring (Oct 29)
+
+Part B1 puts bareguard 0.29.0 in front of every request. Brief: `docs/logs/m3-b1-gate-brief.md`.
+
+Design as built:
+- One gate per agent (and one for the TCP door's `tcp` agent), built by `policy.gateFor` from one shared tools table (`src/policy.js`). The mode only picks the letters and `askUnheld`.
+- barebox's hold queue is each gate's `humanChannel`. A request gets a barebox id (`rid`) that goes in the gate action; the channel looks the request up by `event.action.rid` (`src/proxy.js` `askHuman`). Inside `check()` the channel reserves the agent's hold slot, spools the body to `held/<id>`, frees the working slot and parks. A full line answers 429 `hold queue full`.
+- Bodies of 64 KB or less are read in the agent's working slot before the gate decides, so the card scanner can set `cardLike`. The body never goes in the action, since bareguard writes the action to its audit file.
+- A plain object with `check()` can stand in for a Gate (tests do); `askHuman` from it goes to the same channel.
+
+Smoke test (orchestrator, real internet): `sbx run --mode auto --json -- bash -c 'curl https://example.com/; curl -X POST -d q=1 https://httpbin.org/post'`. The GET returned 200. The POST parked as ask h1 (rule `rwx.ask`, letter `x`, bodyPreview `q=1`). `sbx deny h1` gave 403 on the POST. Events were ask, decided, done, exit 0. `gate.jsonl` held 1 `rwx.allow` and 2 `rwx.ask` lines (the gate phase and the approval phase of the one ask). Suite 398/398 three times in a real shell; typecheck clean.
+
+Concurrent audit writes (20 gates, one `gate.jsonl`): safe by reading, not stress-tested. bareguard's audit writer appends each line with one `appendFile` in append mode on Linux (`node_modules/bareguard/src/primitives/audit.js:575`) and caps a line at 3500 bytes (`MAX_LINE_BYTES`, `audit.js:11`), under the 4096-byte PIPE_BUF its comment cites. The code comment relies on the kernel keeping such appends whole. One file per agent was not needed on that reading; a concurrent stress test is in the fix ledger.
+
+Still separate: barebox's `audit.jsonl` and bareguard's `gate.jsonl`. They merge in B2.
