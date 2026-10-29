@@ -3,7 +3,7 @@
 // runtime dir; the `onAsk` channel needs no runtime at all.
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync, readdirSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync, readdirSync, statSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHolds, normalizeDecision } from '../src/holds.js';
@@ -282,5 +282,420 @@ describe('no answer outlives its queue (r1 item 2)', () => {
     await waitFor(() => readdirSync(join(rt, 'asks')).length >= 1, 'ask file parked');
     q.close();
     assert.deepEqual(readdirSync(join(rt, 'asks')), [], 'no ask files survive close');
+  });
+});
+
+describe('one held request per agent', () => {
+  function mkQ(extra = {}) {
+    const logs = [];
+    const events = [];
+    const approved = [];
+    const denied = [];
+    const q = createHolds({
+      log: (o) => logs.push(o),
+      onAsk: () => new Promise(() => {}),
+      timeoutMs: 5000,
+      onEvent: (e) => events.push(e),
+      onApprove: (h) => approved.push(h.id),
+      onDeny: (h, reason) => denied.push([h.id, reason]),
+      ...extra,
+    });
+    return { logs, events, approved, denied, q };
+  }
+
+  const entry = (agent, slot, arrivedAt) => ({
+    agent, method: 'POST', url: 'http://x/hold', headers: {},
+    body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'r',
+    ...(slot ? { slot, arrivedAt } : {}),
+  });
+
+  const noop = () => {};
+
+  it('first is now, second queues, decision hands over', (t) => {
+    // Under one-timer-per-reservation the promoted waiter keeps its own
+    // timer, so a handover the caller ignores would expire: like the real
+    // proxy, add B on ready.
+    // The clock is mocked because A's hold timer and B's reservation timer
+    // share a deadline: after a loop stall they tie and B can expire first.
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const { denied, q } = mkQ({ timeoutMs: 200 });
+    try {
+      const rA = q.reserve('a', { onReady: noop, onExpire: noop });
+      assert.equal(rA.state, 'now');
+      q.add(entry('a', rA, rA.arrivedAt));
+      let ready = 0;
+      const expired = [];
+      let rB;
+      rB = q.reserve('a', {
+        onReady: () => { ready++; q.add(entry('a', rB, rB.arrivedAt)); },
+        onExpire: (reason) => expired.push(reason),
+      });
+      assert.equal(rB.state, 'queued');
+      t.mock.timers.tick(200);
+      assert.equal(ready, 1, 'handover to B');
+      assert.deepEqual(expired, [], 'add cleared the reservation timer');
+      t.mock.timers.tick(1);
+      assert.deepEqual(denied.map(([, r]) => r), ['hold timeout', 'hold timeout'],
+        'both settle on their own clocks');
+      assert.equal(ready, 1, 'onReady exactly once');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('agents are independent', () => {
+    const { q } = mkQ();
+    try {
+      const rA = q.reserve('a', { onReady: noop, onExpire: noop });
+      const rB = q.reserve('b', { onReady: noop, onExpire: noop });
+      assert.equal(rA.state, 'now');
+      assert.equal(rB.state, 'now');
+      rA.cancel();
+      rB.cancel();
+    } finally {
+      q.close();
+    }
+  });
+
+  it('an un-added holder expires first, then the promoted waiter expires on its own arrival deadline', async () => {
+    // One timer per reservation, from arrival: A arrived first, so A expires
+    // first and B is promoted — then B (never added) expires at B's arrival
+    // deadline, not at its promotion.
+    const { q } = mkQ({ timeoutMs: 200 });
+    try {
+      const expiredA = [];
+      const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expiredA.push(reason) });
+      assert.equal(rA.state, 'now');
+      let ready = 0;
+      const expiredB = [];
+      const rB = q.reserve('a', {
+        onReady: () => { ready++; },
+        onExpire: (reason) => expiredB.push(reason),
+      });
+      assert.equal(rB.state, 'queued');
+      await waitFor(() => ready === 1, 'A expires, B promoted');
+      assert.deepEqual(expiredA, ['hold timeout']);
+      await waitFor(() => expiredB.length === 1, 'B expires on its own arrival deadline');
+      assert.deepEqual(expiredB, ['hold timeout']);
+      rA.cancel();
+      rB.cancel();
+    } finally {
+      q.close();
+    }
+  });
+
+  it('a never-added holder expires on its own arrival deadline', async () => {
+    const { q } = mkQ({ timeoutMs: 200 });
+    try {
+      const expired = [];
+      const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push([Date.now(), reason]) });
+      assert.equal(rA.state, 'now');
+      const tA = rA.arrivedAt;
+      let readyB = 0;
+      const rB = q.reserve('a', { onReady: () => { readyB++; }, onExpire: noop });
+      assert.equal(rB.state, 'queued');
+      await waitFor(() => expired.length === 1, 'A expires');
+      assert.deepEqual(expired.map(([, reason]) => reason), ['hold timeout']);
+      const elapsed = expired[0][0] - tA;
+      assert.ok(elapsed >= 150 && elapsed < 2000, `at ~200ms after arrival (${elapsed}ms)`);
+      await waitFor(() => readyB === 1, 'B promoted');
+      rB.cancel();
+    } finally {
+      q.close();
+    }
+  });
+
+  it('a promoted waiter keeps its arrival deadline', (t) => {
+    // Mocked clock: a real-time upper bound fails whenever the loop stalls.
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const { q } = mkQ({ timeoutMs: 300 });
+    try {
+      const rA = q.reserve('a', { onReady: noop, onExpire: noop });
+      const idA = q.add(entry('a', rA, rA.arrivedAt));
+      let ready = 0;
+      const expired = [];
+      const rB = q.reserve('a', {
+        onReady: () => { ready++; },
+        onExpire: (reason) => expired.push([Date.now(), reason]),
+      });
+      assert.equal(rB.state, 'queued');
+      const tB = rB.arrivedAt;
+      t.mock.timers.tick(180);
+      q.abandon(idA);
+      assert.equal(ready, 1, 'B promoted');
+      t.mock.timers.tick(119);
+      assert.deepEqual(expired, [], 'not expired 1 ms before its arrival deadline');
+      t.mock.timers.tick(1);
+      assert.deepEqual(expired.map(([, reason]) => reason), ['hold timeout']);
+      assert.equal(expired[0][0] - tB, 300, 'at 300ms after arrival, not promotion');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('add clears the reservation timer; the entry keeps its own', async () => {
+    const { denied, q } = mkQ({ timeoutMs: 150 });
+    try {
+      const expired = [];
+      const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push(reason) });
+      const id = q.add(entry('a', rA, rA.arrivedAt));
+      await waitFor(() => denied.length === 1, 'entry settles on its own clock');
+      assert.deepEqual(denied, [[id, 'hold timeout']]);
+      await new Promise((r) => setTimeout(r, 250));
+      assert.deepEqual(expired, [], 'no reservation expiry after add');
+      assert.equal(denied.length, 1, 'exactly one decision');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('cancel clears the reservation timer', async () => {
+    const { q } = mkQ({ timeoutMs: 150 });
+    try {
+      const expired = [];
+      const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push(reason) });
+      assert.equal(rA.state, 'now');
+      rA.cancel();
+      await new Promise((r) => setTimeout(r, 300));
+      assert.deepEqual(expired, [], 'no expiry after cancel');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('add with a finished slot parks nothing', (t) => {
+    // Mocked clock: a real 300 ms sleep outlives A's 500 ms deadline after a
+    // loop stall, and B then reserves as the holder instead of queueing.
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const { logs, q } = mkQ({ timeoutMs: 500 });
+    try {
+      const expiredA = [];
+      const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expiredA.push(reason) });
+      assert.equal(rA.state, 'now');
+      t.mock.timers.tick(300);
+      const rB = q.reserve('a', { onReady: noop, onExpire: noop });
+      assert.equal(rB.state, 'queued');
+      t.mock.timers.tick(199);
+      assert.equal(expiredA.length, 0, 'A not expired 1 ms before its deadline');
+      t.mock.timers.tick(1);
+      assert.equal(expiredA.length, 1, 'A expires');
+      assert.equal(q.add(entry('a', rA, rA.arrivedAt)), null);
+      assert.deepEqual(q.pending(), [], 'nothing parked');
+      assert.ok(!logs.some((l) => l.ev === 'hold'), 'no hold log line');
+      const idB = q.add(entry('a', rB, rB.arrivedAt));
+      assert.equal(q.pending().length, 1, 'the promoted waiter still holds a live slot');
+      void idB;
+    } finally {
+      q.close();
+    }
+  });
+
+  it("close expires an un-added holder once", async () => {
+    const { q } = mkQ();
+    const expired = [];
+    try {
+      q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push(reason) });
+      q.close();
+      assert.deepEqual(expired, ['proxy closing']);
+      await new Promise((r) => setTimeout(r, 100));
+      assert.deepEqual(expired, ['proxy closing'], 'once, nothing afterwards');
+    } finally {
+      q.close();
+    }
+  });
+
+  it("timeoutMs 'never' arms no timer", async () => {
+    const { q } = mkQ({ timeoutMs: 'never' });
+    try {
+      const expired = [];
+      const r = q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push(reason) });
+      assert.equal(r.state, 'now');
+      await new Promise((r) => setTimeout(r, 300));
+      assert.deepEqual(expired, []);
+      r.cancel();
+    } finally {
+      q.close();
+    }
+  });
+
+  it('a handed-over ask keeps its arrival deadline', (t) => {
+    // Mocked clock: real-time bounds fail whenever the loop stalls.
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+    const { denied, q } = mkQ({ timeoutMs: 300 });
+    try {
+      const rA = q.reserve('a', { onReady: noop, onExpire: noop });
+      const idA = q.add(entry('a', rA, rA.arrivedAt));
+      let ready = 0;
+      const rB = q.reserve('a', {
+        onReady: () => { ready++; },
+        onExpire: noop,
+      });
+      assert.equal(rB.state, 'queued');
+      const tB = rB.arrivedAt;
+      t.mock.timers.tick(200);
+      q.abandon(idA);
+      assert.equal(ready, 1, 'handover to B');
+      const idB = q.add(entry('a', rB, rB.arrivedAt));
+      t.mock.timers.tick(99);
+      assert.equal(denied.some(([id]) => id === idB), false, 'B not denied 1 ms before its arrival deadline');
+      t.mock.timers.tick(1);
+      assert.deepEqual(denied.find(([id]) => id === idB), [idB, 'hold timeout']);
+      assert.equal(Date.now() - tB, 300, 'B denied 300ms after arrival, not 500ms');
+    } finally {
+      q.close();
+    }
+  });
+
+  it('the 17th waiter is refused and logged', () => {
+    const { logs, q } = mkQ({ timeoutMs: 'never' });
+    try {
+      const rA = q.reserve('a', { onReady: noop, onExpire: noop });
+      q.add(entry('a', rA, rA.arrivedAt));
+      const waiters = [];
+      for (let i = 0; i < 16; i++) {
+        const r = q.reserve('a', { onReady: noop, onExpire: noop });
+        assert.equal(r.state, 'queued', `waiter ${i}`);
+        waiters.push(r);
+      }
+      const full = q.reserve('a', { onReady: noop, onExpire: noop });
+      assert.equal(full.state, 'full');
+      assert.ok(logs.some((l) => l.ev === 'hold-queue-full' && l.agent === 'a'),
+        'a hold-queue-full line is logged');
+      for (const w of waiters) w.cancel();
+      full.cancel();
+    } finally {
+      q.close();
+    }
+  });
+
+  it('cancel paths release or skip exactly once', async () => {
+    // A cancelled waiter is skipped; the next waiter gets the slot.
+    {
+      const { q } = mkQ();
+      try {
+        const rA = q.reserve('a', { onReady: noop, onExpire: noop });
+        q.add(entry('a', rA, rA.arrivedAt));
+        let readyB = 0;
+        let readyC = 0;
+        const rB = q.reserve('a', { onReady: () => { readyB++; }, onExpire: noop });
+        const rC = q.reserve('a', { onReady: () => { readyC++; }, onExpire: noop });
+        rB.cancel();
+        rB.cancel();
+        q.abandon(q.pending()[0].id);
+        await waitFor(() => readyC === 1, 'handover skips cancelled B');
+        assert.equal(readyB, 0, 'cancelled waiter never gets onReady');
+        rC.cancel();
+      } finally {
+        q.close();
+      }
+    }
+    // Cancelling a held 'now' reservation passes the slot on.
+    {
+      const { q } = mkQ();
+      try {
+        const r1 = q.reserve('a', { onReady: noop, onExpire: noop });
+        assert.equal(r1.state, 'now');
+        let ready = 0;
+        const r2 = q.reserve('a', { onReady: () => { ready++; }, onExpire: noop });
+        assert.equal(r2.state, 'queued');
+        r1.cancel();
+        r1.cancel();
+        await waitFor(() => ready === 1, 'cancel hands the slot over');
+        r2.cancel();
+      } finally {
+        q.close();
+      }
+    }
+    // Cancelling after add does nothing: the parked entry owns the slot.
+    {
+      const { denied, q } = mkQ({ timeoutMs: 120 });
+      try {
+        const r = q.reserve('a', { onReady: noop, onExpire: noop });
+        const id = q.add(entry('a', r, r.arrivedAt));
+        r.cancel();
+        r.cancel();
+        assert.equal(q.pending().length, 1, 'still parked after cancel');
+        await waitFor(() => denied.length === 1, 'entry times out on its own clock');
+        assert.deepEqual(denied, [[id, 'hold timeout']]);
+      } finally {
+        q.close();
+      }
+    }
+  });
+
+  it('abandon and close release the slot', async () => {
+    // abandon hands over.
+    {
+      const { q } = mkQ();
+      try {
+        const rA = q.reserve('a', { onReady: noop, onExpire: noop });
+        const idA = q.add(entry('a', rA, rA.arrivedAt));
+        let ready = 0;
+        const rB = q.reserve('a', { onReady: () => { ready++; }, onExpire: noop });
+        q.abandon(idA);
+        await waitFor(() => ready === 1, 'abandon hands over');
+        rB.cancel();
+      } finally {
+        q.close();
+      }
+    }
+    // close expires every waiter.
+    {
+      const { q } = mkQ();
+      const expired = [];
+      try {
+        const rA = q.reserve('a', { onReady: noop, onExpire: noop });
+        q.add(entry('a', rA, rA.arrivedAt));
+        const rB = q.reserve('b', { onReady: noop, onExpire: noop });
+        assert.equal(rB.state, 'now', 'b holds its slot without parking');
+        q.reserve('a', { onReady: noop, onExpire: (reason) => expired.push(['a', reason]) });
+        q.reserve('b', { onReady: noop, onExpire: (reason) => expired.push(['b', reason]) });
+        q.close();
+        assert.deepEqual(expired.sort(), [['a', 'proxy closing'], ['b', 'proxy closing']]);
+      } finally {
+        q.close();
+      }
+    }
+  });
+
+  it('asks/ and answers/ are 0700 under umask 0, even pre-existing', () => {
+    const prev = process.umask(0);
+    try {
+      const rt = mkdtempSync(join(tmpdir(), 'bb-hmode-'));
+      try {
+        mkdirSync(join(rt, 'answers'), { recursive: true });
+        chmodSync(join(rt, 'answers'), 0o777);
+        const q = createHolds({
+          log: () => {}, runtime: rt, timeoutMs: 5000, pollMs: 10,
+          onApprove: () => {}, onDeny: () => {},
+        });
+        try {
+          assert.equal(statSync(join(rt, 'asks')).mode & 0o777, 0o700);
+          assert.equal(statSync(join(rt, 'answers')).mode & 0o777, 0o700);
+        } finally {
+          q.close();
+        }
+      } finally {
+        rmSync(rt, { recursive: true, force: true });
+      }
+    } finally {
+      process.umask(prev);
+    }
+  });
+
+  it('add without a slot still parks without limit', () => {
+    const { q } = mkQ();
+    try {
+      const park = () => q.add({
+        agent: 'a', method: 'POST', url: 'http://x/hold', headers: {},
+        body: Buffer.from('m=1'), sock: {}, cres: {}, note: 'r',
+      });
+      park();
+      park();
+      park();
+      assert.equal(q.pending().length, 3, 'all three parked, as today');
+    } finally {
+      q.close();
+    }
   });
 });

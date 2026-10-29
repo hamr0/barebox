@@ -3,7 +3,9 @@
 //
 // Default-deny for loopback, link-local (incl. cloud metadata 169.254/16),
 // the host's own addresses, and private LAN ranges (RFC 1918, CGNAT
-// 100.64/10, IPv6 ULA fc00::/7). The check runs AFTER DNS resolution, so a
+// 100.64/10, IPv6 ULA fc00::/7). An IPv4 embedded in IPv6 is checked too, in
+// every spelling: mapped, compat, uncompressed, NAT64 (RFC 6052, RFC 8215)
+// and 6to4 (RFC 3056). The check runs AFTER DNS resolution, so a
 // hostname that resolves to 127.0.0.1 is denied exactly like the literal.
 // Unresolvable names are denied too (fail closed, never 502-then-dial).
 // Only the TEST-ONLY `unsafeTestOnly.allowLoopback` (loopback + unspecified)
@@ -22,17 +24,76 @@ function normIp(ip) {
   return s;
 }
 
-/** Embedded IPv4 in `::ffff:1.2.3.4`, or null. */
-function mappedV4(ip) {
-  const m = ip.match(/^(?:.*:)?(\d+\.\d+\.\d+\.\d+)$/);
-  return m && net.isIP(m[1]) === 4 ? m[1] : null;
-}
-
 function v4Parts(ip) {
   return ip.split('.').map((p) => parseInt(p, 10));
 }
 
-/** This machine's own interface addresses, one spelling (see `normIp`). */
+/**
+ * Parse IPv6 into its 8 groups, handling `::` anywhere and a trailing
+ * dotted quad (`::ffff:1.2.3.4`, `64:ff9b::1.2.3.4`).
+ *
+ * @param {string} ip normalized IP spelling
+ * @returns {number[]|null} 8 groups (0–0xffff), or null when not IPv6
+ */
+function v6Groups(ip) {
+  if (net.isIP(ip) !== 6) return null;
+  const dbl = ip.indexOf('::');
+  if (dbl >= 0 && ip.indexOf('::', dbl + 2) >= 0) return null;
+  const parts = (s) => s.split(':').filter((p) => p !== '');
+  const head = dbl >= 0 ? parts(ip.slice(0, dbl)) : ip.split(':');
+  const tail = dbl >= 0 ? parts(ip.slice(dbl + 2)) : [];
+  const val = (s) => {
+    if (s.includes('.')) {
+      if (net.isIP(s) !== 4) return null;
+      const p = s.split('.').map((x) => parseInt(x, 10));
+      return [(p[0] << 8) | p[1], (p[2] << 8) | p[3]];
+    }
+    if (!/^[0-9a-f]{1,4}$/.test(s)) return null;
+    return [parseInt(s, 16)];
+  };
+  /** @type {number[]} */
+  const hGroups = [];
+  /** @type {number[]} */
+  const tGroups = [];
+  for (const [list, out] of [[head, hGroups], [tail, tGroups]]) {
+    for (const s of list) {
+      const v = val(s);
+      if (!v) return null;
+      out.push(...v);
+    }
+  }
+  if (dbl < 0) return hGroups.length === 8 ? hGroups : null;
+  if (hGroups.length + tGroups.length > 8) return null;
+  return [...hGroups, ...new Array(8 - hGroups.length - tGroups.length).fill(0), ...tGroups];
+}
+
+/** Dotted IPv4 from two groups. @param {number[]} g groups @param {number} i first group @returns {string} */
+function v4Of(g, i) {
+  return `${(g[i] >> 8) & 255}.${g[i] & 255}.${(g[i + 1] >> 8) & 255}.${g[i + 1] & 255}`;
+}
+
+/**
+ * Why a dotted IPv4 is denied, or null when it may go through. The one IPv4
+ * rule set: plain IPv4 and every embedded IPv4 use this function.
+ *
+ * @param {string} v4 dotted IPv4
+ * @param {boolean} allowLoopback test-only opt-in for loopback + unspecified
+ * @returns {string|null} `loopback` / `unspecified` / `link-local` / `host-local` / `private`, or null
+ */
+function v4Reason(v4, allowLoopback) {
+  const [a, b] = v4Parts(v4);
+  if (a === 127) return allowLoopback ? null : 'loopback';
+  if (a === 0) return allowLoopback ? null : 'unspecified';
+  if (a === 169 && b === 254) return 'link-local';
+  if (a === 10) return 'private';
+  if (a === 172 && b >= 16 && b <= 31) return 'private';
+  if (a === 192 && b === 168) return 'private';
+  if (a === 100 && b >= 64 && b <= 127) return 'private';
+  if (localIps().has(v4)) return 'host-local';
+  return null;
+}
+
+/** This machine's own interface addresses: IPv6 keyed by parsed groups, IPv4 dotted (see `normIp`). */
 function localIps() {
   const out = new Set();
   let ifs = {};
@@ -45,7 +106,10 @@ function localIps() {
   }
   for (const addrs of Object.values(ifs)) {
     for (const a of addrs ?? []) {
-      if (a && a.address) out.add(normIp(a.address));
+      if (!a || !a.address) continue;
+      const norm = normIp(a.address);
+      const g = v6Groups(norm);
+      out.add(g ? g.join(':') : norm);
     }
   }
   return out;
@@ -60,28 +124,25 @@ function localIps() {
  */
 export function denyReasonForIp(rawIp, allowLoopback) {
   const ip = normIp(rawIp);
-  const v4 = mappedV4(ip) ?? (net.isIP(ip) === 4 ? ip : null);
-  if (v4) {
-    const [a, b] = v4Parts(v4);
-    if (a === 127) return allowLoopback ? null : 'loopback';
-    if (a === 0) return allowLoopback ? null : 'unspecified';
-    if (a === 169 && b === 254) return 'link-local';
-    if (a === 10) return 'private';
-    if (a === 172 && b >= 16 && b <= 31) return 'private';
-    if (a === 192 && b === 168) return 'private';
-    if (a === 100 && b >= 64 && b <= 127) return 'private';
-    if (localIps().has(v4)) return 'host-local';
-    return null;
-  }
-  if (net.isIP(ip) === 6) {
-    if (ip === '::1') return allowLoopback ? null : 'loopback';
-    if (ip === '::') return allowLoopback ? null : 'unspecified';
-    const first = parseInt(ip.split(':')[0] || '0', 16);
-    if (first >= 0xfe80 && first <= 0xfebf) return 'link-local';
-    if (first >= 0xfc00 && first <= 0xfdff) return 'private';
-    if (localIps().has(ip)) return 'host-local';
-    return null;
-  }
+  if (net.isIP(ip) === 4) return v4Reason(ip, allowLoopback);
+  const g = v6Groups(ip);
+  if (!g) return null;
+  const zero = (a, b) => g.slice(a, b).every((x) => x === 0);
+  if (zero(0, 8)) return allowLoopback ? null : 'unspecified';
+  if (zero(0, 7) && g[7] === 1) return allowLoopback ? null : 'loopback';
+  // IPv4-mapped ::ffff:0:0/96, then compat ::/96: the embedded IPv4 decides.
+  if (zero(0, 5) && g[5] === 0xffff) return v4Reason(v4Of(g, 6), allowLoopback);
+  if (zero(0, 6)) return v4Reason(v4Of(g, 6), allowLoopback);
+  // NAT64 64:ff9b::/96: the embedded IPv4 decides. Local-use 64:ff9b:1::/48
+  // is private outright: the IPv4 position depends on the prefix length,
+  // which the wall can't know.
+  if (g[0] === 0x64 && g[1] === 0xff9b && zero(2, 6)) return v4Reason(v4Of(g, 6), allowLoopback);
+  if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 1) return 'private';
+  // 6to4 2002::/16: the next 32 bits are the IPv4.
+  if (g[0] === 0x2002) return v4Reason(v4Of(g, 1), allowLoopback);
+  if ((g[0] & 0xffc0) === 0xfe80) return 'link-local';
+  if ((g[0] & 0xfe00) === 0xfc00) return 'private';
+  if (localIps().has(g.join(':'))) return 'host-local';
   return null;
 }
 

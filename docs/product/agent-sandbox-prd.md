@@ -117,7 +117,7 @@ The product stands or falls on three things, all on Linux.
 | # | Capability | Proof |
 |---|---|---|
 | a | The proxy is the only way out, fails closed, and can read inside HTTPS. | A request that skips the proxy fails. A request through it is visible in full (method, URL, headers, body) for curl, node, python requests, git over https. |
-| b | The proxy holds one x request for human approval while the agent keeps working. | One request parked; other requests from the same agent complete meanwhile; approve forwards it, deny or timeout returns a clear 403. |
+| b | The proxy holds one x request for human approval while the agent keeps working. | One request parked; other requests from the same agent complete meanwhile; approve forwards it, deny or timeout returns a clear 403. Since the hold-queue change each agent has one held request at a time: later ones wait unread in line (max 16, then `429 hold queue full`), and the deadline counts from arrival. |
 | c | Per-agent memory and the shared proxy stay within the memory targets. | Measured with 20 concurrent sandboxes (see Memory targets). |
 
 M0, M1 and M2 are the go/no-go modules. If any of a, b or c fails, stop and take it back to this PRD as a spec change. M3 onward is not started until M0–M2 pass.
@@ -143,7 +143,7 @@ agent `sleep` excluded per the PRD walls-only definition).
 | Per-sandbox overhead (two bwrap processes + socat each) | mean 7.8 MB, max 7.9 MB (range 7.7–7.9 across agents) | ≤ 10 MB each | PASS |
 | Proxy RSS idle | 60.1 MB | ≤ 80 MB | PASS |
 | Proxy RSS after minting 10 certs | 69.4 MB | ≤ 80 MB | PASS |
-| Proxy RSS with 20 parked holds | 71.9 MB | ≤ 80 MB | PASS |
+| Proxy RSS with 20 agents × (1 parked + 16 waiting) | 77.9 MB (re-measured 2026-10-28 on the hold-queue code; was 71.9 MB with 20 single parked holds) | ≤ 80 MB | PASS |
 
 This supersedes the M0/M1 POC proxy figures (52.1 MB bare, 59.9–63.1 MB with TLS) for the
 rewritten code. Start timing remains unmeasured on the rewrite (TODO re-measure).
@@ -199,10 +199,10 @@ srt starts a proxy per sandbox, so that is about 1 GB for 10 agents and about 2 
 
 | Setup | 20 agents |
 |---|---|
-| Own walls (rewrite bench): ~72 MB proxy + 20 × 7.8 MB | ~228 MB |
+| Own walls (rewrite bench): ~78 MB proxy + 20 × 7.8 MB | ~234 MB |
 | srt | ~2 GB |
 
-The own-walls figure will grow. The proxy still has to load TLS handling, rwxmap and bareguard, and none of that is measured. Treat 228 MB as a floor to check, not a promise.
+The own-walls figure will grow. The proxy still has to load TLS handling, rwxmap and bareguard, and none of that is measured. Treat 234 MB as a floor to check, not a promise.
 
 ### M0 measured run (Oct 26, PASS 14/14)
 
@@ -276,7 +276,7 @@ Signed off by the user.
 | Memory per sandbox | ~100 MB (Node 82 + socat ~12 + bash ~8) | ~8 MB (socat 4.1 + walls peak ~3.8) |
 | Proxy | one per sandbox | one shared |
 | Start time | 1.87 / 2.05 / 1.98 s | 0.02–0.03 s (walls only) |
-| 20 agents | ~2 GB | ~228 MB rough sum (~72 MB proxy + 20 × 7.8 MB, rewrite bench) |
+| 20 agents | ~2 GB | ~234 MB rough sum (~78 MB proxy + 20 × 7.8 MB, rewrite bench) |
 | Blocks work | yes | yes |
 
 Memory is priority 1, and the per-sandbox proxy is the cost. We build the thin walls ourselves (a launcher of about 50 lines). srt stays as prior art. We borrow these ideas from it:
@@ -397,7 +397,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Goal | Every request gets a letter and a decision through a gate; the mode decides what each letter does; every decision is in the one audit log. |
 | We use | bareguard (dependency: `Gate`, rwx, `isPrivateIp`, `secrets` redaction, audit). rwxmap output as bareguard rwx config. |
 | We build | See the list below. |
-| Riskiest assumption | **Proxy memory with bareguard loaded stays ≤ 80 MB.** The rewrite bench measured 71.9 MB with 20 parked holds, so the headroom is about 8 MB. Second: the "x asks" behaviour (see Suite friction). |
+| Riskiest assumption | **Proxy memory with bareguard loaded stays ≤ 80 MB.** The bench measures 77.9 MB with 20 agents × (1 parked + 16 waiting), so the headroom is about 2 MB (the global held-body cap is deferred to M3). Second: the "x asks" behaviour (see Suite friction). |
 | Done when | See the list below. |
 | Estimate | 1–1.5 days. |
 
@@ -407,7 +407,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 3. **`ask` / `auto` / `trust` as bareguard presets**, with the floor in every mode.
 4. **The `gate` option**: none means a preset; otherwise a passed bareguard `Gate` or any object with the same `check(action)` contract. Matched by shape.
 5. **Reuse instead of barebox's own copies**:
-   - bareguard's `isPrivateIp` replaces barebox's `denyReasonForIp`. bareguard's version already decodes the hex `::ffff:7f00:1` form that barebox's misses.
+   - barebox's `denyReasonForIp` already covers every embedded form: mapped (`::ffff:7f00:1`, `::ffff:127.0.0.1`), compat, uncompressed `0:0:0:0:0:0:0:1`, NAT64 `64:ff9b::/96` and 6to4 `2002::/16`, with public sites behind NAT64/6to4 still reachable. Adopt bareguard's `isPrivateIp` only once it covers NAT64, 6to4 and the uncompressed `::1` and is exported — see `docs/logs/bareguard-isprivateip-spike.md`.
    - bareguard's redaction replaces barebox's `SENSITIVE_HEADERS` scrub.
 
 **Done when:**
@@ -425,7 +425,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | F1 | bareguard | `rwx.askOn` accepts only `"none"` or `"loose"`. `auto` needs "x asks" and `ask` needs "w and x ask"; today a letter above the ceiling is **denied**, not asked. Proposal: `askOn` takes letters, e.g. `["x"]`. | M3 | to file |
 | F2 | rwxmap | Labels are keyed `<vendor>.<operationId>`, but the proxy sees `METHOD` + URL. Needs a matcher primitive: request → key + letter (OpenAPI path templates). barebox must not write its own matcher. | M3 | to file |
 | F3 | bareguard | barebox's transport lines (request, response status, wall denial) must land in the gate's audit file in its shape. Check in the POC whether `gate.record` covers this; if not, ask for an append API. | M2.5 / M3 | verify in POC |
-| F4 | bareguard | `isPrivateIp` coverage of NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) forms is unverified. If missing, fix it there; barebox imports it. | M3 | verify |
+| F4 | bareguard | `isPrivateIp` misses NAT64, 6to4 and the uncompressed `::1` (verified against 0.27.0; barebox's wall covers them). Adopt it once fixed and exported. | M3 | verified: misses 3 forms; see `docs/logs/bareguard-isprivateip-spike.md` |
 
 ### M4. Undo layer
 
@@ -525,7 +525,7 @@ None of these block M0. Nothing here is silently assumed.
 
 | # | Question | Decides |
 |---|---|---|
-| 1 | What is the real proxy memory with bareguard loaded? Measured so far: TLS + on-demand certs + 20 holds = 71.9 MB (rewrite bench, Oct 27). bareguard still unmeasured; about 8 MB of headroom. | The ≤ 80 MB target. Measured first in M3. |
+| 1 | What is the real proxy memory with bareguard loaded? Measured so far: TLS + on-demand certs + 20 agents × (1 parked + 16 waiting) = 77.9 MB (bench, Oct 28; 71.9 MB with 20 single holds on Oct 27). bareguard still unmeasured; about 2 MB of headroom. | The ≤ 80 MB target. Measured first in M3. |
 | 2 | ~~`node-forge` or shelling out to `openssl` for certificates?~~ Decided Oct 26: `openssl` subprocess (sandbox keeps proxy RSS clean; platform coupling accepted, see M1). | — |
 | 3 | How should the undo layer handle large untracked dirs (`node_modules`) and build output? | M4 design. |
 | 4 | Localhost sockets (Postgres, Docker daemon) are writes the overlay can't see. Decided Oct 26 for M0: block. | M3 revisits only if a demo needs a local DB. |

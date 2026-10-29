@@ -10,7 +10,7 @@ for (const v of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
   'FTP_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'ftp_proxy']) {
   delete process.env[v];
 }
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile as execFileCb, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -620,7 +620,7 @@ describe('holds', () => {
   // client arg built after the proxy starts always resolves to a real file.
   const HCA = join(HRT, 'certs', 'ca.pem');
   const hlog = () => readFileSync(join(HRT, 'mitm.log'), 'latin1');
-  const waitHlog = (re, what) => waitFor(() => re.test(hlog()), what);
+  const waitHlog = (re, what, from = 0, ms) => waitFor(() => re.test(hlog().slice(from)), what, ms);
   const answersDir = () => join(HRT, 'answers');
   const askFile = (id) => join(HRT, 'asks', `${id}.json`);
   const answerFile = (id) => join(answersDir(), `${id}.json`);
@@ -637,6 +637,23 @@ describe('holds', () => {
   const pendingWith = (marker) => hp.pending().find((h) => {
     try { return new RegExp(marker).test(readAsk(h.id).bodyPreview); } catch { return false; }
   });
+  const socks = [];
+  afterEach(() => { for (const s of socks.splice(0)) { try { s.destroy(); } catch {} } });
+  // Raw held POST over an agent's unix socket; `res` resolves with the
+  // first response, `closed` when the proxy or client drops the socket.
+  async function post(sockPath, marker) {
+    const s = net.connect(sockPath);
+    socks.push(s);
+    s.on('error', () => {});
+    await once(s, 'connect');
+    const up = `127.0.0.1:${plainUp.port}`;
+    const body = `m=${marker}`;
+    s.write(`POST http://${up}/hold HTTP/1.1\r\nHost: ${up}\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
+    const res = readOneResponse(s);
+    res.catch(() => {});
+    return { s, t0: Date.now(), res,
+      closed: new Promise((r) => s.once('close', () => setImmediate(() => r({ status: 'closed' })))) };
+  }
   async function waitGone(p, what) {
     await waitFor(() => !existsSync(p), what);
   }
@@ -663,6 +680,24 @@ describe('holds', () => {
       hp = null;
     }
     rmSync(HRT, { recursive: true, force: true });
+  });
+
+  it('an unopenable logFile throws synchronously and releases the claim', async () => {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-badlog-'));
+    try {
+      const dirLog = join(rt, 'logdir');
+      mkdirSync(dirLog, { recursive: true });
+      assert.throws(() => createProxy({ port: 0, logFile: dirLog, runtime: rt }),
+        /cannot open logFile/);
+      const p2 = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), runtime: rt });
+      try {
+        await p2.ready;
+      } finally {
+        await p2.close();
+      }
+    } finally {
+      rmSync(rt, { recursive: true, force: true });
+    }
   });
 
   it('runtime is required (certs always live at <runtime>/certs)', async () => {
@@ -852,12 +887,13 @@ describe('holds', () => {
     }
   });
 
-  it('depth 3: concurrent holds decide independently', async () => {
-    const P2 = await holdProxy({ timeoutMs: 10000 });
+  it('depth 3: concurrent holds from three agents decide independently',
+    { skip: UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI' }, async () => {
+    await holdProxy({ timeoutMs: 10000 });
     try {
       const bodies = ['DEPTH1', 'DEPTH2', 'DEPTH3'];
-      const ps = bodies.map((m) => execA('curl', ['-s', '--max-time', '8', '-x', P2,
-        '--cacert', HCA, '--data', `m=${m}`, `${tlsUp.url}hold`], { encoding: 'latin1' }));
+      const rs = [];
+      for (const [i, m] of bodies.entries()) rs.push(await post(hp.addAgent(`d${i}`), m));
       const held = await waitFor(() => {
         const p = hp.pending();
         return p.length === 3 ? p : null;
@@ -866,12 +902,15 @@ describe('holds', () => {
       answer(byBody('DEPTH1').id, { decision: 'allow' });
       answer(byBody('DEPTH2').id, { decision: 'deny', reason: 'second' });
       answer(byBody('DEPTH3').id, { decision: 'allow' });
-      const [r1, r2, r3] = await Promise.all(ps);
-      assert.match(r1.stdout, /DEPTH1/);
-      assert.match(r2.stdout, /denied: second/);
-      assert.match(r3.stdout, /DEPTH3/);
+      const [r1, r2, r3] = await Promise.all(rs.map((r) => r.res));
+      assert.equal(r1.status, 200);
+      assert.match(r1.body, /DEPTH1/);
+      assert.match(r2.body, /denied: second/);
+      assert.equal(r3.status, 200);
+      assert.match(r3.body, /DEPTH3/);
       assert.equal(hp.pending().length, 0);
     } finally {
+      for (const s of socks.splice(0)) { try { s.destroy(); } catch {} }
       await hp.close();
       hp = null;
     }
@@ -986,6 +1025,270 @@ describe('holds', () => {
       s.on('error', reject);
     });
   }
+
+  describe('one held request per agent (agent socket)', () => {
+    const NEED_UNIX = UNIX_OK ? false : 'unix socket bind blocked here; run in a real shell or CI';
+    const nap = (ms) => new Promise((r) => setTimeout(r, ms));
+    const finish = async () => { for (const s of socks.splice(0)) { try { s.destroy(); } catch {} } const h = hp; hp = null; await Promise.race([h?.close(), nap(5000)]); };
+
+    it('a second held POST is not read while the first is parked', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy({ timeoutMs: 15000 });
+      try {
+        const fa = hp.addAgent('fa');
+        const r1 = await post(fa, 'ONE1');
+        const held1 = await waitFor(() => pendingWith('ONE1'), 'first hold to park');
+        const r2 = await post(fa, 'TWO2');
+        await nap(400);
+        assert.equal(hp.pending().length, 1, 'only one parked');
+        assert.ok(!/m=TWO2/.test(hlog()), 'queued body must not have been read');
+        answer(held1.id, { decision: 'allow' });
+        const a = await r1.res;
+        assert.equal(a.status, 200);
+        assert.match(a.body, /ONE1/);
+        const held2 = await waitFor(() => pendingWith('TWO2'), 'second hold to park after the first');
+        assert.equal(hp.pending().length, 1);
+        answer(held2.id, { decision: 'allow' });
+        const b = await r2.res;
+        assert.equal(b.status, 200);
+        assert.match(b.body, /m=TWO2/, 'full body forwarded on approve');
+      } finally { await finish(); }
+    });
+
+    it('two agents each park at the same time', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy({ timeoutMs: 15000 });
+      try {
+        const ra = await post(hp.addAgent('fa'), 'AGA1');
+        const rb = await post(hp.addAgent('fb'), 'AGB1');
+        const both = await waitFor(() => (hp.pending().length === 2 ? hp.pending() : null), 'both agents to park');
+        assert.deepEqual(both.map((h) => h.agent).sort(), ['fa', 'fb']);
+        for (const h of both) answer(h.id, { decision: 'allow' });
+        assert.equal((await ra.res).status, 200);
+        assert.equal((await rb.res).status, 200);
+      } finally { await finish(); }
+    });
+
+    it('the 18th held request from one agent gets 429 fast', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy({ timeoutMs: 15000 });
+      try {
+        const fa = hp.addAgent('fa');
+        await post(fa, 'FULL00');
+        await waitFor(() => pendingWith('FULL00'), 'first hold to park');
+        for (let i = 1; i <= 16; i++) await post(fa, `FULL${String(i).padStart(2, '0')}`);
+        await nap(300);
+        const last = await post(fa, 'FULL17');
+        const out = await Promise.race([last.res, last.closed, nap(3000).then(() => ({ status: 'timeout' }))]);
+        assert.equal(out.status, 429);
+        assert.match(out.body, /hold queue full/);
+        assert.ok(Date.now() - last.t0 < 2000, 'refused fast');
+        assert.equal(hp.pending().length, 1, 'still exactly one parked');
+      } finally { await finish(); }
+    });
+
+    it('a queued request whose client disconnects leaves the line', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy({ timeoutMs: 15000 });
+      try {
+        const fa = hp.addAgent('fa');
+        const r1 = await post(fa, 'LINE1');
+        const held1 = await waitFor(() => pendingWith('LINE1'), 'first hold to park');
+        const dead = await post(fa, 'DEAD2');
+        await post(fa, 'LIVE3');
+        await nap(300);
+        dead.s.destroy();
+        await nap(300);
+        answer(held1.id, { decision: 'allow' });
+        assert.equal((await r1.res).status, 200);
+        const next = await waitFor(() => hp.pending()[0], 'next waiter to park');
+        assert.match(readAsk(next.id).bodyPreview, /LIVE3/, 'the live waiter is next, not the dead one');
+        await nap(300);
+        assert.equal(hp.pending().length, 1);
+        assert.ok(!/m=DEAD2/.test(hlog()), 'dead waiter body never read');
+      } finally { await finish(); }
+    });
+
+    it('close() with parked and queued requests resolves promptly', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy({ timeoutMs: 15000 });
+      const closing = hp;
+      try {
+        const fa = hp.addAgent('fa');
+        const rs = [await post(fa, 'CLOSE0')];
+        await waitFor(() => pendingWith('CLOSE0'), 'first hold to park');
+        rs.push(await post(fa, 'CLOSE1'), await post(fa, 'CLOSE2'));
+        await nap(300);
+        const t0 = Date.now();
+        await Promise.race([closing.close(), nap(5000).then(() => { throw new Error('close() wedged'); })]);
+        hp = null;
+        assert.ok(Date.now() - t0 < 3000);
+        // holds.close() answers waiters and the parked hold with a 403 before
+        // the sockets are destroyed, so every client sees the denial.
+        for (const r of rs) {
+          const out = await Promise.race([r.res, r.closed]);
+          assert.equal(out.status, 403);
+          assert.match(out.body, /denied: proxy closing/);
+        }
+      } finally { await finish(); }
+    });
+
+    it('close() never wedges when the audit log hits a write error (full disk)',
+      { skip: existsSync('/dev/full') ? false : 'no /dev/full here', timeout: 20000 }, async () => {
+        const rt = mkdtempSync(join(tmpdir(), 'bb-fulllog-'));
+        const errs = [];
+        const orig = console.error;
+        console.error = (...a) => { errs.push(a.join(' ')); };
+        const p = createProxy({ port: 0, runtime: rt, logFile: '/dev/full' });
+        try {
+          const { port } = await p.ready;
+          const s = net.connect(port, '127.0.0.1');
+          s.on('error', () => {});
+          s.write('GET http://127.0.0.1:1/ HTTP/1.1\r\nHost: 127.0.0.1:1\r\nConnection: close\r\n\r\n');
+          await waitFor(() => errs.length > 0, 'ENOSPC on the audit log');
+          await Promise.race([p.close(), nap(3000).then(() => { throw new Error('close() wedged'); })]);
+          s.destroy();
+          assert.equal(errs.length, 1);
+          assert.match(errs[0], /ENOSPC/);
+        } finally {
+          console.error = orig;
+          rmSync(rt, { recursive: true, force: true });
+        }
+      });
+
+    it('close() never wedges on a busy audit log (late writes after end)', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy({ timeoutMs: 15000 });
+      const errs = [];
+      const orig = console.error;
+      console.error = (...a) => { errs.push(a.join(' ')); };
+      try {
+        const fa = hp.addAgent('fa');
+        // Holder mid-body: its socket destroy fires 'error' -> a log line on a later tick.
+        await partialPost(fa, 'BUSY0', 100, 'm=BUSY0');
+        await nap(100);
+        // Long fs write queue at close time: many quick log-producing requests.
+        for (let i = 0; i < 300; i++) {
+          const s = net.connect(hport, '127.0.0.1');
+          socks.push(s);
+          s.on('error', () => {});
+          s.write('garbage\r\n\r\n');
+        }
+        for (let i = 0; i < 100; i++) await post(fa, `Q${i}`);
+        await Promise.race([hp.close(), nap(5000).then(() => { throw new Error('close() wedged'); })]);
+        hp = null;
+        await nap(200);
+        assert.deepEqual(errs.filter((e) => /write after end/.test(e)), []);
+      } finally { console.error = orig; await finish(); }
+    });
+
+    it('a waiter that reaches the front past its deadline is refused at add (deadline counts from arrival)', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy({ timeoutMs: 400 });
+      try {
+        const fa = hp.addAgent('fa');
+        await post(fa, 'DL0');
+        await waitFor(() => pendingWith('DL0'), 'first hold to park');
+        await nap(100);
+        const w = await post(fa, 'DL1');
+        await nap(100);
+        assert.equal(hp.pending().length, 1, 'waiter is queued, not parked');
+        assert.ok(!/m=DL1/.test(hlog()), 'waiter body unread');
+        const out = await Promise.race([w.res, w.closed, nap(3000).then(() => ({ status: 'timeout' }))]);
+        const dt = Date.now() - w.t0;
+        assert.equal(out.status, 403);
+        assert.match(out.body, /hold timeout/);
+        assert.ok(dt >= 300 && dt < 700, `deadline from arrival (took ${dt} ms)`);
+      } finally { await finish(); }
+    });
+
+    // Raw held POST whose body is sent in two steps: `head` now, the rest via `rest()`.
+    async function partialPost(sockPath, marker, total, head) {
+      const s = net.connect(sockPath);
+      socks.push(s);
+      s.on('error', () => {});
+      await once(s, 'connect');
+      const up = `127.0.0.1:${plainUp.port}`;
+      s.write(`POST http://${up}/hold HTTP/1.1\r\nHost: ${up}\r\nContent-Length: ${total}\r\nConnection: close\r\n\r\n${head}`);
+      const res = readOneResponse(s);
+      res.catch(() => {});
+      return { s, res, closed: new Promise((r) => s.once('close', () => setImmediate(() => r({ status: 'closed' })))),
+        rest: (more) => s.write(more) };
+    }
+
+    it('a dripping holder expires at its deadline and frees the slot', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy({ timeoutMs: 600 });
+      let drip = null;
+      try {
+        const fa = hp.addAgent('fa');
+        const logFrom = hlog().length; // earlier tests already logged this note; the deny logs before the reply, so 1 s is ample
+        const t0 = Date.now();
+        const holder = await partialPost(fa, 'DRIP0', 100, 'd');
+        let sent = 1;
+        drip = setInterval(() => { if (sent < 100) { sent++; holder.rest('d'); } }, 100);
+        // The client is still dripping when the proxy answers and closes, so
+        // under load the kernel may deliver an RST before curl-like reads the 403.
+        const out = await Promise.race([holder.res.catch(() => ({ status: 'reset' })), holder.closed,
+          nap(3000).then(() => ({ status: 'timeout' }))]);
+        const dt = Date.now() - t0;
+        assert.ok(out.status === 403 || out.status === 'reset' || out.status === 'closed', `got ${out.status}`);
+        if (out.status === 403) assert.match(out.body, /hold timeout/);
+        assert.ok(dt >= 500 && dt < 1000, `expired at arrival + deadline (took ${dt} ms)`);
+        await waitHlog(/"note":"denied: hold timeout"/, 'the 403 hold-timeout to be logged', logFrom, 1000);
+        const fresh = await post(fa, 'FRESH1');
+        await waitFor(() => pendingWith('FRESH1'), 'fresh request to park promptly', 1000);
+        // The dripper finishing late must not park a second request.
+        holder.rest('d'.repeat(100));
+        await nap(300);
+        assert.equal(hp.pending().length, 1, 'only the fresh request is parked');
+        assert.ok(pendingWith('FRESH1'));
+        fresh.s.destroy();
+      } finally { clearInterval(drip); await finish(); }
+    });
+
+    it('a client that dies during the DNS check does not leak the slot', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      // An IP literal skips the resolver, so use a name the stub resolves slowly.
+      const slow = async () => { await nap(200); return '127.0.0.1'; };
+      hp = createProxy({ port: 0,
+        logFile: join(HRT, 'mitm.log'), upstreamCa: CA, runtime: HRT,
+        clientIdleMs: 500,
+        unsafeTestOnly: { allowLoopback: true, resolveUpstream: slow },
+        hold: { match: '/hold', timeoutMs: 'never', pollMs: 25 } });
+      await hp.ready;
+      try {
+        const fa = hp.addAgent('fa');
+        const raw = async (marker) => {
+          const s = net.connect(fa);
+          socks.push(s);
+          s.on('error', () => {});
+          await once(s, 'connect');
+          s.write(`POST http://slow.test/hold HTTP/1.1\r\nHost: slow.test\r\nContent-Length: 8\r\nConnection: close\r\n\r\nm=${marker}`);
+          return s;
+        };
+        const dead = await raw('GONE00');
+        await nap(50);
+        dead.destroy();
+        await nap(500); // past the DNS await: reserve ran with the client already gone
+        const t0 = Date.now();
+        await raw('AFTER1');
+        await waitFor(() => pendingWith('AFTER1'), 'fresh request to park promptly', 1000);
+        assert.ok(Date.now() - t0 < 1500);
+        assert.equal(hp.pending().length, 1);
+      } finally { await finish(); }
+    });
+
+    it('an over-size holder frees the slot: the waiter behind it parks', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy({ timeoutMs: 15000, maxBody: 16 });
+      try {
+        const fa = hp.addAgent('fa');
+        const holder = await partialPost(fa, 'BIG0', 100, 'm=BI');
+        await nap(100);
+        const w = await post(fa, 'SMALL1');
+        await nap(200);
+        assert.equal(hp.pending().length, 0, 'waiter is queued behind the holder');
+        holder.rest('x'.repeat(96));
+        const h = await Promise.race([holder.res, holder.closed, nap(3000).then(() => ({ status: 'timeout' }))]);
+        assert.equal(h.status, 403);
+        assert.match(h.body, /body too large to hold/);
+        const held = await waitFor(() => pendingWith('SMALL1'), 'waiter to park after the over-size holder');
+        answer(held.id, { decision: 'allow' });
+        assert.equal((await w.res).status, 200);
+      } finally { await finish(); }
+    });
+  });
 });
 
 describe('one proxy owns a runtime (claim)', () => {
@@ -1039,6 +1342,8 @@ describe('one proxy owns a runtime (claim)', () => {
     const p2 = createProxy({ port: 0, logFile: join(rt, 'mitm2.log'), runtime: rt });
     try {
       await p2.ready;
+      p2.addAgent('a1');
+      assert.equal(statSync(join(rt, 'socks')).mode & 0o777, 0o700);
     } finally {
       await p2.close();
     }

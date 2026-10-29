@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+
+- Held requests are one per agent (pre-1.0 behaviour change): each agent has at most one held request being read or parked; later ones wait in line, unread, in order. At most 16 wait; the next gets `429 hold queue full`.
+- The hold deadline counts from arrival (default 120 s, `never` supported), time in line and reading the body included; a request past its deadline is denied `hold timeout` whether waiting, sending, or parked.
+- The TCP door is one agent: every connection through `createProxy`'s TCP `port` counts as the agent `tcp` and shares one hold line. Use `addAgent` sockets (`sbx run` does) for separate lines.
+
+### Security
+
+- The upstream wall checks an IPv4 embedded in IPv6 in every spelling: IPv4-mapped (`::ffff:7f00:1` as well as `::ffff:127.0.0.1`) and compat forms, uncompressed loopback (`0:0:0:0:0:0:0:1`), NAT64 `64:ff9b::/96` (local-use `64:ff9b:1::/48` denied outright) and 6to4 `2002::/16`. NAT64 and 6to4 of public sites stay reachable.
+- Runtime folders are owner-only (0700) whatever the umask: the runtime root, `asks/`, `answers/` and `socks/`.
+
+### Fixed
+
+- `createProxy` throws synchronously on an unopenable `logFile` and releases the runtime. A later audit-log write error prints one `sbx: audit log … write failed` line to stderr and the proxy keeps running.
+- The `sbx run` "answer with" hint quotes the runtime path, so it is safe to copy-paste.
+- Overlay hashing reads files in 1 MiB chunks, so very large files no longer exhaust memory.
+- `run()` releases the runtime when the agent socket can't be created; the claim no longer stays held refusing a second `run()` on the same runtime as "in use".
+
 ## [0.3.0] - 2026-10-28
 
 Breaking changes (pre-1.0): the control socket, `createProxy`'s `certDir` and `allowUpstream`, `run()`'s low-level options, the hold queue's `approve`/`deny`/`size` and the top-level `allowLoopback` option are removed or moved; `runtime` is now required. Each is marked **Breaking** below.

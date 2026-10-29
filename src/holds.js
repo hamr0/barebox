@@ -44,13 +44,16 @@
 // must write atomically (tmp file + rename); readers never see partials.
 import fs from 'node:fs';
 import path from 'node:path';
-import { runtimePaths } from './runtime.js';
+import { ensurePrivateDir, runtimePaths } from './runtime.js';
 
 /** Body preview cap for `asks/<id>.json` (bytes). */
 export const ASK_BODY_LIMIT = 4096;
 
 /** Default answer poll interval in ms (PRD Q9). */
 export const DEFAULT_POLL_MS = 250;
+
+/** At most this many held requests wait in line per agent; the next is refused. */
+const MAX_WAITING_PER_AGENT = 16;
 
 /**
  * A parked request, as returned by {@link pending}. Plain objects only —
@@ -204,7 +207,9 @@ export function normalizeDecision(input, { approveAlias = false } = {}) {
  * in `createProxy` (a second live proxy on the same runtime never starts):
  * on the file channel the queue owns `asks/` and `answers/` for its
  * runtime, clearing both at start and removing its asks on close, so no
- * answer outlives its queue.
+ * answer outlives its queue. One parked request per agent: `reserve` hands
+ * out the agent's hold slot before a held body is read, and the slot passes
+ * to the next waiter when the parked entry leaves by any path.
  *
  * @param {object} opts
  * @param {(o: Record<string, unknown>) => void} opts.log audit-log writer
@@ -218,7 +223,7 @@ export function normalizeDecision(input, { approveAlias = false } = {}) {
  * @param {OnEvent|null} [opts.onEvent] event callback: `{ type: 'ask' }` on park, `{ type: 'decided' }` on settle or abandon
  * @param {(entry: object) => void} opts.onApprove forward the parked request upstream
  * @param {(entry: object, reason: string) => void} opts.onDeny refuse the parked request
- * @returns {{ add: (entry: object) => string, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
+ * @returns {{ add: (entry: object) => string|null, reserve: (agent: string, cbs: { onReady: () => void, onExpire: (reason: string) => void }) => { state: 'now'|'queued'|'full', arrivedAt: number, cancel: () => void }, decide: (req: { agent: string, method: string, url: string, headers: Record<string, string | string[] | undefined> }) => string | null, abandon: (id: string) => void, abandonSocket: (sock: object) => void, pending: () => HeldRequest[], close: () => void }} queue handle
  */
 export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   maxBody = 1048576, runtime = null, onAsk = null, pollMs = DEFAULT_POLL_MS,
@@ -248,8 +253,8 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   }
   const paths = runtime ? runtimePaths(runtime) : null;
   if (paths) {
-    fs.mkdirSync(paths.asksDir, { recursive: true });
-    fs.mkdirSync(paths.answersDir, { recursive: true });
+    ensurePrivateDir(paths.asksDir);
+    ensurePrivateDir(paths.answersDir);
   }
   // A dead queue's leftovers must never decide the next queue's holds
   // (ids restart at h1): clear both folders at start, logging one audit
@@ -278,6 +283,65 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   let n = 0;
   /** @type {Map<string, object>} */
   const queue = new Map();
+  /**
+   * One hold slot per agent: `holder` is the reservation holding it (or the
+   * parked entry's marker), `line` the FIFO of waiting reservation handles.
+   *
+   * @type {Map<string, { holder: object|null, line: Array<object> }>}
+   */
+  const slots = new Map();
+  /** Internal reserve state by returned handle identity. @type {WeakMap<object, { agent: string, onReady: () => void, onExpire: (reason: string) => void, timer: ReturnType<typeof setTimeout>|null, consumed: boolean, done: boolean }>} */
+  const handleState = new WeakMap();
+
+  /**
+   * The one expiry path for every reservation timer: mark it done, take it
+   * out of the line or hand its slot to the next waiter (whose own timer
+   * keeps running from its arrival), then expire it. Once.
+   *
+   * @param {string} agent agent name
+   * @param {object} handle the reservation's handle
+   * @param {string} reason expiry reason
+   * @returns {void}
+   */
+  function expireReservation(agent, handle, reason) {
+    const st = handleState.get(handle);
+    if (!st || st.done) return;
+    st.done = true;
+    st.timer = null;
+    const s = slots.get(agent);
+    if (s) {
+      if (s.holder === handle) {
+        releaseSlot(agent);
+      } else {
+        const i = s.line.indexOf(handle);
+        if (i >= 0) s.line.splice(i, 1);
+        if (!s.holder && s.line.length === 0) slots.delete(agent);
+      }
+    }
+    st.onExpire(reason);
+  }
+
+  /**
+   * Drop the current holder and hand the slot to the next waiter in line,
+   * or forget the agent when nobody waits. A promoted waiter keeps its own
+   * arrival timer: nothing here arms, clears or resets one.
+   *
+   * @param {string} agent agent name
+   * @returns {void}
+   */
+  function releaseSlot(agent) {
+    const s = slots.get(agent);
+    if (!s) return;
+    s.holder = null;
+    const next = s.line.shift();
+    if (!next) {
+      slots.delete(agent);
+      return;
+    }
+    s.holder = next;
+    const hst = handleState.get(next);
+    if (hst) hst.onReady();
+  }
 
   const pub = (h) => ({
     id: h.id, agent: h.agent, method: h.method, url: h.url, rule: h.note,
@@ -322,6 +386,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
     if (!h) return `unknown ${id}`;
     queue.delete(id);
     if (h.timer) clearTimeout(h.timer);
+    if (h.slot) releaseSlot(h.agent);
     removeAskFile(id);
     const decision = approved ? 'allow' : 'deny';
     if (approved) {
@@ -415,21 +480,101 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
   if (pollTimer && typeof pollTimer.unref === 'function') pollTimer.unref();
 
   const holds = {
-    add({ agent, method, url, headers, body, sock, cres, note }) {
+    /**
+     * Park a held request. With `slot` (from `reserve`) the parked entry
+     * takes over that slot, clearing the reservation's timer; with
+     * `arrivedAt` the deadline counts from arrival, not from now. A
+     * finished slot (expired, cancelled, closed, or no longer the holder)
+     * parks nothing and returns `null`. Without `slot`, parks exactly as
+     * before, without limit.
+     *
+     * @param {object} entry queue entry
+     * @returns {string|null} hold id, or null for a finished slot
+     */
+    add({ agent, method, url, headers, body, sock, cres, note, slot, arrivedAt }) {
+      const hst = typeof slot === 'object' && slot !== null ? handleState.get(slot) : undefined;
+      const s = slots.get(agent);
+      if (slot && (!hst || hst.done || !s || s.holder !== slot)) return null;
       const id = `h${++n}`;
       const ms = deadlineMs();
+      const t0 = typeof arrivedAt === 'number' ? arrivedAt : Date.now();
       const entry = {
-        id, agent, method, url, headers, body, sock, cres, note, t0: Date.now(),
+        id, agent, method, url, headers, body, sock, cres, note, t0,
+        slot: null,
         timer: ms === null ? null
-          : setTimeout(() => settle(id, false, 'hold timeout'), ms),
+          : setTimeout(() => settle(id, false, 'hold timeout'), Math.max(0, ms - (Date.now() - t0))),
       };
       // Unref: a parked `never` hold must not keep the process alive by itself.
       if (entry.timer?.unref) entry.timer.unref();
+      if (slot && hst && s && s.holder === slot) {
+        if (hst.timer) clearTimeout(hst.timer);
+        hst.timer = null;
+        hst.consumed = true;
+        s.holder = { parked: id };
+        entry.slot = slot;
+      }
       queue.set(id, entry);
       log({ ev: 'hold', id, agent, method, url, reason: note ?? undefined,
-        timeoutMs: ms, waiting: queue.size });
+        timeoutMs: ms, waiting: queue.size, queued: s ? s.line.length : 0 });
       void park(entry, ms, note ?? '');
       return id;
+    },
+
+    /**
+     * Ask for this agent's hold slot before reading a held request's body.
+     * @param {string} agent
+     * @param {{ onReady: () => void, onExpire: (reason: string) => void }} cbs
+     * @returns {{ state: 'now'|'queued'|'full', arrivedAt: number, cancel: () => void }}
+     */
+    reserve(agent, { onReady, onExpire }) {
+      const arrivedAt = Date.now();
+      // Internal slot state, keyed by the returned handle's identity: `add`
+      // receives that same object as `slot`, so holder comparisons use it.
+      // The one deadline timer lives here, armed below for 'now' and
+      // 'queued' alike; expiry runs through `expireReservation` only.
+      /** @type {{ agent: string, onReady: () => void, onExpire: (reason: string) => void, timer: ReturnType<typeof setTimeout>|null, consumed: boolean, done: boolean }} */
+      const st = { agent, onReady, onExpire, timer: null, consumed: false, done: false };
+      const s0 = slots.get(agent);
+      /** @type {'now'|'queued'|'full'} */
+      const state = !s0 ? 'now' : (s0.line.length >= MAX_WAITING_PER_AGENT ? 'full' : 'queued');
+      const handle = {
+        state,
+        arrivedAt,
+        cancel() {
+          if (st.done) return;
+          st.done = true;
+          if (st.timer) clearTimeout(st.timer);
+          st.timer = null;
+          if (st.consumed) return;
+          const s = slots.get(agent);
+          if (!s) return;
+          if (s.holder === handle) {
+            releaseSlot(agent);
+            return;
+          }
+          const i = s.line.indexOf(handle);
+          if (i >= 0) {
+            s.line.splice(i, 1);
+            if (!s.holder && s.line.length === 0) slots.delete(agent);
+          }
+        },
+      };
+      handleState.set(handle, st);
+      if (state === 'now') {
+        slots.set(agent, { holder: handle, line: [] });
+      } else if (state === 'full') {
+        log({ ev: 'hold-queue-full', agent });
+        return handle;
+      } else {
+        if (!s0) throw new Error(`reserve: no slot record for ${agent}`);
+        s0.line.push(handle);
+      }
+      const ms = deadlineMs();
+      if (ms !== null) {
+        st.timer = setTimeout(() => expireReservation(agent, handle, 'hold timeout'), ms);
+        if (st.timer.unref) st.timer.unref();
+      }
+      return handle;
     },
 
     // The client went away: drop its holds so no later answer can forward
@@ -439,6 +584,7 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
       if (!h) return;
       queue.delete(id);
       if (h.timer) clearTimeout(h.timer);
+      if (h.slot) releaseSlot(h.agent);
       removeAskFile(id);
       log({ ev: 'hold-abandoned', id, agent: h.agent, method: h.method, url: h.url });
       onDeny(h, 'client gone');
@@ -457,6 +603,19 @@ export function createHolds({ log, shouldHold, match, timeoutMs = 120000,
 
     close() {
       if (pollTimer) clearInterval(pollTimer);
+      for (const s of [...slots.values()]) {
+        const handles = [...s.line];
+        if (s.holder && !('parked' in s.holder)) handles.push(s.holder);
+        for (const handle of handles) {
+          const hst = handleState.get(handle);
+          if (!hst) continue;
+          if (hst.timer) clearTimeout(hst.timer);
+          hst.timer = null;
+          hst.done = true;
+          hst.onExpire('proxy closing');
+        }
+      }
+      slots.clear();
       // settle() removes each ask file: `sbx pending` never lists a dead queue's holds.
       for (const [id] of [...queue]) settle(id, false, 'proxy closing');
     },

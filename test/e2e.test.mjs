@@ -3,9 +3,9 @@
 // a real shell and CI. This is the only test that proves the product.
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile as execFileCb, execFileSync } from 'node:child_process';
+import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +14,7 @@ import { launch } from '../src/launcher.js';
 import { createProxy } from '../src/proxy.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps } from './fixtures/upstream.mjs';
+import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
 
 // test/setup-env.mjs (via --import) already dropped the sandbox's egress proxy
 // vars before `node:http` snapshotted them; repeat here so curl children
@@ -34,13 +35,9 @@ function canUnix() {
     s.listen(p, () => s.close(() => { try { rmSync(p); } catch {} resolve(true); }));
   });
 }
-function hasBin(n) {
-  try { execFileSync('which', [n], { stdio: 'ignore' }); return true; }
-  catch { return false; }
-}
 const UNIX_OK = await canUnix();
-const CAN_E2E = existsSync('/usr/bin/bwrap') && UNIX_OK && hasBin('socat') && hasBin('curl');
-const SKIP_WHY = !existsSync('/usr/bin/bwrap') ? 'needs bwrap'
+const CAN_E2E = bwrapUsable() && UNIX_OK && hasBin('socat') && hasBin('curl');
+const SKIP_WHY = !bwrapUsable() ? 'needs bwrap'
   : (!UNIX_OK ? 'unix socket bind blocked here'
     : (!hasBin('socat') || !hasBin('curl') ? 'needs socat and curl' : ''));
 describe(`end-to-end (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}` : ''})`,

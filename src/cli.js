@@ -30,7 +30,7 @@ import { parseArgs } from 'node:util';
 import { writeFileAtomic } from './holds.js';
 import { run as sandboxRun } from './run.js';
 import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
-import { assertAgentName, createRuntime, runtimePaths, runtimeLive, safe } from './runtime.js';
+import { assertAgentName, createRuntime, runtimePaths, runtimeLive, safe, shellQuote } from './runtime.js';
 
 const USAGE = 'usage: sbx [--help] | pending | approve <id> | deny <id> [reason] | diff [--agent <name>] | commit [--agent <name>] [--skip-conflicts] | rollback [--agent <name>] | run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]';
 
@@ -179,7 +179,7 @@ async function run(args) {
     if (json) out(JSON.stringify({ ev: 'decided', id: c.id, decision: c.decision, reason: c.reason }));
     else out(`decided ${c.id} ${c.decision}${c.reason ? ` (${c.reason})` : ''}`);
   };
-  err(`runtime ${runtime} (answer with: SBX_RUNTIME=${runtime} sbx approve <id>)`);
+  err(`runtime ${runtime} (answer with: SBX_RUNTIME=${shellQuote(runtime)} sbx approve <id>)`);
   /** @type {{ exit: number, diff: { path: string }[] } | null} */
   let result = null;
   try {

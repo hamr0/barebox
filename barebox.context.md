@@ -64,10 +64,14 @@ SBX_RUNTIME=/tmp/sbx npx sbx approve h1
 SBX_RUNTIME=/tmp/sbx npx sbx deny h2 "reason here"
 ```
 
-Held requests wait (default 120 s, `never` supported); approve forwards,
-deny and timeout answer 403 with the reason. These commands need the proxy
-to be alive: with no live proxy on the runtime `sbx pending`, `approve` and
-`deny` exit 1 and say so, because nothing would read the answer.
+Held requests wait (default 120 s, `never` supported), counting from arrival:
+time spent in line and reading the body counts too, and a request past its
+deadline is denied `hold timeout` whether waiting, sending, or parked. Each
+agent holds at most one request being read or parked; later ones wait in
+line, unread, in order — at most 16, the next gets `429 hold queue full`.
+Approve forwards, deny and timeout answer 403 with the reason. These commands
+need the proxy to be alive: with no live proxy on the runtime `sbx pending`,
+`approve` and `deny` exit 1 and say so, because nothing would read the answer.
 
 ## One call: `run()` and `sbx run`
 
@@ -128,8 +132,9 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
   `GIT_SSL_CAINFO`. Without it every HTTPS call from inside fails
   verification. Only `ca.pem` enters the sandbox, never the key.
 - Certificates live in `<runtime>/certs` (`runtime` is required). There is no `certDir` option and no control socket: decisions flow through `<runtime>/asks` + `<runtime>/answers` or `hold.onAsk`.
-- The upstream wall answers `403` for loopback, link-local (incl. `169.254.169.254`), the host's own addresses, private LAN ranges and unresolvable names. Every DNS answer is checked and the dial is pinned to the checked IP; test-only options live under `unsafeTestOnly` (`allowLoopback`, `resolveUpstream`) and production never sets them.
-- The audit log (`logFile`) is set to `0600` every time a proxy starts. The values of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token` and `Api-Key` are logged as `[redacted]`; other headers and bodies are logged as-is unless your `redact` hook shapes them (it runs after the built-in scrub).
+- The TCP door is one agent: every connection through `createProxy`'s TCP `port` counts as the agent `tcp` and shares one hold line. Use `addAgent` sockets (`sbx run` does) for separate lines per agent.
+- The upstream wall answers `403` for loopback, link-local (incl. `169.254.169.254`), the host's own addresses, private LAN ranges and unresolvable names. An IPv4 embedded in IPv6 is checked in every spelling: mapped, compat, uncompressed, NAT64 `64:ff9b::/96` (local-use `/48` denied outright) and 6to4 `2002::/16`; NAT64 and 6to4 of public sites stay reachable. Every DNS answer is checked and the dial is pinned to the checked IP; test-only options live under `unsafeTestOnly` (`allowLoopback`, `resolveUpstream`) and production never sets them.
+- `createProxy` throws synchronously on an unopenable `logFile` (a directory, a missing parent, no permission) and releases the runtime. The runtime root, `asks/`, `answers/` and `socks/` are owner-only (`0700`) whatever the umask. The audit log (`logFile`) is set to `0600` every time a proxy starts. The values of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token` and `Api-Key` are logged as `[redacted]`; other headers and bodies are logged as-is unless your `redact` hook shapes them (it runs after the built-in scrub).
 - One proxy per runtime: `createProxy` throws "in use by pid N" (`run()` rejects, `sbx run` exits 1) while a live proxy owns the runtime. The claim is held by the proxy process and the kernel frees it when the process dies, so a crashed proxy never blocks the runtime. Use another `SBX_RUNTIME`, or leave it unset for a fresh one.
 - `launch()` starts the agent in the project dir, in a new session (no controlling terminal). Locked drawers are 21 credential stores (see `LOCKED_PATHS` in `src/launcher.js`); the agent's own model credentials in `~/.claude` stay readable until keys move out of its reach.
 - `sbx` exits 0 ok, 1 unknown id / refused / no live proxy / run failure, 2 usage; `sbx run` mirrors the agent's exit code.

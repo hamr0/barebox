@@ -22,10 +22,10 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { createProxy } from '../src/proxy.js';
 import { launch } from '../src/launcher.js';
 import { certFor } from '../src/certs.js';
+import { bwrapUsable, hasBin } from '../test/fixtures/probes.mjs';
 
 const N = 20;
 const CERT_HOSTS = 10;
@@ -42,11 +42,6 @@ function canUnix() {
     s.on('error', () => resolve(false));
     s.listen(p, () => s.close(() => { try { rmSync(p); } catch {} resolve(true); }));
   });
-}
-
-function hasBin(n) {
-  try { execFileSync('which', [n], { stdio: 'ignore' }); return true; }
-  catch { return false; }
 }
 
 /** Poll `cond` until truthy; throw naming the condition on timeout. */
@@ -111,7 +106,7 @@ function treeRss(rootPid, kids) {
 
 // --- main ------------------------------------------------------------------
 const unixOk = await canUnix();
-const why = !readdirSync('/usr/bin').includes('bwrap') ? 'needs bwrap (/usr/bin/bwrap missing)'
+const why = !bwrapUsable() ? 'needs bwrap on PATH'
   : (!unixOk ? 'unix socket bind blocked here'
     : (!hasBin('socat') ? 'needs socat' : ''));
 if (why) {
@@ -135,7 +130,7 @@ try {
     unsafeTestOnly: { allowLoopback: true },
     hold: { shouldHold: () => 'bench-park', timeoutMs: 'never' },
   });
-  const { port: tcpPort } = await proxy.ready;
+  await proxy.ready;
 
   const proxyMb = () => process.memoryUsage.rss() / 1024 / 1024;
   const idleMb = proxyMb();
@@ -146,9 +141,12 @@ try {
   }
   const mintedMb = proxyMb();
 
+  /** @type {Map<string, string>} */
+  const sockPaths = new Map();
   const names = Array.from({ length: N }, (_, i) => `b${String(i).padStart(2, '0')}`);
   for (const name of names) {
     const sock = proxy.addAgent(name);
+    sockPaths.set(name, sock);
     const child = launch({
       runtime, agent: name, proj, command: ['sleep', '120'], socket: sock, caFile: proxy.caFile,
     });
@@ -190,19 +188,25 @@ try {
   const maxNoSleep = Math.max(...trees.map((t) => t.noSleepMb));
   const meanNoSleep = trees.reduce((a, t) => a + t.noSleepMb, 0) / trees.length;
 
-  // 20 parked holds through the TCP door (127.0.0.1 loopback, allowed via
-  // allowLoopback): absolute-form POST parks before any forward, so no
-  // upstream fixture is needed. Sockets stay open — the holds stay parked.
+  // Worst case for the hold queue: every agent parks 1 held POST and has 16
+  // more waiting unread, and its 18th gets 429. Over each agent's own unix
+  // socket (a TCP-door connection is always agent 'tcp'). Absolute-form POST
+  // to 127.0.0.1 (allowLoopback) parks before any forward, so no upstream
+  // fixture is needed. Sockets stay open — the holds stay parked.
+  const PER_AGENT = 18;
+  const full = new Map(names.map((n) => [n, 0]));
   await waitFor(() => {
-    while (holdSockets.length < N) {
-      const i = holdSockets.length;
-      const s = net.connect(/** @type {number} */ (tcpPort), '127.0.0.1');
+    while (holdSockets.length < N * PER_AGENT) {
+      const k = holdSockets.length;
+      const name = names[k % N];
+      const s = net.connect(/** @type {string} */ (sockPaths.get(name)));
       s.on('error', () => {});
-      s.write(`POST http://127.0.0.1:1/hold-${i} HTTP/1.1\r\nHost: 127.0.0.1:1\r\nContent-Length: 4\r\n\r\nx=${String(i).padStart(2, '0')}`);
+      s.once('data', (c) => { if (/^HTTP\/1\.1 429 /.test(c.toString('latin1'))) full.set(name, (full.get(name) ?? 0) + 1); });
+      s.write(`POST http://127.0.0.1:1/hold-${k} HTTP/1.1\r\nHost: 127.0.0.1:1\r\nContent-Length: 4\r\n\r\nx=${String(k % 100).padStart(2, '0')}`);
       holdSockets.push(s);
     }
-    return proxy.pending().length >= N || false;
-  }, '20 holds to park');
+    return (proxy.pending().length === N && [...full.values()].every((v) => v === 1)) || false;
+  }, `${N} agents to park 1 and refuse the 18th`);
   const heldMb = proxyMb();
 
   console.log('');
@@ -210,7 +214,7 @@ try {
   console.log('|---|---|---|');
   console.log(`| proxy idle | ${idleMb.toFixed(1)} | ≤ ${MAX_PROXY_MB} |`);
   console.log(`| proxy after minting ${CERT_HOSTS} certs | ${mintedMb.toFixed(1)} | ≤ ${MAX_PROXY_MB} |`);
-  console.log(`| proxy with ${N} parked holds | ${heldMb.toFixed(1)} | ≤ ${MAX_PROXY_MB} |`);
+  console.log(`| proxy with ${N} agents × (1 parked + 16 waiting) | ${heldMb.toFixed(1)} | ≤ ${MAX_PROXY_MB} |`);
   console.log(`| per-sandbox walls mean (no \`sleep\`) | ${meanNoSleep.toFixed(1)} | ≤ ${MAX_SANDBOX_MB} |`);
   console.log(`| per-sandbox walls max (no \`sleep\`) | ${maxNoSleep.toFixed(1)} | ≤ ${MAX_SANDBOX_MB} |`);
   console.log('');

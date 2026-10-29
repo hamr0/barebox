@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, delimiter } from 'node:path';
 import net from 'node:net';
 import { launch, buildCaBundle } from '../src/launcher.js';
+import { bwrapUsable } from './fixtures/probes.mjs';
 
 function canUnix() {
   return new Promise((resolve) => {
@@ -17,7 +18,7 @@ function canUnix() {
   });
 }
 const UNIX_OK = await canUnix();
-const NEED_SANDBOX = !existsSync('/usr/bin/bwrap') ? 'needs bwrap; run in a real shell or CI'
+const NEED_SANDBOX = !bwrapUsable() ? 'needs bwrap; run in a real shell or CI'
   : (!UNIX_OK ? 'unix socket bind blocked here; run in a real shell or CI' : false);
 
 

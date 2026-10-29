@@ -3,14 +3,20 @@
 // child processes.
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, mkdirSync, statSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, symlinkSync, renameSync, mkdirSync, statSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import net from 'node:net';
-import { claimRuntime, runtimePaths } from '../src/runtime.js';
+import { claimRuntime, runtimePaths, shellQuote } from '../src/runtime.js';
 
 const RUNTIME_URL = new URL('../src/runtime.js', import.meta.url).href;
+
+/** Spawn a script in a child node process. */
+function spawnChild(body, args) {
+  return spawn(process.execPath, ['--input-type=module', '-e',
+    `import { claimRuntime } from ${JSON.stringify(RUNTIME_URL)};\n${body}`, '--', ...args]);
+}
 
 /**
  * Run a script in a child node process.
@@ -20,11 +26,6 @@ const RUNTIME_URL = new URL('../src/runtime.js', import.meta.url).href;
  * @param {number} timeoutMs kill after this long
  * @returns {Promise<{code: number|null, signal: string|null, stdout: string, stderr: string, timedOut: boolean}>} how it ended
  */
-function spawnChild(body, args) {
-  return spawn(process.execPath, ['--input-type=module', '-e',
-    `import { claimRuntime } from ${JSON.stringify(RUNTIME_URL)};\n${body}`, '--', ...args]);
-}
-
 function runChild(body, args, timeoutMs) {
   return new Promise((resolve) => {
     const child = spawnChild(body, args);
@@ -144,6 +145,32 @@ describe('claimRuntime: one live proxy per runtime', () => {
     r2();
   });
 
+  it('the runtime root is 0700 whatever the umask', () => {
+    const prev = process.umask(0);
+    try {
+      const rt = join(root, `rt-${process.pid}-${Date.now()}`);
+      const release = claimRuntime(rt);
+      try {
+        assert.equal(statSync(rt).mode & 0o777, 0o700);
+      } finally {
+        release();
+      }
+    } finally {
+      process.umask(prev);
+    }
+  });
+
+  it('an existing runtime root is tightened to 0700', () => {
+    const rt = mkdtempSync(join(root, 'rt-'));
+    chmodSync(rt, 0o755);
+    const release = claimRuntime(rt);
+    try {
+      assert.equal(statSync(rt).mode & 0o777, 0o700);
+    } finally {
+      release();
+    }
+  });
+
   it('the owner file is 0600', () => {
     const rt = mkdtempSync(join(root, 'rt-'));
     const release = claimRuntime(rt);
@@ -151,6 +178,16 @@ describe('claimRuntime: one live proxy per runtime', () => {
       assert.equal(statSync(runtimePaths(rt).owner).mode & 0o777, 0o600);
     } finally {
       release();
+    }
+  });
+
+  it('shellQuote leaves safe paths alone and quotes the rest', () => {
+    assert.equal(shellQuote('/tmp/sbx-a1'), '/tmp/sbx-a1');
+    assert.equal(shellQuote('/tmp/my dir'), `'/tmp/my dir'`);
+    assert.equal(shellQuote(`/tmp/it's`), `'/tmp/it'\\''s'`);
+    for (const orig of ['/tmp/sbx-a1', '/tmp/my dir', `/tmp/it's`]) {
+      const q = shellQuote(orig);
+      assert.equal(execFileSync('bash', ['-c', `printf %s ${q}`], { encoding: 'utf8' }), orig);
     }
   });
 });
@@ -164,35 +201,48 @@ describe('claimRuntime: kernel lock across processes', () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  it('stampede: 8 processes claim at one instant, exactly one wins each round', async () => {
+  it('stampede: 10 processes claim, 2 of them mid-hold, no two ever hold the runtime together', async () => {
     const body = `
-      const [rt, at] = process.argv.slice(1);
-      while (Date.now() < Number(at)) {}
+      const [rt, at, lateMs] = process.argv.slice(1);
+      while (Date.now() < Number(at) + Number(lateMs)) {}
       try {
         const release = claimRuntime(rt);
-        console.log('WON');
+        console.log('WON ' + Date.now());
         await new Promise((r) => setTimeout(r, 1000));
+        console.log('REL ' + Date.now());
         release();
       } catch (e) {
         console.log('ERR ' + e.message);
       }`;
+    // 8 children start together; 2 late ones start mid-hold (winner holds 1000 ms),
+    // so a lock that frees early lets a late child win inside the winner's [t1, t2].
+    let refusedTotal = 0;
     for (let round = 0; round < 20; round++) {
       const rt = mkdtempSync(join(root, 'rt-'));
       const at = String(Date.now() + 1500);
-      const outs = await Promise.all(Array.from({ length: 8 }, () => runChild(body, [rt, at], 15000)));
-      let won = 0;
+      const lateMs = [0, 0, 0, 0, 0, 0, 0, 0, 500, 500];
+      const outs = await Promise.all(lateMs.map((late) => runChild(body, [rt, at, String(late)], 15000)));
+      const held = [];
       let refused = 0;
       const other = [];
       for (const o of outs) {
         const line = o.stdout.trim();
-        if (line === 'WON') won++;
+        const m = /^WON (\d+)\nREL (\d+)$/.exec(line);
+        if (m && Number(m[1]) <= Number(m[2])) held.push({ t1: Number(m[1]), t2: Number(m[2]) });
         else if (/^ERR runtime .* (is in use by pid \d+ \(|could not be locked: no live owner is recorded \()/.test(line)) refused++;
         else other.push(`${line} | ${o.stderr.trim()}`);
       }
       assert.deepEqual(other, [], `round ${round}: unexpected outcomes`);
-      assert.equal(won, 1, `round ${round}: winners (refused ${refused})`);
-      assert.equal(refused, 7, `round ${round}: refused`);
+      assert.ok(held.length >= 1, `round ${round}: no winner (refused ${refused})`);
+      assert.equal(held.length + refused, 10, `round ${round}: winners ${held.length} + refused ${refused}`);
+      held.sort((a, b) => a.t1 - b.t1);
+      for (let i = 1; i < held.length; i++) {
+        assert.ok(held[i].t1 >= held[i - 1].t2, `round ${round}: claims overlap ${JSON.stringify(held[i - 1])} ${JSON.stringify(held[i])}`);
+      }
+      refusedTotal += refused;
     }
+    // Per round, contention can vanish on a loaded host; across 20 rounds it cannot.
+    assert.ok(refusedTotal > 0, 'no claim was ever refused: the overlap check proved nothing');
   });
 
   it('SIGKILL frees the runtime at once, with no manual step', async () => {

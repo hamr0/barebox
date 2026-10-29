@@ -14,7 +14,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
   existsSync, mkdirSync, readdirSync, lstatSync, statSync, accessSync, constants,
   readFileSync, writeFileSync, rmSync, rmdirSync, chmodSync,
-  readlinkSync, renameSync, realpathSync,
+  readlinkSync, renameSync, realpathSync, openSync, readSync, closeSync,
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -110,6 +110,58 @@ function fpOf(e) {
 }
 
 /**
+ * Wrap a filesystem error from hashing: keep the message naming the path,
+ * and carry the original over (`cause`, plus its `code` when it has one)
+ * so callers like `isPermErr` still see it.
+ *
+ * @param {string} abs absolute path being hashed
+ * @param {unknown} e the original error
+ * @returns {never} always throws
+ */
+function hashError(abs, e) {
+  const err = new Error(
+    `hash failed for ${abs}: ${e instanceof Error ? e.message : String(e)}`,
+    { cause: e });
+  if (typeof /** @type {{ code?: unknown }} */ (e)?.code === 'string') {
+    /** @type {{ code?: string }} */ (err).code = /** @type {{ code: string }} */ (e).code;
+  }
+  throw err;
+}
+
+/**
+ * Hash a file in 1 MiB chunks, never whole: a multi-GiB file must not
+ * exhaust memory at setup. Errors name the path.
+ *
+ * @param {string} abs absolute path to hash
+ * @returns {string} sha256 hex
+ */
+export function hashFile(abs) {
+  const hash = createHash('sha256');
+  let fd;
+  try {
+    fd = openSync(abs, 'r');
+  } catch (e) {
+    throw hashError(abs, e);
+  }
+  const buf = Buffer.alloc(1024 * 1024);
+  try {
+    for (;;) {
+      let n;
+      try {
+        n = readSync(fd, buf, 0, buf.length, null);
+      } catch (e) {
+        throw hashError(abs, e);
+      }
+      if (n === 0) break;
+      hash.update(buf.subarray(0, n));
+    }
+  } finally {
+    try { closeSync(fd); } catch {}
+  }
+  return hash.digest('hex');
+}
+
+/**
  * Build one manifest entry: the single definition of the fingerprint
  * (type + content + mode), shared by the walker and by live re-checks.
  *
@@ -124,7 +176,7 @@ function entryOf(abs, st, full = true) {
     return full
       ? {
         type, mode: st.mode & 0o7777,
-        hash: createHash('sha256').update(readFileSync(abs)).digest('hex'),
+        hash: hashFile(abs),
       }
       : { type, mode: st.mode & 0o7777 };
   }

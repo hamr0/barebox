@@ -90,6 +90,18 @@ export function runtimeTempDir(scratch, prefix) {
   return fs.mkdtempSync(path.join(scratch, `${prefix}-`));
 }
 
+/**
+ * Make a runtime dir owner-only whatever the umask: `mode` is masked by
+ * the umask and doesn't apply to an existing dir, hence the `chmod`.
+ *
+ * @param {string} dir dir to create or fix up
+ * @returns {void}
+ */
+export function ensurePrivateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(dir, 0o700);
+}
+
 /** @param {string} owner owner file path @returns {unknown} the pid it names, or 'unknown' when missing, empty or garbage */
 function pidOf(owner) {
   try {
@@ -170,7 +182,7 @@ export function runtimeLive(runtime) {
  * @returns {() => void} `release()`: unlinks the owner file only when it holds our pid, then closes the lock; idempotent per claim
  */
 export function claimRuntime(runtime) {
-  fs.mkdirSync(runtime, { recursive: true });
+  ensurePrivateDir(runtime);
   const real = fs.realpathSync(runtime);
   const owner = runtimePaths(real).owner;
   const name = lockName(runtime);
@@ -218,6 +230,18 @@ export function safe(s) {
   return stripVTControlCharacters(String(s ?? ''))
     .replace(/[\x00-\x1f\x7f]/g, '')
     .replace(/[\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
+}
+
+/**
+ * Quote a path for pasting into a shell: safe spellings come back
+ * unchanged, anything else is single-quoted with `'` escaped.
+ *
+ * @param {string} s path to quote
+ * @returns {string} shell-safe spelling
+ */
+export function shellQuote(s) {
+  if (/^[A-Za-z0-9_\/.,:@%+=-]+$/.test(s)) return s;
+  return `'` + s.replace(/'/g, `'\\''`) + `'`;
 }
 
 /**

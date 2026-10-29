@@ -5,7 +5,7 @@
 // proxy.test.mjs.
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile as execFileCb, execFileSync, spawn } from 'node:child_process';
+import { execFile as execFileCb, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdtempSync, mkdirSync, writeFileSync, renameSync, existsSync, rmSync, readFileSync, readdirSync, lstatSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,6 +17,7 @@ import { claimRuntime } from '../src/runtime.js';
 import { writeFileAtomic } from '../src/holds.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
+import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
 
 // test/setup-env.mjs (via --import) already dropped the sandbox's egress proxy
 // vars before `node:http` snapshotted them; repeat here so curl children
@@ -316,11 +317,6 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
   let CAN_RUN = false;
   let SKIP_WHY = '';
 
-  function hasBin(n) {
-    try { execFileSync('which', [n], { stdio: 'ignore' }); return true; }
-    catch { return false; }
-  }
-
   before(async () => {
     const p = join(tmpdir(), `bb-crprobe-${process.pid}.sock`);
     const unixOk = await new Promise((resolve) => {
@@ -328,7 +324,7 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
       s.on('error', () => resolve(false));
       s.listen(p, () => s.close(() => { try { rmSync(p); } catch {} resolve(true); }));
     });
-    if (!existsSync('/usr/bin/bwrap')) SKIP_WHY = 'needs bwrap';
+    if (!bwrapUsable()) SKIP_WHY = 'needs bwrap';
     else if (!unixOk) SKIP_WHY = 'unix socket bind blocked here';
     else if (!hasBin('socat') || !hasBin('curl')) SKIP_WHY = 'needs socat and curl';
     else CAN_RUN = true;
