@@ -1,7 +1,7 @@
 // Holds unit tests: decision normalization and the event channel, with no
 // proxy, sandbox, or sockets involved. The file channel works on a temp
 // runtime dir; the `onAsk` channel needs no runtime at all.
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, renameSync, rmSync, readdirSync, statSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -311,10 +311,13 @@ describe('one held request per agent', () => {
 
   const noop = () => {};
 
-  it('first is now, second queues, decision hands over', async () => {
+  it('first is now, second queues, decision hands over', () => {
     // Under one-timer-per-reservation the promoted waiter keeps its own
     // timer, so a handover the caller ignores would expire: like the real
     // proxy, add B on ready.
+    // The clock is mocked because A's hold timer and B's reservation timer
+    // share a deadline: after a loop stall they tie and B can expire first.
+    mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const { denied, q } = mkQ({ timeoutMs: 200 });
     try {
       const rA = q.reserve('a', { onReady: noop, onExpire: noop });
@@ -328,12 +331,16 @@ describe('one held request per agent', () => {
         onExpire: (reason) => expired.push(reason),
       });
       assert.equal(rB.state, 'queued');
-      await waitFor(() => ready === 1, 'handover to B');
-      await waitFor(() => denied.length === 2, 'both settle on their own clocks');
-      assert.equal(ready, 1, 'onReady exactly once');
+      mock.timers.tick(200);
+      assert.equal(ready, 1, 'handover to B');
       assert.deepEqual(expired, [], 'add cleared the reservation timer');
+      mock.timers.tick(1);
+      assert.deepEqual(denied.map(([, r]) => r), ['hold timeout', 'hold timeout'],
+        'both settle on their own clocks');
+      assert.equal(ready, 1, 'onReady exactly once');
     } finally {
       q.close();
+      mock.timers.reset();
     }
   });
 
