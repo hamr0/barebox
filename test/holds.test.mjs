@@ -463,16 +463,22 @@ describe('one held request per agent', () => {
     }
   });
 
-  it('add with a finished slot parks nothing', async () => {
+  it('add with a finished slot parks nothing', (t) => {
+    // Mocked clock: a real 300 ms sleep outlives A's 500 ms deadline after a
+    // loop stall, and B then reserves as the holder instead of queueing.
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
     const { logs, q } = mkQ({ timeoutMs: 500 });
     try {
       const expiredA = [];
       const rA = q.reserve('a', { onReady: noop, onExpire: (reason) => expiredA.push(reason) });
       assert.equal(rA.state, 'now');
-      await new Promise((r) => setTimeout(r, 300));
+      t.mock.timers.tick(300);
       const rB = q.reserve('a', { onReady: noop, onExpire: noop });
       assert.equal(rB.state, 'queued');
-      await waitFor(() => expiredA.length === 1, 'A expires');
+      t.mock.timers.tick(199);
+      assert.equal(expiredA.length, 0, 'A not expired 1 ms before its deadline');
+      t.mock.timers.tick(1);
+      assert.equal(expiredA.length, 1, 'A expires');
       assert.equal(q.add(entry('a', rA, rA.arrivedAt)), null);
       assert.deepEqual(q.pending(), [], 'nothing parked');
       assert.ok(!logs.some((l) => l.ev === 'hold'), 'no hold log line');
