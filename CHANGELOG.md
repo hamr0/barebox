@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- One config file, `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, read by the CLI only (`sbx run`). Keys: `mode`, `holdTimeoutSec` (a positive integer or `"never"`), `heldBodyMaxMB` (a positive integer). A flag beats the file, the file beats the default. An unknown key, a bad value or bad JSON makes `sbx run` exit 2, naming the file and the key.
+- The card floor now looks inside bodies: an allowed request whose body is 64 KB or less and holds a card number (13-19 digits, optional single space or dash between digits, first digit 2-6, Luhn-valid) parks as an ask with rule `card number in body (floor)` in every mode, `trust` included. Nothing is denied because of a card. Bodies over 64 KB stream through unchecked for cards (known gap). Each agent has one 64 KB working slot, so allowed body-carrying requests read their body one at a time per agent.
+- Held bodies are spooled to `<runtime>/held/<id>` (a 0600 file in an owner-only dir), never kept in memory, and deleted whenever the hold ends. `runtimePaths` gains `heldDir` and `heldFile(id)`; `run()` gains the `heldBodyMaxBytes` option.
+- The `sbx` CLI starts Node with `--max-semi-space-size=1` (caps the V8 young generation to hold proxy memory down; latency unchanged).
+- `holds.js` exports `ASK_BODY_LIMIT`, `DEFAULT_HOLD_MAX_BODY` and `bodyPreview`.
+
+### Changed
+
+- `hold.maxBody` now defaults to 52428800 (50 MB), was 1048576. A body over the cap is denied `403 body too large to hold`.
+- Audit-log `req` lines no longer carry `body` / `truncated`; they carry `bodyPreview` (the first 4 KB, card numbers masked except the last 4), `bodyBytes` and `bodySha256`.
+- The ask payload's `bodyPreview` is masked the same way (one function).
+- `holds.add` takes `preview`, `bodyBytes` and `bodyFile` in place of `body` (internal shape).
+
+### Removed
+
+- **Breaking:** the `createProxy` option `maxLogBody`.
+
+### Security
+
+- Card numbers no longer land verbatim in the audit log or the ask files. Known gap: other secrets inside a body still show in the 4 KB preview until bareguard redaction lands.
+- The config file is hidden inside the sandbox wherever it resolves (the mask follows `XDG_CONFIG_HOME`).
+
 ## [0.4.0] - 2026-10-29
 
 ### Changed

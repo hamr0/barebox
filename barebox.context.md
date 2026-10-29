@@ -69,7 +69,7 @@ time spent in line and reading the body counts too, and a request past its
 deadline is denied `hold timeout` whether waiting, sending, or parked. Each
 agent holds at most one request being read or parked; later ones wait in
 line, unread, in order — at most 16, the next gets `429 hold queue full`.
-Approve forwards, deny and timeout answer 403 with the reason. These commands
+Approve forwards, deny and timeout answer 403 with the reason. A held body is spooled to `<runtime>/held/<id>` (never kept in memory, deleted when the hold ends); one over `hold.maxBody` (default 50 MB) is denied `403 body too large to hold`. These commands
 need the proxy to be alive: with no live proxy on the runtime `sbx pending`,
 `approve` and `deny` exit 1 and say so, because nothing would read the answer.
 
@@ -79,7 +79,12 @@ need the proxy to be alive: with no live proxy on the runtime `sbx pending`,
 the exit code with the ask and audit trail. Modes: `ask`, `auto` (default),
 `trust`. Payment destinations (`/checkout`, `/payment`, `/orders`,
 `/purchase`) hold in every mode; `ask` and `auto` also hold every
-non-GET/HEAD request (an interim rule until the policy module lands).
+non-GET/HEAD request (an interim rule until the policy module lands). The
+card floor also looks inside bodies: an allowed request whose body is 64 KB
+or less and holds a card number (13-19 digits, optional single space or dash,
+first digit 2-6, Luhn-valid) parks as an ask with rule `card number in body
+(floor)` in every mode, `trust` included; nothing is denied because of a card.
+`run()` takes `heldBodyMaxBytes` to change the held-body cap.
 
 ```js no-run
 import { run } from "barebox";
@@ -101,6 +106,13 @@ runtime (a short temp dir otherwise, printed on stderr). It prints an `ask`
 line when a request parks and a `decided` line when it ends, then `done`;
 with `--json` stdout carries only JSON lines. Its exit code mirrors the
 agent's.
+
+`sbx run` reads one optional config file,
+`${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, with keys `mode`,
+`holdTimeoutSec` (positive integer or `"never"`) and `heldBodyMaxMB`
+(positive integer). A flag beats the file, the file beats the default; an
+unknown key, bad value or bad JSON exits 2 naming the file and key. The file
+is hidden inside the sandbox wherever it resolves. The library does not read it.
 
 ## Undo layer
 
@@ -134,7 +146,7 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
 - Certificates live in `<runtime>/certs` (`runtime` is required). There is no `certDir` option and no control socket: decisions flow through `<runtime>/asks` + `<runtime>/answers` or `hold.onAsk`. Each minted certificate gets a random 128-bit serial (no shared `ca.srl`), and at most 4 mints run at once.
 - The TCP door is one agent: every connection through `createProxy`'s TCP `port` counts as the agent `tcp` and shares one hold line. Use `addAgent` sockets (`sbx run` does) for separate lines per agent. `removeAgent(name)` ends that agent's open connections; its held requests end as deny / client gone. `run()` calls it when the sandbox exits, so a request still held then ends as client gone, not `proxy closing`.
 - The upstream wall answers `403` for loopback, link-local (incl. `169.254.169.254`), the host's own addresses, private LAN ranges and unresolvable names. An IPv4 embedded in IPv6 is checked in every spelling: mapped, compat, uncompressed, NAT64 `64:ff9b::/96` (local-use `/48` denied outright) and 6to4 `2002::/16`; NAT64 and 6to4 of public sites stay reachable. Every DNS answer is checked and the dial is pinned to the checked IP; test-only options live under `unsafeTestOnly` (`allowLoopback`, `resolveUpstream`) and production never sets them.
-- `createProxy` throws synchronously on an unopenable `logFile` (a directory, a missing parent, no permission) and releases the runtime. The runtime root, `asks/`, `answers/` and `socks/` are owner-only (`0700`) whatever the umask. An existing runtime dir you own is tightened to `0700`; one you don't own (such as `/tmp`) is refused with an error naming the dir and its owner and suggesting a subdir like `/tmp/sbx`. The audit log (`logFile`) is set to `0600` every time a proxy starts. The values of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token` and `Api-Key` are logged as `[redacted]`; other headers and bodies are logged as-is unless your `redact` hook shapes them (it runs after the built-in scrub).
+- `createProxy` throws synchronously on an unopenable `logFile` (a directory, a missing parent, no permission) and releases the runtime. The runtime root, `asks/`, `answers/`, `held/` and `socks/` are owner-only (`0700`) whatever the umask. An existing runtime dir you own is tightened to `0700`; one you don't own (such as `/tmp`) is refused with an error naming the dir and its owner and suggesting a subdir like `/tmp/sbx`. The audit log (`logFile`) is set to `0600` every time a proxy starts. The values of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token` and `Api-Key` are logged as `[redacted]`; other headers are logged as-is unless your `redact` hook shapes them (it runs after the built-in scrub). Request bodies are not logged whole: each `req` line carries `bodyPreview` (the first 4 KB, card numbers masked except the last 4), `bodyBytes` and `bodySha256`, and the ask payload's `bodyPreview` is masked the same way. Other secrets inside a body still show in the preview until bareguard redaction lands.
 - One proxy per runtime: `createProxy` throws "in use by pid N" (`run()` rejects, `sbx run` exits 1) while a live proxy owns the runtime. The claim is held by the proxy process and the kernel frees it when the process dies, so a crashed proxy never blocks the runtime. Use another `SBX_RUNTIME`, or leave it unset for a fresh one.
 - `launch()` starts the agent in the project dir, in a new session (no controlling terminal). Locked drawers are 21 credential stores (see `LOCKED_PATHS` in `src/launcher.js`); the agent's own model credentials in `~/.claude` stay readable until keys move out of its reach.
 - `sbx` exits 0 ok, 1 unknown id / refused / no live proxy / run failure, 2 usage; `sbx run` mirrors the agent's exit code.
@@ -144,6 +156,7 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
 
 Enforcement policy (which requests hold) arrives in a later module; until
 then holds follow the interim rules above (a path rule for `createProxy`;
-payment destinations plus non-GET/HEAD for `run()`). The hold decision never
-sees the request body, so card numbers in a body are not caught yet. No Docker, no MCP server, no macOS/Windows —
+payment destinations plus non-GET/HEAD for `run()`). The card-in-body floor
+checks bodies of 64 KB or less; larger bodies stream through unchecked for
+cards. No Docker, no MCP server, no macOS/Windows —
 Linux only. POC harnesses live in `poc/` in the repo and never ship.

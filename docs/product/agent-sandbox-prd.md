@@ -1,8 +1,8 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Name: barebox (CLI `sbx`).
-> Status: M0–M2 PASS; graduation rewrite shipped as **barebox 0.2.0** on npm (Oct 27, provenance-signed). M2.5 integration seam and M4 undo layer are built (unreleased; see CHANGELOG [Unreleased]). Next: M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
-> Build window: Meta Global AI Developer Hackathon, Oct 26 – Nov 4 2026 (10 days). Built to be the seed of a real product, not a throwaway.
+> Status: M0–M2 PASS. **barebox 0.4.0 is on npm** (provenance-signed); M2.5 (ask seam), M4 (undo layer) and the hardening branch are released. M3 is being scoped (design decided Oct 29, memory POC rounds 1 and 2 done). Next: M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
+> Build window: Meta Global AI Developer Hackathon, Oct 26 2026 until the cutoff on **Nov 5 2026, 01:00 Amsterdam time (CET, GMT+1)**. Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
 
@@ -38,7 +38,7 @@ Solo devs and small teams. They want maximum control and freedom at zero cost.
 
 ### Why now
 
-The hackathon gives a fixed 10-day window and a demo audience. The memory measurements already show a clear gap against the current prior art, so the idea can be tested quickly.
+The hackathon gives a fixed window (cutoff Nov 5, 01:00 Amsterdam time) and a demo audience. The memory measurements already show a clear gap against the current prior art, so the idea can be tested quickly.
 
 ### What it is and isn't
 
@@ -78,19 +78,19 @@ The agent works in your house:
    ONE shared proxy (Node, in-process: rwxmap + bareguard)
         |-- r        -> forward
         |-- x        -> hold, ask the human, forward or 403
-        '-- unknown  -> per-mode default
+        '-- no label -> http.<METHOD>; the rwx file gives its letter
 ```
 
 ### The doorman's deterministic x-rules (strongest first)
 
 The proxy sees requests, not intent, and sites use `POST` for both searching and paying. So `GET = r, POST = x` is too crude. The rules, strongest first:
 
-1. **Card data in the body: always x.** Any 13–19 digit number that passes the Luhn check, or a CVV/expiry field.
-2. **Payment destinations: always x.** Known payment domains and paths such as `/checkout`, `/payment`, `/orders`, `/purchase`.
+1. **Card data in the body: the floor.** Any 13–19 digit number that passes the Luhn check, or a CVV/expiry field. It sets a mark on the request (`cardLike`) that asks in every mode, `trust` included. Nothing is denied because of a card: a body up to 64 KB with a card becomes a floor ask. Card numbers in bodies over 64 KB are not checked (known gap, section 10).
+2. **Payment destinations: the floor.** Known payment domains and paths such as `/checkout`, `/payment`, `/orders`, `/purchase`. It sets a mark on the request (payment path) that asks in every mode.
 3. **Known APIs: rwxmap labels.** For example, search = r, create order = x.
-4. **Everything else:** `GET`/`HEAD` = r. Any other method without a label = **x** (bareguard's rule: "unsure? tag it x").
+4. **Everything else:** `GET`/`HEAD` = r. Any other method without a label = **x** (bareguard's rule: "unsure? tag it x"). The request goes to the gate as `http.<METHOD>`.
 
-Rules 1–2 are the **floor**: they hold in every mode, including `trust`. The idea note's "personal data leaving" rule is out of scope.
+Rules 3–4 give the letter. Rules 1–2 are the **floor**: they hold in every mode, including `trust`. The idea note's "personal data leaving" rule is out of scope.
 
 ### Modes (decided Oct 27)
 
@@ -161,6 +161,14 @@ Published to npm from `main` at `d6c67f5` (tag `v0.2.0`), with SLSA provenance. 
 ## 4. Evidence so far
 
 Measured on the dev machine: Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22, ext4 home. These came from throwaway POCs. They are evidence, not the product.
+
+### M3 memory POC, round 1 (Oct 29)
+
+Proxy RSS with bareguard 0.28.0 and rwxmap's match code loaded, measured in one process: 78.0 MB baseline, 90.9 MB after 360 gate checks and 360 matches, up to 112.9 MB with 360 held 64 KB bodies. Walls unchanged (mean 7.8 MB). Round 1 had two flaws (client side included, deltas maybe V8 high-water). Table and reading: `docs/logs/findings.md`, "M3 — memory with bareguard".
+
+### M3 memory POC, round 2 (Oct 29)
+
+The proxy ran in its own child process, with GC forced before each reading. With the real gate and matcher loaded, it measured 76.4 MB (3600 checks and 3600 matches) with `--max-semi-space-size=1`, and 77.3 MB with 20 held 64 KB bodies. Default Node ended at 90.5 MB before bodies. The per-call growth is one-time V8 young-generation high-water, not retained state. Under 80 MB, measured. Table and reading: `docs/logs/findings.md`, "M3 — memory, round 2".
 
 ### Baseline
 
@@ -308,6 +316,15 @@ For the whole build. Core foundations first, all else is out of scope.
 - No personal-data-leaving rule (passport, date of birth, address).
 - No browser agents or on-screen action classifier (Jev) in v1.
 
+Also out of scope until Nov 5:
+
+- Bareguard-shape audit lines, unless `gate.record` and `gate.annotate` cover them as they are.
+- A run on a VPS (optional).
+- A secret scrubber for bodies in the ask preview and the log. Card numbers are masked; API keys and passwords are not, until bareguard's redaction covers them in M3.
+- "Don't ask again for this run" (decided Oct 29, no for v1).
+- Adopting bareguard's `isPrivateIp` (F4).
+- Checking compressed (gzip) bodies for card numbers.
+
 ## 7. Modules
 
 Order is dependency order. Each module is a POC aimed at its riskiest assumption. A module is done when it works alone and still works connected to everything built before it. Do not start N+1 while N is unproven.
@@ -377,7 +394,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
    - A stale or late answer is ignored and logged, as in fwdloop.
    - `sbx run` prints an `ask <id> <agent> <method> <url> rule=<rule>` line to stdout (`{"ev":"ask",...}` with `--json`), so a human watching a terminal knows. The library prints nothing: a caller of `run()` or `createProxy` gets `asks/<id>.json` and the `onEvent` callback.
    - The control socket and its server are deleted.
-3. **A decision-ready ask payload**: `id`, `agent`, `method`, `url`, `rule` (`payment`, `card-in-body`, `x:unlabelled-POST`), `letter`, a body preview (redaction lands in M3, see item 6), `waitingSec`, `expiresAt`. barebox knows the request, not the intent; the caller adds its own context (step, goal).
+3. **A decision-ready ask payload**: `id`, `agent`, `method`, `url`, `rule` (`payment`, `card-in-body`, `x:unlabelled-POST`), `letter`, a 4 KB body preview with card numbers masked except the last 4 digits (M3), `waitingSec`, `expiresAt`. barebox knows the request, not the intent; the caller adds its own context (step, goal).
 4. **`run({ proj, command, mode, onAsk })`** → `{ exit, asks, audit, diff, runtime }` (`diff` is the M4 overlay diff; `gate` is not an option today, the foundations rework removed it). It wraps `createProxy`, `addAgent` and `launch`, which stay public as the low-level parts.
 5. **`sbx run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd>`**. With `--json`, stdout carries JSON lines (`{"ev":"ask",...}`, `{"ev":"decided",...}` as each ask ends, `{"ev":"done","exit":N}`), and the exit code mirrors the agent's.
 6. **Audit lines in bareguard's shape** (see Decisions, "Audit"), so M3 shares the file without a migration. STATUS (Oct 27): the bareguard line shape is DEFERRED to M3 — the current log is barebox's own JSONL. Body-preview redaction is NOT DONE either: the preview is verbatim up to `ASK_BODY_LIMIT` (see `holds.js`), redaction waits for M3's bareguard `secrets`.
@@ -395,37 +412,89 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | | |
 |---|---|
 | Goal | Every request gets a letter and a decision through a gate; the mode decides what each letter does; every decision is in the one audit log. |
-| We use | bareguard (dependency: `Gate`, rwx, `isPrivateIp`, `secrets` redaction, audit). rwxmap output as bareguard rwx config. |
+| We use | bareguard (dependency: `Gate`, rwx, flags, audit; 0.29.0 for `rwx.askUnheld`). rwxmap's `rwxmap/match` entry (0.8.0) for request keys. |
 | We build | See the list below. |
-| Riskiest assumption | **Proxy memory with bareguard loaded stays ≤ 80 MB.** The bench measures 77.9 MB with 20 agents × (1 parked + 16 waiting), so the headroom is about 2 MB (the global held-body cap is deferred to M3). Second: the "x asks" behaviour (see Suite friction). |
+| Riskiest assumption | **Proxy memory with bareguard loaded stays ≤ 80 MB.** Round 1 of the memory POC (Oct 29, `docs/logs/findings.md`) put bareguard alone over 80 MB, with two flaws in the measurement. Round 2 (proxy in its own process) measured about 76.4 MB before bodies with `--max-semi-space-size=1` and 77.3 MB with 20 held bodies. Under 80 MB, measured. Second: the body check (see below). |
 | Done when | See the list below. |
 | Estimate | 1–1.5 days. |
 
+**Design (decided Oct 29):**
+
+*Letters vs modes.* The letter is per request. The mode is per run.
+
+- **r**: read, no outside effect (GET/HEAD).
+- **w**: reversible write, only where an rwxmap label says so.
+- **x**: irreversible. Any non-GET request with no label is x.
+- The mode picks which letters pass without asking. `ask`: r free, w and x ask. `auto` (default): r and w free, x asks. `trust`: r, w and x free.
+- The floor (card numbers, payment paths) asks in every mode, `trust` included.
+
+*Modes as bareguard config.* bareguard gains an optional `rwx.askUnheld` (array of letters, default `[]`, behaviour unchanged). A matched letter the agent does not hold that is in `askUnheld` goes to `askHuman` with rule `rwx.ask`. A letter not in `askUnheld` is still `rwx.denied`. An unlisted tool is `rwx.unlisted`. Children can only narrow it.
+
+| Mode | rwx letters | askUnheld |
+|---|---|---|
+| `ask` | `r--` | `["w","x"]` |
+| `auto` | `rw-` | `["x"]` |
+| `trust` | `rwx` | `[]` |
+
+*Memory (decided Oct 29).* The `sbx` proxy runs with `--max-semi-space-size=1`, set in the CLI's first line (`#!/usr/bin/env -S node --max-semi-space-size=1`). It caps the V8 young generation at 1 MB. Library embedders set their own Node flags, and the docs recommend this one. Latency with and without the flag was measured Oct 29 (`scripts/latency.mjs`, 2000 requests, 3 runs): p50 the same (about 0.8–1.0 ms); p95/p99 up to about 0.5 ms slower in 2 of 3 runs, the same in the third. See `docs/logs/findings.md`, "M3 — part A results".
+
+*The queue.* Only requests that need the human's answer enter an agent's line. Allowed requests flow even while asks wait. Per agent: 1 held, up to 16 waiting unread (the bytes stay in the kernel socket buffer, not in proxy memory), and the next is refused at once with 429. Each has a 120 s deadline from arrival. On timeout it is denied with 403 "timed out", and a late answer is ignored. barebox never retries. Whether to try again is the agent's choice, and a retry is a new request with a new ask id.
+
+*Gate facts (learned Oct 29).* `check()` returns allow or deny, never `askHuman`. After a human allow the rule is `humanChannel.allow`; after a deny the original rule stays. A null tool falls back to type `net` and is `rwx.unlisted`, so barebox always sends a tool. The audit config key is `audit.path`.
+
+*Letters come only from config.* The gate never takes a letter from the caller. barebox sends `tool` = the rwxmap key for a labelled request, and `http.<METHOD>` (for example `http.GET`) for an unlabelled one. The committed rwx file, generated by barebox per mode, gives each its letter. Unlisted means deny. Rejected: granting rwx and passing the letter as a flag, because a mislabelled x would pass silently.
+
+*Request keys.* rwxmap gains a light entry `rwxmap/match`: `matcherFrom([sidecar, ...]) → match(method, url) → { key, letter, marker, source: 'spec'|'request', tie }`. It never returns null. With no match it returns a request-only key in a stable documented format: `<host>.<METHOD> <path with ids as {id}>`, for example `api.anthropic.com.POST /v1/messages`. The per-vendor sidecar gains a top-level `servers` list (sidecars are regenerated with rwxmap 0.8.0). The letter rwxmap returns is informational; bareguard's file is authoritative. rwx measured the import at about +0.9 MB. The `rwxmap/discover` entry costs +14 MB and is out.
+
+*Model endpoints.* barebox labels them r by policy, not rwxmap. rwxmap labels them x: for example `/v1/responses` with store can persist state, so r is a policy choice. barebox ships a small default list keyed by rwxmap request keys, user-extendable, written into the rwx file it generates: Anthropic `/v1/messages`; OpenAI-compatible `/v1/chat/completions` and `/v1/responses`; Ollama `/api/chat` and `/api/generate`; llama.cpp `/completion` and `/v1/chat/completions`.
+
+*Audit.* No new primitive. Response status goes through `gate.record(action, {status,...}, {aid})`. barebox's own facts (request, wall denial) go through `gate.annotate({ surface:false, ... })`, into the same audit file.
+
+*The floor as marks.* No new bareguard primitive. barebox runs its own regex and Luhn on the body and sets `cardLike: true` on the action. Config: `flags: { cardLike: { true: "ask" } }`. Flags run before the allowlist and rwx, so they ask in every mode. A flag can only add an ask or a deny, never grant. That is why a caller-set flag is safe and a caller-set letter is not. Payment paths (`/checkout`, `/payment`, `/orders`, `/purchase`, today a list in `src/run.js`) move to the same mark mechanism. The body never goes into the gate action. The audit log carries only the masked 4 KB preview, the body length and a hash (see "The body check").
+
+*The body check (final, decided Oct 29, later the same day).*
+
+- Bodies up to 64 KB are read whole into the agent's working slot (one per agent, 64 KB, in memory), checked for card numbers, then decided. A card number turns the request into a floor ask (asks in every mode, `trust` included). Nothing is ever denied because of a card.
+- Bodies over 64 KB stream through unchecked for card numbers. They still get the normal letter and mode decision from URL and headers. Why: random 16-digit numbers starting 2–6 pass Luhn about 1 time in 10, so checking and denying large uploads would break uploads full of ids.
+- Bodies are read only when the URL and headers alone would allow the request. If they already mean ask, the body stays unread, as today.
+- The scanner (`src/cardscan.js`, built and tested Oct 29): 13–19 digits, optional single space or dash separators, touching no other digit, first digit 2–6 (excludes millisecond timestamps), then Luhn. It keeps a 40-byte tail between chunks and finds a card followed by a CVV. Card detection gets no more rounds: further wrinkles go to the fix ledger.
+- Held bodies (any request waiting for the human, card asks and x asks) are written to a file in the owner-only runtime folder, never kept in memory. Cap 50 MB (config key `heldBodyMaxMB`, in the one config file). Over the cap: 403 "body too large to hold". The file is deleted once the ask is decided or abandoned. Why: a held body kept in memory up to 1 MB (today) is 20 MB at 20 agents, over budget, and a 64 KB cap would make `git push` impossible to approve.
+- A card ask waits in the agent's line like any other ask (1 held, up to 16 waiting).
+- Memory: one 64 KB working slot per agent, 20 agents = 1.25 MB. Measured at 77.3 MB total with the semi-space flag (round 2, stage 4a). The per-agent worst case is about 0.34 MB, so the estimate is about 28 agents under 80 MB (to be measured at 10/20/30/40 agents).
+- The audit log no longer stores whole bodies (today up to 1 MB verbatim, kept in memory per request while it streams). Each request line carries a 4 KB body preview with card numbers masked except the last 4 digits, plus the full body length and a SHA-256 hash. The ask file uses the same 4 KB masked preview (one function makes both).
+- Known gap: API keys or passwords inside a body still appear in the preview. bareguard's redaction covers common token shapes once the log moves to bareguard's format in M3. barebox does not build its own secret scrubber.
+- Known gap: compressed (gzip) bodies are not checked.
+
 **We build:**
-1. **The action barebox hands the gate**: `{ type: "net", tool: <rwxmap key or null>, url, method, agent, letter }`.
-2. **The letter rules from section 2**: Luhn card numbers, CVV/expiry, payment domains and paths, rwxmap labels, then the GET/HEAD = r, other methods = x default.
-3. **`ask` / `auto` / `trust` as bareguard presets**, with the floor in every mode.
-4. **The `gate` option**: none means a preset; otherwise a passed bareguard `Gate` or any object with the same `check(action)` contract. Matched by shape.
-5. **Reuse instead of barebox's own copies**:
-   - barebox's `denyReasonForIp` already covers every embedded form: mapped (`::ffff:7f00:1`, `::ffff:127.0.0.1`), compat, uncompressed `0:0:0:0:0:0:0:1`, NAT64 `64:ff9b::/96` and 6to4 `2002::/16`, with public sites behind NAT64/6to4 still reachable. Adopt bareguard's `isPrivateIp` only once it covers NAT64, 6to4 and the uncompressed `::1` and is exported — see `docs/logs/bareguard-isprivateip-spike.md`.
+1. **The action barebox hands the gate**: `{ type: "net", tool: <rwxmap request key, or http.<METHOD>>, url, method, agent, cardLike?, paymentPath? }`. No letter.
+2. **The rwx file generator**: per mode, from rwxmap labels plus the default model-endpoint list.
+3. **`ask` / `auto` / `trust` as bareguard config** (rwx letters + `askUnheld` + the flags for the floor).
+4. **The body checker**, the 64 KB working slot per agent, held bodies in files, and the masked 4 KB preview (see "The body check").
+4a. **The config file**: `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, read by the CLI only. Keys today `mode`, `holdTimeoutSec`, and (coming) `heldBodyMaxMB`; later modules add keys to the same file, no second user config file. A flag beats the file, the file beats the default. An unknown key, bad value or bad JSON makes `sbx run` exit 2 naming the file and key. It is hidden inside the sandbox (it reads empty); the mask must follow the resolved path, so a custom `XDG_CONFIG_HOME` under `$HOME` is hidden too (fixed in the body brief). Built Oct 29 (part A).
+5. **The `gate` option**: none means a preset; otherwise a passed bareguard `Gate` or any object with the same `check(action)` contract. Matched by shape.
+6. **Audit** through `gate.record` and `gate.annotate`.
+7. **Reuse instead of barebox's own copies**:
+   - barebox's `denyReasonForIp` already covers every embedded form: mapped (`::ffff:7f00:1`, `::ffff:127.0.0.1`), compat, uncompressed `0:0:0:0:0:0:0:1`, NAT64 `64:ff9b::/96` and 6to4 `2002::/16`, with public sites behind NAT64/6to4 still reachable. It stays. Adopting bareguard's `isPrivateIp` (F4) is not in this release.
    - bareguard's redaction replaces barebox's `SENSITIVE_HEADERS` scrub.
+8. **The Node flag**: the CLI's first line sets `--max-semi-space-size=1`, plus a latency comparison with and without it.
 
 **Done when:**
 - A scripted request set gets the expected decision in each of the three modes, for each rule, including a case that should not match.
-- The floor asks in `trust`.
+- The floor asks in `trust`, for a small body and for a body split across chunks. A body up to 64 KB with a card becomes an ask; a large body streams through unchecked and completes. A held body is a file, deleted once the ask ends; over `heldBodyMaxMB` it gets 403.
 - A passed loop gate receives the asks (barebox's file channel stays silent).
 - A vanilla `check()` object works.
-- The audit log shows every decision in bareguard's shape.
-- The proxy RSS bench is re-run with bareguard loaded and the result recorded against ≤ 80 MB.
+- The audit log shows request, decision and response status in one file.
+- The memory bench uses the round 2 method (proxy in its own process, GC forced before each reading, the real gate and matcher loaded) and measures 10, 20, 30 and 40 agents with every working slot filled, so the agent limit is measured, not estimated. Current estimate: about 28 agents in the full worst case under 80 MB. Recorded against ≤ 80 MB.
+- The latency comparison with and without `--max-semi-space-size=1` is recorded.
 
-**Suite friction**: per the suite reuse rule, these are fixed in the owning library, never patched here.
+**Suite friction**: per the suite reuse rule, these are fixed in the owning library, never patched here. Status as of Oct 29.
 
 | # | Library | Gap | Needed by | Status |
 |---|---|---|---|---|
-| F1 | bareguard | `rwx.askOn` accepts only `"none"` or `"loose"`. `auto` needs "x asks" and `ask` needs "w and x ask"; today a letter above the ceiling is **denied**, not asked. Proposal: `askOn` takes letters, e.g. `["x"]`. | M3 | to file |
-| F2 | rwxmap | Labels are keyed `<vendor>.<operationId>`, but the proxy sees `METHOD` + URL. Needs a matcher primitive: request → key + letter (OpenAPI path templates). barebox must not write its own matcher. | M3 | to file |
-| F3 | bareguard | barebox's transport lines (request, response status, wall denial) must land in the gate's audit file in its shape. Check in the POC whether `gate.record` covers this; if not, ask for an append API. | M2.5 / M3 | verify in POC |
-| F4 | bareguard | `isPrivateIp` misses NAT64, 6to4 and the uncompressed `::1` (verified against 0.27.0; barebox's wall covers them). Adopt it once fixed and exported. | M3 | verified: misses 3 forms; see `docs/logs/bareguard-isprivateip-spike.md` |
+| F1 | bareguard | `rwx.askOn` accepts only `"none"` or `"loose"`; a letter above the ceiling is denied, not asked. | M3 | **Resolved by bareguard**, agreed with the bareguard maintainer session and approved by the user: new optional `rwx.askUnheld` (see "Modes as bareguard config"). Ships in bareguard 0.29.0 (branch `feat/rwx-ask-unheld`, target Oct 30–31; the user confirms publish). A new bareguard ruling (#70). **Accepted Oct 29:** `askUnheld` at bareguard commit `fb0bd74` passed barebox's acceptance test (`poc/m3/askunheld.mjs`, 16/16; against 0.28.0 the same script fails 8). The test drives the gate directly with the proxy's action shape, not through the proxy's HTTP path. The 0.29.0 release is pending the user's review. |
+| F2 | rwxmap | Labels are keyed `<vendor>.<operationId>`, but the proxy sees `METHOD` + URL. | M3 | **Resolved by rwxmap**, approved by the user: new entry `rwxmap/match` (see "Request keys"). Ships in rwxmap 0.8.0 (branch `feat/match-entry`, target Oct 31). rwxmap's bars: 0 differences vs `classifyCall` on its four corpora, import ≤ 1.5 MB, no slower per match, the fail-closed fallback tested by breaking it. |
+| F3 | bareguard | barebox's transport lines must land in the gate's audit file. | M3 | **Resolved, no new primitive**: `gate.record` for response status, `gate.annotate({ surface:false, ... })` for barebox's own facts. |
+| F4 | bareguard | `isPrivateIp` misses NAT64, 6to4 and the uncompressed `::1` (verified against 0.27.0; barebox's wall covers them). | — | **Not in this release.** barebox's wall already covers all three. bareguard's view: Node's `new URL()` already shortens uncompressed `::1`, so that miss only bites raw-string calls. See `docs/logs/bareguard-isprivateip-spike.md`. |
 
 ### M4. Undo layer
 
@@ -455,6 +524,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Goal | Check the memory targets at the real scale. |
 | What | 20 agents plus the shared proxy on one box, and on a 2 GB VPS if one is available. Compare with the memory targets. |
 | Note | If M0 and M1 measurements already cover this, fold it into them and record the numbers there. It is then not a separate step. |
+| Method | The M3 round 2 bench: proxy in its own process, GC forced before each reading, the real gate and matcher loaded, 10, 20, 30 and 40 agents with every working slot filled. |
 | Estimate | No separate estimate. It is part of the 9–10 day total. |
 
 ### M7. Demos, numbers, README
@@ -471,25 +541,24 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 
 About 9–10 days on Linux. This is tight for the hackathon.
 
-## 8. Day-by-day plan (Oct 26 – Nov 4)
+## 8. Day-by-day plan (Oct 26 – Nov 5, 01:00 Amsterdam time)
 
-This is a plan, not a result. It shifts as POCs return.
+This is a plan, not a result. It shifts as POCs return. Review cap per module: one self-review and one branch-review. Nits go to the fix ledger, not into more rounds.
 
 | Day | Date | Work | Gate |
 |---|---|---|---|
 | 1 | Oct 26 | M0, M1, M2 POCs (done: all three go/no-go PASS) | Go/no-go (a), (b), (c) met |
 | 2 | Oct 27 | Graduation rewrite, reviews, rewrite bench (done) | Branch review: ready |
-| 3 | Oct 28 | M2.5: ask seam, file channel, `run()`, `sbx run --json` | |
-| 4 | Oct 29 | M4: overlay, diff / commit / rollback | |
-| 5 | Oct 30 | M4 finish (deletions, conflicts). File F1/F2 upstream; settle Q7. | |
-| 6 | Oct 31 | M3: bareguard in-process, proxy RSS first, then modes + letter rules | Proxy ≤ 80 MB with bareguard |
-| 7 | Nov 1 | M3 finish. M5 (keys). | |
-| 8 | Nov 2 | M6 scale run. M7 start (demo A). | Memory targets measured |
-| 9 | Nov 3 | M7: demos A and B, numbers | |
-| 10 | Nov 4 | M7: README, final checks, submission | |
+| 3 | Oct 28 | M2.5 ask seam, M4 undo layer, hardening, release 0.4.0 (done) | 0.4.0 on npm |
+| 4 | Oct 29 | M3 scoping, memory POC (rounds 1 and 2 done) | |
+| 5–6 | Oct 30–31 | M3 build and review. bareguard 0.29.0 and rwxmap 0.8.0 land upstream. | Proxy ≤ 80 MB with bareguard |
+| 7 | Nov 1 | M5 (keys) | |
+| 8 | Nov 2 | M6 numbers. Demo B. | Memory targets measured |
+| 9 | Nov 3 | Demo A, README. Freeze in the evening. | |
+| 10 | Nov 4 | Release 0.5.0 and submission | |
+| 11 | Nov 5 | Buffer only, before 01:00 Amsterdam time | |
 
-Days 1–2 are results; days 3–10 are a plan. F1 (bareguard `askOn` letters) and F2 (rwxmap request matcher) land in their own repos and gate M3's `auto`/`ask` modes; if either slips, M3 ships `trust` + floor first.
-Nov 2 has room to spare and absorbs slips from earlier days. Nov 4 is the last day.
+Days 1–3 are results; the rest is a plan. F1 (bareguard `askUnheld`) and F2 (rwxmap `match` entry) land in their own repos and gate M3's `auto`/`ask` modes; if either slips, M3 ships `trust` + floor first.
 
 ## 9. Later (after the hackathon)
 
@@ -516,6 +585,8 @@ Not sorted into the 10 days.
 - **Writes over sockets escape the overlay.** A local Postgres or Docker daemon is not a file. See Open questions.
 - **Commit conflicts.** If the user edits the same files during a run, M4 flags the conflict. It does not merge.
 - **Held requests can time out on the server side.** Holding happens before forwarding, so only the agent's client waits.
+- **Card numbers in bodies over 64 KB are not checked.** Such bodies stream through with the normal letter and mode decision. Checking and denying them would break large uploads, because random 16-digit ids pass Luhn about 1 time in 10.
+- **API keys or passwords inside a body still appear in the 4 KB preview** (log and ask file). Card numbers are masked. bareguard's redaction covers common token shapes once the log moves to its format in M3. barebox builds no scrubber of its own.
 - **Certificate pinning breaks inspection.** Out of scope.
 - **The proxy sees traffic, not intent.** Every API needs a mapping. File edits and local stdio MCP servers never touch the network. The undo layer and locked paths cover files. An MCP server running outside the sandbox with its own credentials is a hole.
 
@@ -525,13 +596,13 @@ None of these block M0. Nothing here is silently assumed.
 
 | # | Question | Decides |
 |---|---|---|
-| 1 | What is the real proxy memory with bareguard loaded? Measured so far: TLS + on-demand certs + 20 agents × (1 parked + 16 waiting) = 77.9 MB (bench, Oct 28; 71.9 MB with 20 single holds on Oct 27). bareguard still unmeasured; about 2 MB of headroom. | The ≤ 80 MB target. Measured first in M3. |
+| 1 | What is the real proxy memory with bareguard loaded? Bench without bareguard: 77.9 MB (Oct 28, 20 agents × (1 parked + 16 waiting)). M3 POC round 1 (Oct 29, one process, forced GC): baseline 78.0 MB, 90.9 MB after 360 checks and 360 matches, 112.9 MB with 360 held bodies; it included the client side. **Round 2 (Oct 29, proxy in its own process):** about 76.4 MB before bodies with `--max-semi-space-size=1` (90.5 MB with default Node), 77.3 MB with 20 held 64 KB bodies. Measured, under 80 MB. Decided: the `sbx` proxy runs with the flag; see M3, "Memory". | Decided. The agent limit is measured in M3's bench. |
 | 2 | ~~`node-forge` or shelling out to `openssl` for certificates?~~ Decided Oct 26: `openssl` subprocess (sandbox keeps proxy RSS clean; platform coupling accepted, see M1). | — |
 | 3 | How should the undo layer handle large untracked dirs (`node_modules`) and build output? | M4 design. |
 | 4 | Localhost sockets (Postgres, Docker daemon) are writes the overlay can't see. Decided Oct 26 for M0: block. | M3 revisits only if a demo needs a local DB. |
 | 5 | Server-side timeouts while a request is held. How long can a hold last in practice? | The approval timeout value in M2. The idea note's sketch used 120 s; that is not tested. |
 | 6 | ~~Working name.~~ Decided: **barebox** (npm + repo); CLI stays `sbx`. | — |
-| 7 | **The agent's own model calls.** An agent POSTs to its LLM API (`/v1/messages`, `/v1/chat/completions`) every turn. With "other methods = x", `auto` would ask on every turn. Recommendation: ship a small default rwx label set marking known inference endpoints (Anthropic, OpenAI-compatible, Baseten, local) as `r` (no outside side effect beyond cost), extendable by the user. Cost limits belong to bareguard's `budget`, not to an ask. | M3 rule set; must be settled before M3's POC or `auto` is unusable. |
-| 8 | **"Don't ask again for this run"** (Claude Code's option). Should an answer carry `remember: true`, scoped to agent + method + host for the rest of the run? It cuts repeat asks, but bareguard's `gate.add` only tightens, so widening needs support there (would be friction F5). Recommendation: leave it out of M2.5; decide in M3 after seeing how noisy `auto` is with Q7 in place. | M3. |
+| 7 | **The agent's own model calls.** An agent POSTs to its LLM API (`/v1/messages`, `/v1/chat/completions`) every turn. With "other methods = x", `auto` would ask on every turn. Recommendation: ship a small default rwx label set marking known inference endpoints (Anthropic, OpenAI-compatible, Baseten, local) as `r` (no outside side effect beyond cost), extendable by the user. Cost limits belong to bareguard's `budget`, not to an ask. **Decided Oct 29:** labelled r by policy in barebox, not rwxmap; default list in M3 "Model endpoints". | Decided. |
+| 8 | **"Don't ask again for this run"** (Claude Code's option). Should an answer carry `remember: true`, scoped to agent + method + host for the rest of the run? It cuts repeat asks, but bareguard's `gate.add` only tightens, so widening needs support there (would be friction F5). Recommendation: leave it out of M2.5; decide in M3 after seeing how noisy `auto` is with Q7 in place. **Decided Oct 29:** not in v1. | Decided. |
 | 9 | **Ask timeout with a file channel.** Polling adds latency; the M2 default deadline was 120 s. What poll interval and default deadline? Recommendation: 250 ms poll, 120 s deadline, configurable; timeout = deny. | M2.5. |
-| 10 | **The hold decision never sees the body** (found Oct 27, design read). `shouldHold(req)` runs in `handleRequest` *before* the body is read and gets method, URL and headers only. Unheld requests stream straight to upstream; only held ones are buffered. So the body half of the card/payment floor — card numbers (Luhn) ask in every mode, `trust` included (section 2) — is **not enforced today**, and no body-based rule (bareguard `secrets` in a body, payment JSON) can be. Fixing it changes the proxy's core path: either buffer every request body up to a cap before deciding (latency + memory on every request; what cap, and what happens above it — deny, ask, or stream unchecked?), or decide in two passes (headers now, body at end-of-stream before the last byte goes upstream — needs holding the final chunk). Recommendation: buffer up to a small cap (e.g. 64 KB, card numbers and secrets live in small bodies), stream larger bodies with the floor applied to their first cap bytes, and measure the cost against the 80 MB target with 20 agents. | M3 design, before M3's POC: the seam shape `shouldHold(req)` → `shouldHold(req, body?)` and the buffering policy. |
+| 10 | **The hold decision never sees the body** (found Oct 27, design read). `shouldHold(req)` runs in `handleRequest` *before* the body is read and gets method, URL and headers only. Unheld requests stream straight to upstream; only held ones are buffered. So the body half of the card/payment floor — card numbers (Luhn) ask in every mode, `trust` included (section 2) — is **not enforced today**, and no body-based rule (bareguard `secrets` in a body, payment JSON) can be. Fixing it changes the proxy's core path: either buffer every request body up to a cap before deciding (latency + memory on every request; what cap, and what happens above it — deny, ask, or stream unchecked?), or decide in two passes (headers now, body at end-of-stream before the last byte goes upstream — needs holding the final chunk). Recommendation: buffer up to a small cap (e.g. 64 KB, card numbers and secrets live in small bodies), stream larger bodies with the floor applied to their first cap bytes, and measure the cost against the 80 MB target with 20 agents. **Decided Oct 29:** replaced later the same day by the final design: 64 KB read-whole threshold with a card scan and a floor ask (never a deny); larger bodies stream unchecked (known gap); held bodies go to a file (cap 50 MB); one 64 KB working slot per agent. See M3, "The body check". | Decided. |

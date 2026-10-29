@@ -117,3 +117,103 @@ blocks unix binds — M2 runs in a real terminal).
 - Branch protection: first dropped, then applied Oct 26 mirroring bareguard.
 - GitHub About description + topics: set Oct 26 via `gh`.
 - npm trusted-publisher: needed before the first Actions dispatch.
+
+## M3 — memory with bareguard (round 1, Oct 29)
+
+POC `poc/m3/rss.mjs`, run in a real shell with bwrap, socat and unix sockets, nothing
+skipped. Three runs by a worker and one by the orchestrator, matching within 1 MB. One
+process, GC forced from row 1d. Means:
+
+| Stage | RSS MB | Delta |
+|---|---|---|
+| baseline held (gc) | 78.0 | 0 |
+| + bareguard 0.28.0 import | 81.5 | +3.5 |
+| + 20 gates built + init (one per agent) | 82.6 | +1.1 |
+| + 360 gate.check() | 86.8 | +4.2 |
+| + rwxmap match.js import | 86.9 | +0.1 |
+| + 360 matchOperation() | 90.9 | +4.0 |
+| + 20 held 64 KB bodies | 91.6 | +0.7 |
+| + 100 held 64 KB bodies | 96.7 | +5.1 |
+| + 360 held 64 KB bodies | 112.9 | +16.2 |
+
+Sandbox walls unchanged: mean 7.8 MB, max 7.9–8.0 MB.
+
+Reading: as measured, bareguard alone takes the proxy over 80 MB. Bodies are the swing
+factor, and the global buffered-body limit bounds them (replaced in round 2 by two body slots per agent).
+
+Two known flaws in round 1, fixed in round 2 below:
+
+- The "proxy" RSS includes the client side (360 client sockets, child handles), which in
+  production live in the sandboxes.
+- Per-call deltas may be V8 heap high-water, not retained state.
+
+Lesson: measure the proxy in its own process before sizing a budget from it.
+
+## M3 — memory, round 2 (Oct 29)
+
+POC `poc/m3/rss2.mjs` + `proxy-host.mjs`. The proxy runs in its own child process. The
+parent hosts the 20 sandboxes and the 360 hold sockets, and reads the child's VmRSS from
+/proc after the child forces GC. 2 variants x 3 runs, real shell, nothing skipped, all
+exit 0. The orchestrator reran variant B once, within 0.4 MB. Means, VmRSS MB:
+
+| Stage | default node | --max-semi-space-size=1 |
+|---|---|---|
+| idle | 60.6 | 58.9 |
+| 10 certs minted | 69.7 | 66.1 |
+| held: 20 agents x (1 parked + 16 waiting) | 74.7 | 71.2 |
+| + bareguard 0.28.0 import | 77.8 | 74.4 |
+| + 20 gates | 79.9 | 75.0 |
+| + 360 check() | 84.6 | 75.2 |
+| + 3600 check() total | 85.1 | 75.8 |
+| + rwxmap match import | 85.2 | 75.9 |
+| + 360 matches | 90.3 | 76.3 |
+| + 3600 matches total | 90.5 | 76.4 |
+| + 20 held 64 KB bodies | 91.6 | 77.3 |
+| + 100 bodies | 96.6 | 82.3 |
+| + 360 bodies | 112.9 | 98.6 |
+
+Readings:
+
+- Round 1's 78.0 baseline included the client side. The proxy alone is 74.7 (default) /
+  71.2 (flag).
+- The per-call growth is one-time V8 young-generation high-water, not retained state:
+  heapUsed after GC rose only ~0.2 MB over 3240 extra calls.
+- `--max-semi-space-size=1` caps the young generation at 1 MB and removes most of it
+  (first 360 checks +4.7 to +0.2 MB; first 360 matches +5.1 to +0.4 MB). Its CPU cost is
+  not measured yet.
+- Bodies live off-heap. The flag does not change them (64 KB each).
+- Split, with the flag: about 70 MB fixed (Node + proxy + certs ~66, bareguard + rwxmap
+  ~4) plus about 0.34 MB per agent in the worst case (gate ~0.03, 1 held + 16 waiting
+  ~0.25, one 64 KB body ~0.06). An estimate from the 20-agent point, assuming linear
+  growth; not measured at other counts.
+
+bareguard's answers (from the bareguard session):
+
+- One Gate per agent is deliberate: the grant comes from gate config, never from the
+  action. About 55 KB each.
+- A lighter bareguard entry would save ~0: gate.js imports every primitive.
+- Fileless audit mode keeps every line in memory, so always give the gate a file path.
+- Build all gates from ONE shared tools object.
+
+Lessons: measure the proxy in its own process; force GC and read heapUsed to tell retained
+state from high-water; repeat calls to see a plateau.
+
+## M3 — part A results (Oct 29)
+
+Built: card scanner (`src/cardscan.js`), the one config file, the semi-space flag in the
+CLI's first line, `scripts/latency.mjs`. Full suite 350/350 three times in a real shell,
+0 skip; typecheck clean.
+
+Latency with and without `--max-semi-space-size=1` (`scripts/latency.mjs`, 2000 requests,
+3 runs):
+
+- p50: the same (about 0.8–1.0 ms).
+- p95/p99: up to about 0.5 ms slower with the flag in 2 of 3 runs, the same in the third.
+
+Card scanner, found in review and fixed: a card followed by a CVV was missed. The greedy
+match ran into the CVV digits and Luhn failed on the longer run. Fixed so the scanner finds
+the card when a CVV follows.
+
+Why large bodies are not checked: random 16-digit numbers starting 2–6 pass Luhn about 1
+time in 10. Denying on a hit would break uploads full of ids. Bodies over 64 KB stream
+through unchecked for card numbers (known gap).
