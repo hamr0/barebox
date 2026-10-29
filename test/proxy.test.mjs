@@ -1067,6 +1067,27 @@ describe('holds', () => {
       } finally { await finish(); }
     });
 
+    it('removeAgent ends that agent\'s holds as client gone before it returns; others stay parked', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      const events = [];
+      await holdProxy({ timeoutMs: 15000, onEvent: (e) => events.push(e) });
+      try {
+        const ra = await post(hp.addAgent('a'), 'RMA1');
+        const rb = await post(hp.addAgent('b'), 'RMB1');
+        const both = await waitFor(() => (hp.pending().length === 2 ? hp.pending() : null), 'both agents to park');
+        const holdA = both.find((h) => h.agent === 'a');
+        const holdB = both.find((h) => h.agent === 'b');
+        hp.removeAgent('a');
+        // Synchronous: no waiting between the call and these checks.
+        assert.deepEqual(events.filter((e) => e.type === 'decided'),
+          [{ type: 'decided', id: holdA.id, decision: 'deny', reason: 'client gone' }]);
+        assert.deepEqual(hp.pending().map((h) => h.id), [holdB.id], 'b still parked');
+        assert.equal((await ra.closed).status, 'closed', 'a connection ended');
+        assert.ok(hp.pending().some((h) => h.id === holdB.id));
+        answer(holdB.id, { decision: 'allow' });
+        assert.equal((await rb.res).status, 200);
+      } finally { await finish(); }
+    });
+
     it('the 18th held request from one agent gets 429 fast', { skip: NEED_UNIX, timeout: 20000 }, async () => {
       await holdProxy({ timeoutMs: 15000 });
       try {

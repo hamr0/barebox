@@ -92,13 +92,21 @@ export function runtimeTempDir(scratch, prefix) {
 
 /**
  * Make a runtime dir owner-only whatever the umask: `mode` is masked by
- * the umask and doesn't apply to an existing dir, hence the `chmod`.
+ * the umask and doesn't apply to an existing dir, hence the `chmod`. An
+ * existing dir you own is tightened to 0700; one you don't own (`/tmp`,
+ * root-owned, shared) is refused, since it can't be made private.
  *
  * @param {string} dir dir to create or fix up
  * @returns {void}
+ * @throws {Error} when the dir exists and is owned by another uid
  */
 export function ensurePrivateDir(dir) {
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const owner = fs.statSync(dir).uid;
+  const me = /** @type {number} */ (process.getuid?.());
+  if (owner !== me) {
+    throw new Error(`runtime dir ${dir} is owned by uid ${owner}, not you (uid ${me}): use a dir of your own, e.g. ${path.join(dir, 'sbx')}`);
+  }
   fs.chmodSync(dir, 0o700);
 }
 

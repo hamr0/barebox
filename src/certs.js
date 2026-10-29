@@ -6,6 +6,7 @@
 import { execFile } from 'node:child_process';
 import { mkdirSync, chmodSync, existsSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 
 /** Hostname/IP spelling both the mint cache and the proxy wall accept. Single definition (see proxy.js). */
 export const HOST_RE = /^[A-Za-z0-9.-]+$/;
@@ -21,6 +22,25 @@ function sh(file, args) {
 
 // In-flight mints, so concurrent CONNECTs to a new host mint once.
 const inflight = new Map();
+
+// At most this many mints run at once: each is several `openssl` processes.
+const MAX_MINTS = 4;
+let minting = 0;
+/** @type {Array<() => void>} */
+const mintQueue = [];
+
+/** @template T @param {() => Promise<T>} fn @returns {Promise<T>} fn's result, run once a mint slot is free */
+async function withMintSlot(fn) {
+  if (minting >= MAX_MINTS) await new Promise((resolve) => mintQueue.push(() => resolve(undefined)));
+  else minting++;
+  try {
+    return await fn();
+  } finally {
+    // Hand the slot straight to the next waiter, else free it.
+    const next = mintQueue.shift();
+    if (next) next(); else minting--;
+  }
+}
 
 /**
  * Create the CA in `dir` unless it already exists. Safe to call twice:
@@ -74,7 +94,7 @@ export async function certFor(dir, host) {
   }
   let p = inflight.get(host);
   if (!p) {
-    p = mint(dir, host, keyPath, certPath).finally(() => { inflight.delete(host); });
+    p = withMintSlot(() => mint(dir, host, keyPath, certPath)).finally(() => { inflight.delete(host); });
     inflight.set(host, p);
   }
   return p;
@@ -100,7 +120,7 @@ async function mint(dir, host, keyPath, certPath) {
   try {
     await sh('openssl', ['req', '-new', '-key', keyPath, '-out', csr, '-subj', `/CN=${host}`]);
     await sh('openssl', ['x509', '-req', '-in', csr, '-CA', caCert, '-CAkey', caKey,
-      '-CAcreateserial', '-days', '825', '-sha256', '-out', certPath, '-extfile', ext]);
+      '-set_serial', '0x' + randomBytes(16).toString('hex'), '-days', '825', '-sha256', '-out', certPath, '-extfile', ext]);
   } finally {
     rmSync(csr, { force: true });
     rmSync(ext, { force: true });
