@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Name: barebox (CLI `sbx`).
-> Status: M0–M2 PASS. **barebox 0.4.0 is on npm** (provenance-signed); M2.5 (ask seam), M4 (undo layer) and the hardening branch are released. M3 is in progress on branch `m3` (design decided Oct 29; memory POC rounds 1 and 2, part A, bodies and parts B1, B2a and B2b done — bareguard decides every request; labels and model endpoints are wired; one audit file; B2c, the memory bench, done Oct 30: budget re-decided at 150 MB for 40 agents per proxy). Next: finish M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M0–M2 PASS. **barebox 0.4.0 is on npm** (provenance-signed); M2.5 (ask seam), M4 (undo layer) and the hardening branch are released. M3 is in progress on branch `m3` (design decided Oct 29; memory POC rounds 1 and 2, part A, bodies and parts B1, B2a and B2b done — bareguard decides every request; labels and model endpoints are wired; one audit file; B2c, the memory bench, done Oct 30: budget is a range, about 145-175 MB at 40 agents per proxy). Next: finish M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 2026 until the cutoff on **Nov 5 2026, 01:00 Amsterdam time (CET, GMT+1)**. Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -34,7 +34,7 @@ The one-line version: **an agent runs on your machine with your real tools, ever
 
 ### First users
 
-Solo devs and small teams. They want maximum control and freedom at zero cost.
+Solo devs and small teams. They want maximum control and freedom at zero cost. barebox is free, local and lightweight, built to assist and to connect to many tools; it is not for swarms or thousands of agents.
 
 ### Why now
 
@@ -126,17 +126,17 @@ M0, M1 and M2 are the go/no-go modules. If any of a, b or c fails, stop and take
 
 These are targets, not results. They get measured in M0, M1 and M6.
 
-**Re-decided by the user, Oct 30 (supersedes the 80 MB proxy budget).** barebox is for small teams. The shared proxy budget is **150 MB in the full worst case at 40 agents**; 80 MB is retired because about 53 MB of the proxy is Node's own code (see the M3 B2c result). 40 agents per proxy is the maximum, enforced by `addAgent`; above 40 an orchestrator runs more proxies. The walls limit stays 10 MB per sandbox.
+**Re-decided by the user, Oct 30 (supersedes the 80 MB proxy budget, and later the same day the flat 150 MB).** barebox is for small teams. The shared proxy budget is a range, **about 145-175 MB in the full worst case at 40 agents**, quiet to busy machine; 80 MB is retired because about 53 MB of the proxy is Node's own code (see the M3 B2c result). 40 agents per proxy is the maximum, enforced by `addAgent`; above 40 an orchestrator runs more proxies. The walls limit stays 10 MB per sandbox.
 
 | Item | Target |
 |---|---|
-| Shared proxy | <= 150 MB, full worst case, 40 agents (was <= 80 MB, superseded Oct 30) |
+| Shared proxy | about 145-175 MB, full worst case, 40 agents (was <= 80 MB, then <= 150 MB, both superseded Oct 30) |
 | Each extra sandbox, on top of the agent itself | <= 10 MB |
 | Agents per proxy | 40 maximum, enforced (was: 20 agents on a 2 GB VPS) |
 
 ### Rewrite bench (Oct 27): go/no-go (c) re-measured on the rewritten code
 
-*Budget column below is the old 80 MB budget, superseded Oct 30 (now 150 MB at 40 agents; see "M3 B2c memory bench"). The figures are history and stay as measured.*
+*Budget column below is the old 80 MB budget, superseded Oct 30 (now about 145-175 MB at 40 agents; see "M3 B2c memory bench"). The figures are history and stay as measured.*
 
 `npm run bench` exit 0 PASS, measured 2026-10-27 in a real shell with 20 concurrent agents
 (`addAgent` + `launch`; per-sandbox RSS from exact `/proc` tree walks of each bwrap PID;
@@ -174,7 +174,7 @@ Proxy RSS with bareguard 0.28.0 and rwxmap's match code loaded, measured in one 
 
 The proxy ran in its own child process, with GC forced before each reading. With the real gate and matcher loaded, it measured 76.4 MB (3600 checks and 3600 matches) with `--max-semi-space-size=1`, and 77.3 MB with 20 held 64 KB bodies. Default Node ended at 90.5 MB before bodies. The per-call growth is one-time V8 young-generation high-water, not retained state. Under 80 MB, measured. **Superseded Oct 30:** this test had no real HTTP traffic, so the figure was too low; the B2c bench below is the real number. Table and reading: `docs/logs/findings.md`, "M3 — memory, round 2".
 
-### M3 B2c memory bench (Oct 30): budget re-decided at 150 MB
+### M3 B2c memory bench (Oct 30): budget re-decided, then set as a range
 
 `npm run bench:agents`, measured by the orchestrator in a real shell. Method: proxy in its own process (`--expose-gc`, `--max-semi-space-size=1`, GC forced before each reading), real gates in `auto` mode, a 170-operation label tools table, one fresh process per agent count. Worst case per agent, all at once: 1 parked hold + 16 waiting + 1 turned away with 429 + the working slot filled, all with 64 KB bodies. Full findings: `docs/logs/findings.md`, "M3 — B2c memory bench (Oct 30)".
 
@@ -194,12 +194,14 @@ The proxy ran in its own child process, with GC forced before each reading. With
 | Agents | barebox worst case (proxy + 8 MB per sandbox) | srt 0.0.81 (as measured earlier, ~100 MB per sandbox) |
 |---|---|---|
 | 10 | ~180 MB | ~1 GB |
-| 20 | ~274 MB | ~2 GB |
-| 40 | ~464 MB | not measured |
+| 20 | ~275-280 MB | ~2 GB |
+| 40 | ~465-495 MB | not measured |
 
-**Final on published bareguard 0.30.0 (clean runs):** 99.0–100.2 / 112.7–116.0 / 126.8–133.4 / 145.0–147.7 MB at 10 / 20 / 30 / 40 agents. Memory stayed flat over 54,000 more requests. Open: one reading of 144.8 MB at 20 agents after a 51.6 MB audit file suggests the worst case may depend on audit file size; see `docs/logs/findings.md`.
+**Final on published bareguard 0.30.0 (clean runs):** 99.0–100.2 / 112.7–116.0 / 126.8–133.4 / 145.0–147.7 MB at 10 / 20 / 30 / 40 agents. Memory stayed flat over 54,000 more requests. Audit file size does not move the worst case (measured Oct 30 to 205 MB at 40 agents: 143.2–150.1 MB, against 145.2–146.7 MB at 3 MB). Open: the RSS held before the holds varies from 84.6 to 121.1 MB, so 40-agent runs read 143.2–150.1 MB on a quiet machine and up to 172.2 MB at load 4-35; the budget is the range (see the decision below). See `docs/logs/findings.md`, "Long audit file".
 
 **Decision (user, Oct 30):** the proxy budget is 150 MB in the full worst case at 40 agents; 80 MB is retired. barebox targets small teams. 40 agents per proxy is the maximum, enforced: `addAgent` refuses the 41st with an error that says to run another proxy; the `tcp` door does not count; `removeAgent` frees a place. The bench fails when any reading at up to 40 agents exceeds 150 MB or any walls reading exceeds 10 MB. Go/no-go (c) is re-decided at this budget: met at 143.6 MB with bareguard 0.30.0.
+
+**Decision (user, Oct 30, later, replaces the flat 150 MB above):** the budget is a range, about 145-175 MB at 40 agents, because identical runs vary with machine load (143.2–172.2 MB measured). A hard line at 150 MB would overstate the precision, and barebox is for small teams: free, local and lightweight, not for swarms or thousands of agents. The bench now fails above 175 MB.
 
 ### Baseline
 
@@ -445,7 +447,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Goal | Every request gets a letter and a decision through a gate; the mode decides what each letter does; every decision is in the one audit log. |
 | We use | bareguard (dependency: `Gate`, rwx, flags, audit; 0.29.0 for `rwx.askUnheld`). rwxmap's `rwxmap/match` entry (0.8.0) for request keys. |
 | We build | See the list below. |
-| Riskiest assumption | **Proxy memory with bareguard loaded stays within budget.** *Re-decided Oct 30: the budget is 150 MB in the full worst case at 40 agents; the 80 MB below is superseded. Measured 143.6 MB with bareguard 0.30.0 (B2c, see Evidence).* Round 1 of the memory POC (Oct 29, `docs/logs/findings.md`) put bareguard alone over 80 MB, with two flaws in the measurement. Round 2 (proxy in its own process) measured about 76.4 MB before bodies with `--max-semi-space-size=1` and 77.3 MB with 20 held bodies. Under 80 MB, measured (superseded: no real HTTP in that test). Second: the body check (see below). |
+| Riskiest assumption | **Proxy memory with bareguard loaded stays within budget.** *Re-decided Oct 30: the budget is a range, about 145-175 MB in the full worst case at 40 agents; the 80 MB below is superseded. Measured 143.6 MB with bareguard 0.30.0 (B2c, see Evidence).* Round 1 of the memory POC (Oct 29, `docs/logs/findings.md`) put bareguard alone over 80 MB, with two flaws in the measurement. Round 2 (proxy in its own process) measured about 76.4 MB before bodies with `--max-semi-space-size=1` and 77.3 MB with 20 held bodies. Under 80 MB, measured (superseded: no real HTTP in that test). Second: the body check (see below). |
 | Done when | See the list below. |
 | Estimate | 1–1.5 days. |
 
@@ -504,7 +506,6 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 - New dependency `rwxmap` 0.8.0 (exact). Verified: full suite 421/421 three times, 0 skip, typecheck clean; an `sbx run` smoke with an httpbin label folder (labelled PUT `w` passed in `auto` with no ask; unlabelled PUT asked, denied, 403; both PUTs 200 in `trust`; label folder not visible in the sandbox).
 - **B2c, done (Oct 30), brief `docs/logs/m3-b2c-bench-brief.md`:** `npm run bench:agents` measures 10 / 20 / 30 / 40 agents in the full worst case: 99.5 / 114.4 / 124.3 / 143.6 MB with bareguard 0.30.0, walls max 8.0 MB. It found two causes of 318 MB at 20 agents (bareguard re-reading the audit file per ask, fixed upstream for 0.30.0; barebox keeping held bodies in memory, fixed). The user re-decided the budget at 150 MB and capped agents at 40 per proxy. Details in Evidence and `docs/logs/findings.md`.
 - **B2b, done (Oct 30), brief `docs/logs/m3-b2b-audit-brief.md`:** `gate.jsonl` is the one audit file, every line in bareguard's shape through a bareguard Gate (`record` for response status, `annotate` with `surface:false` for barebox's facts, `drainAnnotations()` after each). A body is logged as one `body` line (length + SHA-256, joined by `rid`); request headers and the preview are no longer logged (the preview is in the ask file only). Verified in a real shell: suite 432/432 three times, 0 skip; typecheck clean; live smoke (labelled PUT, asked-then-approved POST): one file, aid joins, correct hash, no secret in the file. Details in `docs/logs/findings.md`, "M3 — B2b one audit file".
-- **B2c (next):** the memory bench at 10, 20, 30 and 40 agents.
 
 **We build:**
 1. **The action barebox hands the gate**: `{ type: "net", tool: <rwxmap request key, or http.<METHOD>>, url, method, agent, cardLike?, paymentPath? }`. No letter.
@@ -525,7 +526,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 - A passed loop gate receives the asks (barebox's file channel stays silent).
 - A vanilla `check()` object works.
 - The audit log shows request, decision and response status in one file.
-- The memory bench uses the round 2 method (proxy in its own process, GC forced before each reading, the real gate and matcher loaded) and measures 10, 20, 30 and 40 agents with every working slot filled, so the agent limit is measured, not estimated. **Done Oct 30:** recorded against 150 MB at 40 agents (the user retired 80 MB); see "M3 B2c memory bench" in Evidence. The agents bench needs bareguard 0.30.0 to meet 150 MB.
+- The memory bench uses the round 2 method (proxy in its own process, GC forced before each reading, the real gate and matcher loaded) and measures 10, 20, 30 and 40 agents with every working slot filled, so the agent limit is measured, not estimated. **Done Oct 30:** recorded against 175 MB at 40 agents (the user retired 80 MB); see "M3 B2c memory bench" in Evidence. The agents bench needs bareguard 0.30.0 to meet 150 MB.
 - The latency comparison with and without `--max-semi-space-size=1` is recorded.
 
 **Suite friction**: per the suite reuse rule, these are fixed in the owning library, never patched here. Status as of Oct 29.
@@ -592,7 +593,7 @@ This is a plan, not a result. It shifts as POCs return. Review cap per module: o
 | 2 | Oct 27 | Graduation rewrite, reviews, rewrite bench (done) | Branch review: ready |
 | 3 | Oct 28 | M2.5 ask seam, M4 undo layer, hardening, release 0.4.0 (done) | 0.4.0 on npm |
 | 4 | Oct 29 | M3 scoping, memory POC (rounds 1 and 2 done) | |
-| 5–6 | Oct 30–31 | M3 build and review. bareguard 0.29.0 and rwxmap 0.8.0 land upstream. | Proxy ≤ 150 MB at 40 agents on bareguard 0.30.0, pinned (145–148 MB measured; re-decided Oct 30; was ≤ 80 MB) |
+| 5–6 | Oct 30–31 | M3 build and review. bareguard 0.29.0 and rwxmap 0.8.0 land upstream. | Proxy about 145-175 MB at 40 agents on bareguard 0.30.0, pinned (143–172 MB measured, quiet to busy machine; re-decided Oct 30; was ≤ 80 MB) |
 | 7 | Nov 1 | M5 (keys) | |
 | 8 | Nov 2 | M6 numbers. Demo B. | Memory targets measured |
 | 9 | Nov 3 | Demo A, README. Freeze in the evening. | |
@@ -637,7 +638,7 @@ None of these block M0. Nothing here is silently assumed.
 
 | # | Question | Decides |
 |---|---|---|
-| 1 | What is the real proxy memory with bareguard loaded? Bench without bareguard: 77.9 MB (Oct 28, 20 agents × (1 parked + 16 waiting)). M3 POC round 1 (Oct 29, one process, forced GC): baseline 78.0 MB, 90.9 MB after 360 checks and 360 matches, 112.9 MB with 360 held bodies; it included the client side. **Round 2 (Oct 29, proxy in its own process):** about 76.4 MB before bodies with `--max-semi-space-size=1` (90.5 MB with default Node), 77.3 MB with 20 held 64 KB bodies. Measured then under 80 MB, but that test had no real HTTP: superseded Oct 30. **B2c (real bench):** 99.5 / 114.4 / 124.3 / 143.6 MB at 10 / 20 / 30 / 40 agents worst case with bareguard 0.30.0; normal use 83-87 MB. Budget re-decided by the user at 150 MB, 40 agents per proxy maximum. The `sbx` proxy runs with the flag; see M3, "Memory". | Decided Oct 30. |
+| 1 | What is the real proxy memory with bareguard loaded? Bench without bareguard: 77.9 MB (Oct 28, 20 agents × (1 parked + 16 waiting)). M3 POC round 1 (Oct 29, one process, forced GC): baseline 78.0 MB, 90.9 MB after 360 checks and 360 matches, 112.9 MB with 360 held bodies; it included the client side. **Round 2 (Oct 29, proxy in its own process):** about 76.4 MB before bodies with `--max-semi-space-size=1` (90.5 MB with default Node), 77.3 MB with 20 held 64 KB bodies. Measured then under 80 MB, but that test had no real HTTP: superseded Oct 30. **B2c (real bench):** 99.5 / 114.4 / 124.3 / 143.6 MB at 10 / 20 / 30 / 40 agents worst case with bareguard 0.30.0; normal use 83-87 MB. Budget re-decided by the user as a range, about 145-175 MB, 40 agents per proxy maximum. The `sbx` proxy runs with the flag; see M3, "Memory". | Decided Oct 30. |
 | 2 | ~~`node-forge` or shelling out to `openssl` for certificates?~~ Decided Oct 26: `openssl` subprocess (sandbox keeps proxy RSS clean; platform coupling accepted, see M1). | — |
 | 3 | How should the undo layer handle large untracked dirs (`node_modules`) and build output? | M4 design. |
 | 4 | Localhost sockets (Postgres, Docker daemon) are writes the overlay can't see. Decided Oct 26 for M0: block. | M3 revisits only if a demo needs a local DB. |

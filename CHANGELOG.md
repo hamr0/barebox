@@ -25,14 +25,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The tool for a request is the label's key when a label documents it, else a model endpoint key (`r`), else `http.<METHOD>`. A key a label documents but the gate file lacks (a row you deleted) is denied (`rwx.unlisted`).
 - Model endpoints are `r`: Anthropic `/v1/messages` and `/v1/messages/count_tokens`; OpenAI `/v1/chat/completions`, `/v1/responses` and `/v1/embeddings`; and on each `localLlm` host:port `/api/chat`, `/api/generate`, `/api/embed`, `/v1/chat/completions` and `/v1/completions` (http only).
 - `src/policy.js` exports `buildTools`, `toolFor` and `emptyMatcher`; `gateFor` takes `tools`; `createProxy` and `run()` take `labels`; `launch()` takes `maskDirs`.
-- `npm run bench:agents` (`scripts/bench-agents.mjs`): the proxy's memory at 10 / 20 / 30 / 40 agents, each at the full worst case (1 parked + 16 waiting + a filled body slot), proxy in its own process with forced GC. Exits 1 above 150 MB at up to 40 agents, or above 10 MB per sandbox walls.
+- `npm run bench:agents` (`scripts/bench-agents.mjs`): the proxy's memory at 10 / 20 / 30 / 40 agents, each at the full worst case (1 parked + 16 waiting + a filled body slot), proxy in its own process with forced GC. Exits 1 above 175 MB at up to 40 agents, or above 10 MB per sandbox walls.
 - One proxy serves at most 40 agents: `addAgent` throws an error naming the limit and telling you to run another proxy. The TCP door's `tcp` agent does not count; `removeAgent` frees a place.
 - Held bodies are spooled to disk and released from memory as soon as they are written (68 held bodies grow `arrayBuffers` by 0.28 MB).
 - New dependency: `rwxmap` 0.8.0 (exact). Label files written before rwxmap 0.8.0 fail to load with rwxmap's "regenerate" message.
 
 ### Changed
 
-- The proxy memory budget is 150 MB in the full worst case at 40 agents (was 80 MB, retired: about 53 MB is Node's own code). barebox targets small teams. Measured 99.5 / 114.4 / 124.3 / 143.6 MB at 10 / 20 / 30 / 40 agents; normal use 83-87 MB.
+- The proxy memory budget is a range, about 145-175 MB in the full worst case at 40 agents (was 80 MB, retired: about 53 MB is Node's own code). barebox is for small teams: free, local and lightweight, built to assist and to connect to many tools, not to run swarms or thousands of agents. Measured about 100 / 113-120 / 127-133 / 143-172 MB at 10 / 20 / 30 / 40 agents, quiet to busy machine; normal use about 85-120 MB.
 - `hold.maxBody` now defaults to 52428800 (50 MB), was 1048576. A body over the cap is denied `403 body too large to hold`.
 - The audit file carries a body's length and SHA-256 only (the `body` line), never its content. The ask payload carries the 4 KB `bodyPreview` (card numbers masked except the last 4).
 - Long audit fields are cut before they reach bareguard (`url` to 400 characters, `note` and `reason` to 200), so the ids that join an ask to its outcome survive bareguard's 1000-byte `meta` limit.
@@ -42,7 +42,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Known
 
-- At 40 agents the worst case measures 145–148 MB, close to the 150 MB budget. The first ask of each gate walks the existing audit file, and one 20-agent run after a 51 MB audit file measured 144.8 MB on a busy machine, so a very long run may cost more than these figures. Under 54,000 more allowed requests memory stayed flat (98.7–99.0 MB).
+- Memory varies with machine load: identical 40-agent runs read 143-172 MB. Audit file size does not move it (205 MB of audit read the same as 3 MB), though the first ask of each gate still reads the whole file. Under 54,000 more allowed requests memory stayed flat (98.7–99.0 MB).
 
 ### Removed
 

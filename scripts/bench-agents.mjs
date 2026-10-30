@@ -26,9 +26,10 @@
 // The worst-case reading at 20 therefore comes after 10800 allows (conservative).
 //
 // Limits: barebox targets small teams. 40 agents per proxy is the maximum
-// (enforced by addAgent); above that, run more proxies. The 150 MB proxy
-// budget is for the full worst case at 40 agents. Exit 1 when any proxy
-// reading at any count (up to 40) exceeds 150 MB, or any walls reading exceeds
+// (enforced by addAgent); above that, run more proxies. The proxy budget is a
+// range, about 145-175 MB in the full worst case at 40 agents, quiet to busy
+// machine. Exit 1 when any proxy reading at any count (up to 40) exceeds the
+// top of the range, 175 MB, or any walls reading exceeds
 // 10 MB. The straight-line fit over the four worst-case points is printed as
 // an estimate, with the MB per agent slope; it is not a gate.
 import { fork, spawnSync } from 'node:child_process';
@@ -51,7 +52,7 @@ const BODY = 65536;
 const SENT = 61440; // "about 60 KB" of the working-slot POST
 const PER_AGENT = 18; // 1 parked + 16 waiting + the 429
 const MAX_SANDBOX_MB = 10;
-const MAX_PROXY_MB = 150;
+const MAX_PROXY_MB = 175;
 const DRIFT_FINDING_MB = 1;
 const SKIP_EXIT = 77;
 

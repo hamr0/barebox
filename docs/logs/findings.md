@@ -338,4 +338,35 @@ Both clean runs pass at 150 MB, with 2–5 MB to spare at 40 agents. A run at lo
 
 Drift over 7200 requests read +0.8, +3.5, +2.4, +1.1 and +4.8 MB across five runs. A long run settled it: 20 agents, 61,200 allowed requests, RSS 98.7 to 99.0 MB over the first 54,000, heap flat at about 12 MB, so no steady leak. RSS then stepped to 114.0 MB with the heap still flat, on a busy machine (load about 30); that step is unexplained.
 
-Open: the same long run read 144.8 MB in the 20-agent worst case with a 51.6 MB audit file, against 113–116 MB after a short run. Each gate's first ask walks the existing file, so the worst case may depend on audit file size. Load was also high, so this is one reading, not a measurement. The 40-agent case after a long run is unmeasured and could exceed 150 MB.
+Open (closed below): the same long run read 144.8 MB in the 20-agent worst case with a 51.6 MB audit file, against 113–116 MB after a short run.
+
+### Long audit file (Oct 30)
+
+**Result: audit file size does not move the worst case.** The memory budget does not depend on rotation, and no fix is needed for it.
+
+Method: a throwaway copy of the bench seeded `gate.jsonl` with real lines (439 bytes each) from a short run, either after the gates were built (a long run) or before the proxy started (a restart on an old file). The seed was appended from outside the proxy. The bench itself was not changed. Worst case at load 2-3 (the last 20-agent runs ran at load 7-12):
+
+| Agents | Audit file | Worst MB, run 1 | Worst MB, run 2 | Peak (VmHWM) MB | Read by the proxy |
+|---|---|---|---|---|---|
+| 40 | 3 MB | 146.7 | 145.2 | 146.9–149.1 | 196 MB |
+| 40 | 54 MB, after | 145.4 | 143.4 | 145.5–147.3 | 2248 MB |
+| 40 | 205 MB, after | 150.1 | 143.2 | 145.0–153.3 | 8281 MB |
+| 40 | 205 MB, before | 145.3 | 143.9 | 146.8–147.8 | 8281 MB |
+| 20 | 3 MB | 119.6 | 116.7 | 117.5–120.3 | 91 MB |
+| 20 | 54 MB, after | 118.2 | 114.5 | 115.6–119.2 | 1117 MB |
+
+The check can fail: the read counter shows every gate really walked the file (8281 MB is about 40 × 205 MB). An earlier matrix's 290-300 MB peaks are a harness artefact, not a proxy cost: the seed step read the file into the proxy process. They are discarded.
+
+Ruled out: `readAll()` at gate build. The restart case's peak stays at 147-148 MB with a 205 MB file.
+
+**What moves the worst case is the RSS the proxy already holds before the holds.** Worst case is that baseline (`after 3600 allows`) plus a steady 50-60 MB at 40 agents, or about 30 MB at 20. The baseline ranged from 84.6 to 121.1 MB between identical runs and is usually higher under load. This explains the 144.8 MB reading: that run's RSS had stepped to 114.0 MB, and 114.0 + about 30 = 144. The cause of the step itself is still unexplained.
+
+**Load does move it.** 15 runs at 40 agents at load 4-35 read 144.2–172.2 MB, 8 of them over 150, including all 3 runs with no seed. Quiet runs read 143.2–150.1 MB. These readings are post-GC, and peak VmHWM is 1-3 MB higher.
+
+**Decision (user, Oct 30): the budget is a range, about 145-175 MB at 40 agents, quiet to busy machine,** not a flat 150 MB. barebox is for small teams: free, local and lightweight, built to assist and to connect to many tools, not for swarms or thousands of agents. `bench:agents` now fails above 175 MB.
+
+Not measured: the time cost of a first ask's walk. Each gate parses the whole file once, so 40 gates on a 205 MB file read 8.3 GB in total.
+
+### Smoke on bareguard 0.30.0 (Oct 30)
+
+A real `sbx run --mode auto --json` with real internet, after the 0.30.0 pin: GET example.com 200; POST httpbin asked as `rwx.ask`, approved, 200; a second POST asked, denied, 403; exit 0. One audit file, `gate.jsonl`, 16 lines, no `audit.jsonl`; `aid` joins each request's lines; two `body` lines; the body text appears 0 times. socat logged one "Connection reset by peer" as the run ended (not looked into).
