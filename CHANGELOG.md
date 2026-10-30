@@ -4,16 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.5.0] - 2026-10-30
 
 ### Added
 
 - One config file, `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, read by the CLI only (`sbx run`). Keys: `mode`, `holdTimeoutSec` (a positive integer or `"never"`), `heldBodyMaxMB` (a positive integer), `localLlm` (an array of `"host:port"`). A flag beats the file, the file beats the default. An unknown key, a bad value or bad JSON makes `sbx run` exit 2, naming the file and the key.
-- The card floor now looks inside bodies: an allowed request whose body is 64 KB or less and holds a card number (13-19 digits, optional single space or dash between digits, first digit 2-6, Luhn-valid) parks as an ask with rule `card number in body (floor)` in every mode, `trust` included. Nothing is denied because of a card. Bodies over 64 KB stream through unchecked for cards (known gap). Each agent has one 64 KB working slot, so allowed body-carrying requests read their body one at a time per agent.
+- The card floor now looks inside bodies: an allowed request whose body is 64 KB or less and holds a card number (13-19 digits, optional single space or dash between digits, first digit 2-6, Luhn-valid) parks as an ask with rule `flags.cardLike` in every mode, `trust` included. Nothing is denied because of a card. Bodies over 64 KB stream through unchecked for cards (known gap). Each agent has one 64 KB working slot, so allowed body-carrying requests read their body one at a time per agent.
 - Held bodies are spooled to `<runtime>/held/<id>` (a 0600 file in an owner-only dir), never kept in memory, and deleted whenever the hold ends. `runtimePaths` gains `heldDir` and `heldFile(id)`; `run()` gains the `heldBodyMaxBytes` option.
 - The `sbx` CLI starts Node with `--max-semi-space-size=1` (caps the V8 young generation to hold proxy memory down; latency unchanged).
 - `holds.js` exports `ASK_BODY_LIMIT`, `DEFAULT_HOLD_MAX_BODY` and `bodyPreview`.
-- bareguard decides every request: one `gate.check()` per request, one gate per agent (and one for the TCP door's `tcp` agent), all sharing one tools table. `src/policy.js` exports `MODES` and `gateFor`. Modes: `ask` holds `r--` and asks for w and x; `auto` holds `rw-` and asks for x; `trust` holds `rwx`. GET/HEAD are r; POST/PUT/PATCH/DELETE are x; any other method is denied (`rwx.unlisted`). Every request is the tool `http.<METHOD>` until rwxmap labels land.
+- bareguard decides every request: one `gate.check()` per request, one gate per agent (and one for the TCP door's `tcp` agent), all sharing one tools table. `src/policy.js` exports `MODES` and `gateFor`. Modes: `ask` holds `r--` and asks for w and x; `auto` holds `rw-` and asks for x; `trust` holds `rwx`. GET/HEAD are r; POST/PUT/PATCH/DELETE are x; any other method is denied (`rwx.unlisted`).
 - The floor is two bareguard flags, `cardLike` and `paymentPath` (`/checkout`, `/payment`, `/orders`, `/purchase`), which ask in every mode, `trust` included.
 - `createProxy` option `gateFor(agent, { humanChannel })`: returns a bareguard `Gate` or any object with `async check(action)` resolving `{ outcome, rule?, reason? }`; `askHuman` from a plain object goes to the same hold queue. Without it nothing is checked.
 - One audit file: `<runtime>/gate.jsonl` (`runtimePaths(runtime).audit`; `createProxy`'s `logFile` names it). Every line is in bareguard's shape. bareguard's gate lines carry the decision; a response status is a `record` line joined to its decision line by `aid`; barebox's own facts are `annotate` lines with `surface:false`, keyed by `verdict`: `deny`, `hold`, `decide`, `hold-abandoned`, `hold-queue-full`, `stale-answer`, `malformed-answer`, `body`, and `resp` in forward-all mode. A request with a body gets one `body` line with `meta: { agent, rid, bodyBytes, bodySha256 }`, joined to its gate line by `rid`.
@@ -36,13 +36,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `hold.maxBody` now defaults to 52428800 (50 MB), was 1048576. A body over the cap is denied `403 body too large to hold`.
 - The audit file carries a body's length and SHA-256 only (the `body` line), never its content. The ask payload carries the 4 KB `bodyPreview` (card numbers masked except the last 4).
 - Long audit fields are cut before they reach bareguard (`url` to 400 characters, `note` and `reason` to 200), so the ids that join an ask to its outcome survive bareguard's 1000-byte `meta` limit.
-- A denial reads `403 denied: <rule>[: reason]`; an ask carries the gate's rule (`rwx.ask`, `flags.cardLike`, `flags.paymentPath`) and letter. The card floor's rule is now `flags.cardLike`, not `card number in body (floor)`.
+- A denial reads `403 denied: <rule>[: reason]`; an ask carries the gate's rule (`rwx.ask`, `flags.cardLike`, `flags.paymentPath`) and letter.
 - Request bodies of 64 KB or less are read in the agent's working slot before the gate decides; a waiting request's body is spooled to `<runtime>/held/<id>` when it enters the hold line.
 - `holds.add` takes `preview`, `bodyBytes` and `bodyFile` in place of `body` (internal shape).
 
 ### Known
 
 - Memory varies with machine load: identical 40-agent runs read 143-172 MB. Audit file size does not move it (205 MB of audit read the same as 3 MB), though the first ask of each gate still reads the whole file. Under 54,000 more allowed requests memory stayed flat (98.7–99.0 MB).
+- `BAREGUARD_RWX_LETTERS` set in the shell that starts `sbx` overrides the mode letters (for example `--mode ask` then allows a POST without asking), because barebox passes no explicit letters. The sandboxed agent cannot set it.
+- Held bodies can add up to about 2 GB on disk in the runtime dir (50 MB cap per request, 40 agents).
+- API keys inside a body still show in the ask file's 4 KB preview.
 
 ### Removed
 
