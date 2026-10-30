@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Name: barebox (CLI `sbx`).
-> Status: M0–M2 PASS. **barebox 0.4.0 is on npm** (provenance-signed); M2.5 (ask seam), M4 (undo layer) and the hardening branch are released. M3 is in progress on branch `m3` (design decided Oct 29; memory POC rounds 1 and 2, part A, bodies and parts B1 and B2a done — bareguard decides every request; labels and model endpoints are wired; B2b and B2c are next). Next: M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M0–M2 PASS. **barebox 0.4.0 is on npm** (provenance-signed); M2.5 (ask seam), M4 (undo layer) and the hardening branch are released. M3 is in progress on branch `m3` (design decided Oct 29; memory POC rounds 1 and 2, part A, bodies and parts B1, B2a and B2b done — bareguard decides every request; labels and model endpoints are wired; one audit file; B2c, the memory bench, is next). Next: M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 2026 until the cutoff on **Nov 5 2026, 01:00 Amsterdam time (CET, GMT+1)**. Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -320,7 +320,7 @@ Also out of scope until Nov 5:
 
 - Bareguard-shape audit lines, unless `gate.record` and `gate.annotate` cover them as they are.
 - A run on a VPS (optional).
-- A secret scrubber for bodies in the ask preview and the log. Card numbers are masked; API keys and passwords are not, until bareguard's redaction covers them in M3.
+- A secret scrubber for bodies in the ask preview. Card numbers are masked; API keys and passwords are not, until bareguard's redaction covers them in M3.
 - "Don't ask again for this run" (decided Oct 29, no for v1).
 - Adopting bareguard's `isPrivateIp` (F4).
 - Checking compressed (gzip) bodies for card numbers.
@@ -394,10 +394,10 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
    - A stale or late answer is ignored and logged, as in fwdloop.
    - `sbx run` prints an `ask <id> <agent> <method> <url> rule=<rule>` line to stdout (`{"ev":"ask",...}` with `--json`), so a human watching a terminal knows. The library prints nothing: a caller of `run()` or `createProxy` gets `asks/<id>.json` and the `onEvent` callback.
    - The control socket and its server are deleted.
-3. **A decision-ready ask payload**: `id`, `agent`, `method`, `url`, `rule` (`payment`, `card-in-body`, `x:unlabelled-POST`), `letter`, a 4 KB body preview with card numbers masked except the last 4 digits (M3), `waitingSec`, `expiresAt`. barebox knows the request, not the intent; the caller adds its own context (step, goal).
+3. **A decision-ready ask payload**: `id`, `agent`, `method`, `url`, `rule` (`payment`, `card-in-body`, `x:unlabelled-POST`), `letter`, a 4 KB body preview with card numbers masked except the last 4 digits (M3; the ask file is the only place the preview lives), `waitingSec`, `expiresAt`. barebox knows the request, not the intent; the caller adds its own context (step, goal).
 4. **`run({ proj, command, mode, onAsk })`** → `{ exit, asks, audit, diff, runtime }` (`diff` is the M4 overlay diff; `gate` is not an option today, the foundations rework removed it). It wraps `createProxy`, `addAgent` and `launch`, which stay public as the low-level parts.
 5. **`sbx run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd>`**. With `--json`, stdout carries JSON lines (`{"ev":"ask",...}`, `{"ev":"decided",...}` as each ask ends, `{"ev":"done","exit":N}`), and the exit code mirrors the agent's.
-6. **Audit lines in bareguard's shape** (see Decisions, "Audit"), so M3 shares the file without a migration. STATUS (Oct 27): the bareguard line shape is DEFERRED to M3 — the current log is barebox's own JSONL. Body-preview redaction is NOT DONE either: the preview is verbatim up to `ASK_BODY_LIMIT` (see `holds.js`), redaction waits for M3's bareguard `secrets`.
+6. **Audit lines in bareguard's shape** (see Decisions, "Audit"), so M3 shares the file without a migration. STATUS (Oct 30): DONE in M3 B2b — `gate.jsonl` is the one audit file, every line in bareguard's shape. Body-preview redaction is NOT DONE: the ask file's preview is verbatim except card numbers, and redaction waits for bareguard's `secrets`.
 
 **Done when:**
 - A loop answers a parked request through `onAsk` with no files involved.
@@ -450,7 +450,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 
 *Audit.* No new primitive. Response status goes through `gate.record(action, {status,...}, {aid})`. barebox's own facts (request, wall denial) go through `gate.annotate({ surface:false, ... })`, into the same audit file.
 
-*The floor as marks.* No new bareguard primitive. barebox runs its own regex and Luhn on the body and sets `cardLike: true` on the action. Config: `flags: { cardLike: { true: "ask" } }`. Flags run before the allowlist and rwx, so they ask in every mode. A flag can only add an ask or a deny, never grant. That is why a caller-set flag is safe and a caller-set letter is not. Payment paths (`/checkout`, `/payment`, `/orders`, `/purchase`, today a list in `src/run.js`) move to the same mark mechanism. The body never goes into the gate action. The audit log carries only the masked 4 KB preview, the body length and a hash (see "The body check").
+*The floor as marks.* No new bareguard primitive. barebox runs its own regex and Luhn on the body and sets `cardLike: true` on the action. Config: `flags: { cardLike: { true: "ask" } }`. Flags run before the allowlist and rwx, so they ask in every mode. A flag can only add an ask or a deny, never grant. That is why a caller-set flag is safe and a caller-set letter is not. Payment paths (`/checkout`, `/payment`, `/orders`, `/purchase`, today a list in `src/run.js`) move to the same mark mechanism. The body never goes into the gate action. The audit file carries only the body length and a SHA-256 (see "The body check"); the masked 4 KB preview is in the ask file.
 
 *The body check (final, decided Oct 29, later the same day).*
 
@@ -461,8 +461,8 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 - Held bodies (any request waiting for the human, card asks and x asks) are written to a file in the owner-only runtime folder, never kept in memory. Cap 50 MB (config key `heldBodyMaxMB`, in the one config file). Over the cap: 403 "body too large to hold". The file is deleted once the ask is decided or abandoned. Why: a held body kept in memory up to 1 MB (today) is 20 MB at 20 agents, over budget, and a 64 KB cap would make `git push` impossible to approve.
 - A card ask waits in the agent's line like any other ask (1 held, up to 16 waiting).
 - Memory: one 64 KB working slot per agent, 20 agents = 1.25 MB. Measured at 77.3 MB total with the semi-space flag (round 2, stage 4a). The per-agent worst case is about 0.34 MB, so the estimate is about 28 agents under 80 MB (to be measured at 10/20/30/40 agents).
-- The audit log no longer stores whole bodies (today up to 1 MB verbatim, kept in memory per request while it streams). Each request line carries a 4 KB body preview with card numbers masked except the last 4 digits, plus the full body length and a SHA-256 hash. The ask file uses the same 4 KB masked preview (one function makes both).
-- Known gap: API keys or passwords inside a body still appear in the preview. bareguard's redaction covers common token shapes once the log moves to bareguard's format in M3. barebox does not build its own secret scrubber.
+- The audit file no longer stores bodies or a preview (superseded Oct 30: it was whole bodies, then a 4 KB preview per request line). A request with a body gets one `body` annotate line: `meta: { agent, rid, bodyBytes, bodySha256 }`, joined to its gate line by `rid`. The 4 KB masked preview (card numbers masked except the last 4) is in the ask file only. User decision, Oct 30.
+- Known gap: API keys or passwords inside a body still appear in the ask file's preview (the audit file has no preview). bareguard's redaction covers common token shapes once it lands. barebox does not build its own secret scrubber.
 - Known gap: compressed (gzip) bodies are not checked.
 
 **Part B2a, done (Oct 30), brief `docs/logs/m3-b2a-labels-brief.md`.** Decided by the user Oct 30:
@@ -471,7 +471,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 - *Tool order.* Spec key when a label documents the request, else a model endpoint key (`r`), else `http.<METHOD>`. Model endpoints: Anthropic `/v1/messages`, `/v1/messages/count_tokens`; OpenAI `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`; each `localLlm` host:port `/api/chat`, `/api/generate`, `/api/embed`, `/v1/chat/completions`, `/v1/completions`.
 - *Correction to B1 (content defaults).* bareguard's zero-config content word patterns scanned the URL and method before the mode letters. In every mode, `trust` included, they made PUT/PATCH/DELETE ask, made GETs with words like "remove" or "drop" ask, and denied a URL containing "TRUNCATE TABLE". `gateFor` now passes `content: { askPatterns: [], denyPatterns: [] }`, so the modes table is what happens. Evidence: found by the B2a worker's tests 4, 6 and 7, reproduced by the orchestrator against `c09283e`; details in `docs/logs/findings.md`, "M3 — B2a labels".
 - New dependency `rwxmap` 0.8.0 (exact). Verified: full suite 421/421 three times, 0 skip, typecheck clean; an `sbx run` smoke with an httpbin label folder (labelled PUT `w` passed in `auto` with no ask; unlabelled PUT asked, denied, 403; both PUTs 200 in `trust`; label folder not visible in the sandbox).
-- **B2b (next):** merge barebox's audit into `gate.jsonl` through `gate.record` and `gate.annotate`. bareguard buffers every `annotate()` fact until `drainAnnotations()` (measured: 1000 kept), so barebox must drain after each one.
+- **B2b, done (Oct 30), brief `docs/logs/m3-b2b-audit-brief.md`:** `gate.jsonl` is the one audit file, every line in bareguard's shape through a bareguard Gate (`record` for response status, `annotate` with `surface:false` for barebox's facts, `drainAnnotations()` after each). A body is logged as one `body` line (length + SHA-256, joined by `rid`); request headers and the preview are no longer logged (the preview is in the ask file only). Verified in a real shell: suite 432/432 three times, 0 skip; typecheck clean; live smoke (labelled PUT, asked-then-approved POST): one file, aid joins, correct hash, no secret in the file. Details in `docs/logs/findings.md`, "M3 — B2b one audit file".
 - **B2c (next):** the memory bench at 10, 20, 30 and 40 agents.
 
 **We build:**
@@ -502,7 +502,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 |---|---|---|---|---|
 | F1 | bareguard | `rwx.askOn` accepts only `"none"` or `"loose"`; a letter above the ceiling is denied, not asked. | M3 | **Resolved by bareguard**, agreed with the bareguard maintainer session and approved by the user: new optional `rwx.askUnheld` (see "Modes as bareguard config"). bareguard 0.29.0 is released and verified against npm; barebox depends on it exactly. A new bareguard ruling (#70). **Accepted Oct 29:** `askUnheld` at bareguard commit `fb0bd74` passed barebox's acceptance test (`poc/m3/askunheld.mjs`, 16/16; against 0.28.0 the same script fails 8). The test drives the gate directly with the proxy's action shape, not through the proxy's HTTP path. B1 wires it through the proxy's HTTP path. |
 | F2 | rwxmap | Labels are keyed `<vendor>.<operationId>`, but the proxy sees `METHOD` + URL. | M3 | **Resolved by rwxmap**, approved by the user: new entry `rwxmap/match` (see "Request keys"). Ships in rwxmap 0.8.0 (branch `feat/match-entry`, target Oct 31). rwxmap's bars: 0 differences vs `classifyCall` on its four corpora, import ≤ 1.5 MB, no slower per match, the fail-closed fallback tested by breaking it. |
-| F3 | bareguard | barebox's transport lines must land in the gate's audit file. | M3 | **Resolved, no new primitive**: `gate.record` for response status, `gate.annotate({ surface:false, ... })` for barebox's own facts. |
+| F3 | bareguard | barebox's transport lines must land in the gate's audit file. | M3 | **Resolved, no new primitive**: `gate.record` for response status, `gate.annotate({ surface:false, ... })` for barebox's own facts (built in B2b on 0.29.0). Asks for bareguard 0.30.0, shape agreed with the guard session Oct 30 (not built; needs the user's approval there; no date): a 256-fact cap on buffered annotations (`surface:false` evicted first, with an `annotate_dropped` phase); an oversize `meta` drops whole keys, largest first, with `_droppedKeys`, also at the 3500-byte line cap; docs only for the content defaults. barebox keeps calling `drainAnnotations()` even then (256 facts could reach about 350 KB per gate) and can drop its 900-byte fallback once 0.30.0 is pinned. |
 | F4 | bareguard | `isPrivateIp` misses NAT64, 6to4 and the uncompressed `::1` (verified against 0.27.0; barebox's wall covers them). | — | **Not in this release.** barebox's wall already covers all three. bareguard's view: Node's `new URL()` already shortens uncompressed `::1`, so that miss only bites raw-string calls. See `docs/logs/bareguard-isprivateip-spike.md`. |
 
 ### M4. Undo layer
@@ -595,7 +595,7 @@ Not sorted into the 10 days.
 - **Commit conflicts.** If the user edits the same files during a run, M4 flags the conflict. It does not merge.
 - **Held requests can time out on the server side.** Holding happens before forwarding, so only the agent's client waits.
 - **Card numbers in bodies over 64 KB are not checked.** Such bodies stream through with the normal letter and mode decision. Checking and denying them would break large uploads, because random 16-digit ids pass Luhn about 1 time in 10.
-- **API keys or passwords inside a body still appear in the 4 KB preview** (log and ask file). Card numbers are masked. bareguard's redaction covers common token shapes once the log moves to its format in M3. barebox builds no scrubber of its own.
+- **API keys or passwords inside a body still appear in the 4 KB preview** (ask file only; the audit file holds no preview). Card numbers are masked. bareguard's redaction covers common token shapes once it lands. barebox builds no scrubber of its own.
 - **Certificate pinning breaks inspection.** Out of scope.
 - **The proxy sees traffic, not intent.** Every API needs a mapping. File edits and local stdio MCP servers never touch the network. The undo layer and locked paths cover files. An MCP server running outside the sandbox with its own credentials is a hole.
 

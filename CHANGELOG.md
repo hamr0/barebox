@@ -16,7 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - bareguard decides every request: one `gate.check()` per request, one gate per agent (and one for the TCP door's `tcp` agent), all sharing one tools table. `src/policy.js` exports `MODES` and `gateFor`. Modes: `ask` holds `r--` and asks for w and x; `auto` holds `rw-` and asks for x; `trust` holds `rwx`. GET/HEAD are r; POST/PUT/PATCH/DELETE are x; any other method is denied (`rwx.unlisted`). Every request is the tool `http.<METHOD>` until rwxmap labels land.
 - The floor is two bareguard flags, `cardLike` and `paymentPath` (`/checkout`, `/payment`, `/orders`, `/purchase`), which ask in every mode, `trust` included.
 - `createProxy` option `gateFor(agent, { humanChannel })`: returns a bareguard `Gate` or any object with `async check(action)` resolving `{ outcome, rule?, reason? }`; `askHuman` from a plain object goes to the same hold queue. Without it nothing is checked.
-- bareguard's decisions are audited in `<runtime>/gate.jsonl` (`runtimePaths().gateAudit`); the proxy's own audit log is unchanged.
+- One audit file: `<runtime>/gate.jsonl` (`runtimePaths(runtime).audit`; `createProxy`'s `logFile` names it). Every line is in bareguard's shape. bareguard's gate lines carry the decision; a response status is a `record` line joined to its decision line by `aid`; barebox's own facts are `annotate` lines with `surface:false`, keyed by `verdict`: `deny`, `hold`, `decide`, `hold-abandoned`, `hold-queue-full`, `stale-answer`, `malformed-answer`, `body`, and `resp` in forward-all mode. A request with a body gets one `body` line with `meta: { agent, rid, bodyBytes, bodySha256 }`, joined to its gate line by `rid`.
+- A runtime-level audit-only `sbx` gate takes lines for agents whose gate is not built, and every line when `gateFor` is omitted. `close()` waits up to 3 s for pending audit writes; later lines are dropped.
+- `GateLike` gains optional `record`, `annotate` and `drainAnnotations`; `check` may return `aid`.
 - Config key `localLlm` and the `allowLocal` option of `run()` and `createProxy()`: exact `host:port` pairs (such as a local model server) pass the wall's private/loopback check; link-local (cloud metadata) never does. `checkUpstream` takes a port argument.
 - New dependency: `bareguard` 0.29.0 (exact).
 - rwxmap labels. Two config keys: `labels` (folders the rwxmap CLI wrote) and `tenants` (vendor -> server URLs, replacing placeholder hosts such as `your-domain.atlassian.net`). `src/labels.js` exports `loadLabels({ labels, tenants })`, which reads each `<v>.rwxmap.review.json` for request keys (via `rwxmap/match`). The letters come only from the matching `<v>.rwxmap.json` file's `bareguard.tools`, the file you review and can edit; rwxmap's own guessed letter is never used. A bad or missing label file fails `sbx run` before any agent starts.
@@ -28,8 +30,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - `hold.maxBody` now defaults to 52428800 (50 MB), was 1048576. A body over the cap is denied `403 body too large to hold`.
-- Audit-log `req` lines no longer carry `body` / `truncated`; they carry `bodyPreview` (the first 4 KB, card numbers masked except the last 4), `bodyBytes` and `bodySha256`.
-- The ask payload's `bodyPreview` is masked the same way (one function).
+- The audit file carries a body's length and SHA-256 only (the `body` line), never its content. The ask payload carries the 4 KB `bodyPreview` (card numbers masked except the last 4).
+- Long audit fields are cut before they reach bareguard (`url` to 400 characters, `note` and `reason` to 200), so the ids that join an ask to its outcome survive bareguard's 1000-byte `meta` limit.
 - A denial reads `403 denied: <rule>[: reason]`; an ask carries the gate's rule (`rwx.ask`, `flags.cardLike`, `flags.paymentPath`) and letter. The card floor's rule is now `flags.cardLike`, not `card number in body (floor)`.
 - Request bodies of 64 KB or less are read in the agent's working slot before the gate decides; a waiting request's body is spooled to `<runtime>/held/<id>` when it enters the hold line.
 - `holds.add` takes `preview`, `bodyBytes` and `bodyFile` in place of `body` (internal shape).
@@ -37,11 +39,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Removed
 
 - **Breaking:** the `createProxy` option `maxLogBody`.
+- **Breaking:** the separate `<runtime>/audit.jsonl` and the `runtimePaths().gateAudit` path; `runtimePaths().audit` is now `gate.jsonl`.
+- The `req` audit line and request-header logging: no request header is written to the audit file. `scrubSecrets` and `SENSITIVE_HEADERS` are gone; the `redact` hook stays and now shapes annotate `meta`.
 - **Breaking:** `hold.shouldHold` and `hold.match` (replace with `gateFor`); `run()`'s internal `shouldHoldForMode` and `holds.js`'s `matchPath` / `ShouldHold` type.
 
 ### Security
 
-- Card numbers no longer land verbatim in the audit log or the ask files. Known gap: other secrets inside a body still show in the 4 KB preview until bareguard redaction lands.
+- The audit file holds no request header and no body content. Card numbers are masked in the ask files' 4 KB preview. Known gap: other secrets inside a body still show in the ask file's preview until bareguard redaction lands.
 - The config file is hidden inside the sandbox wherever it resolves (the mask follows `XDG_CONFIG_HOME`).
 - Label folders are hidden inside the sandbox the same way, so the agent cannot rewrite a letter for the next run.
 - The modes decide, with no keyword patterns: the gate runs with empty content patterns, so no word in a URL or method (`remove`, `drop`, `TRUNCATE TABLE`) asks or denies on its own. Only the mode letters, the labels and the floor (card number, payment path) decide.

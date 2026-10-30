@@ -146,13 +146,40 @@ resolves `{ outcome: "allow" | "deny" | "askHuman", rule?, reason? }`;
 `askHuman` from a plain object goes to the same queue. Without `gateFor`
 nothing is checked and everything forwards. `policy.js` exports `MODES` and
 `gateFor({ agent, mode, auditPath, humanChannel })`. bareguard writes its
-decisions to `<runtime>/gate.jsonl` (`runtimePaths(runtime).gateAudit`); the
-proxy's own `logFile` is separate. `close()` waits up to 3 s for requests
+decisions to `<runtime>/gate.jsonl`, the one audit file (see "The audit file"
+below). `close()` waits up to 3 s for requests
 still inside a `check()`.
 
 `localLlm` (config key; `allowLocal` on `run()` and `createProxy()`) is an
 array of `"host:port"` strings. Only those exact pairs pass the wall's
 private/loopback check, never link-local (cloud metadata).
+
+## The audit file
+
+`<runtime>/gate.jsonl` (`runtimePaths(runtime).audit`; `run()` returns it as
+`audit`) is the only log, one JSON object per line, all in bareguard's shape.
+- Decisions: bareguard's gate lines carry the action (`method`, `url`, `tool`,
+  `agent`, `rid`) and an `aid`.
+- Response status: a `phase:"record"` line with the same `aid` and
+  `result.status`.
+- barebox's own facts: `phase:"annotate"`, `surface:false`, keyed by `verdict`:
+  `deny`, `hold`, `decide`, `hold-abandoned`, `hold-queue-full`, `stale-answer`,
+  `malformed-answer`, `body`, and `resp` (forward-all mode, no gate). A hold and
+  its outcome share `meta.id`; a request with a body gets one `body` line,
+  `meta: { agent, rid, bodyBytes, bodySha256 }`, joined to its gate line by
+  `action.rid`.
+- Lines for an agent whose gate is not built, and every line when `gateFor` is
+  omitted, are written by a runtime-level `sbx` gate (`meta.agent` names the
+  agent).
+
+```bash
+# every request with its response status, joined by aid
+jq -s 'group_by(.aid)[] | select(.[0].aid) | {url: .[0].action.url, status: (map(.result.status) | map(select(.)) | first)}' <runtime>/gate.jsonl
+# a request's body size and hash, joined by rid
+jq -c 'select(.verdict=="body") | .meta' <runtime>/gate.jsonl
+# one ask from hold to decision
+jq -c 'select(.meta.id=="h1")' <runtime>/gate.jsonl
+```
 
 ## Labels and model endpoints
 
@@ -221,7 +248,7 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
 - Certificates live in `<runtime>/certs` (`runtime` is required). There is no `certDir` option and no control socket: decisions flow through `<runtime>/asks` + `<runtime>/answers` or `hold.onAsk`. Each minted certificate gets a random 128-bit serial (no shared `ca.srl`), and at most 4 mints run at once.
 - The TCP door is one agent: every connection through `createProxy`'s TCP `port` counts as the agent `tcp` and shares one hold line. Use `addAgent` sockets (`sbx run` does) for separate lines per agent. `removeAgent(name)` ends that agent's open connections; its held requests end as deny / client gone. `run()` calls it when the sandbox exits, so a request still held then ends as client gone, not `proxy closing`.
 - The upstream wall answers `403` for loopback, link-local (incl. `169.254.169.254`), the host's own addresses, private LAN ranges and unresolvable names. An IPv4 embedded in IPv6 is checked in every spelling: mapped, compat, uncompressed, NAT64 `64:ff9b::/96` (local-use `/48` denied outright) and 6to4 `2002::/16`; NAT64 and 6to4 of public sites stay reachable. Every DNS answer is checked and the dial is pinned to the checked IP; test-only options live under `unsafeTestOnly` (`allowLoopback`, `resolveUpstream`) and production never sets them.
-- `createProxy` throws synchronously on an unopenable `logFile` (a directory, a missing parent, no permission) and releases the runtime. The runtime root, `asks/`, `answers/`, `held/` and `socks/` are owner-only (`0700`) whatever the umask. An existing runtime dir you own is tightened to `0700`; one you don't own (such as `/tmp`) is refused with an error naming the dir and its owner and suggesting a subdir like `/tmp/sbx`. The audit log (`logFile`) is set to `0600` every time a proxy starts. The values of `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Auth-Token` and `Api-Key` are logged as `[redacted]`; other headers are logged as-is unless your `redact` hook shapes them (it runs after the built-in scrub). Request bodies are not logged whole: each `req` line carries `bodyPreview` (the first 4 KB, card numbers masked except the last 4), `bodyBytes` and `bodySha256`, and the ask payload's `bodyPreview` is masked the same way. Other secrets inside a body still show in the preview until bareguard redaction lands.
+- `createProxy` throws synchronously on an unopenable `logFile` (a directory, a missing parent, no permission) and releases the runtime. The runtime root, `asks/`, `answers/`, `held/` and `socks/` are owner-only (`0700`) whatever the umask. An existing runtime dir you own is tightened to `0700`; one you don't own (such as `/tmp`) is refused with an error naming the dir and its owner and suggesting a subdir like `/tmp/sbx`. The audit file (`logFile`, `gate.jsonl`) is set to `0600` every time a proxy starts. No request header and no body content is written to it: a body is logged as its length and SHA-256 only. The ask payload's `bodyPreview` (the first 4 KB, card numbers masked except the last 4) lives in the ask file only; other secrets inside a body still show there until bareguard redaction lands. Your `redact` hook shapes the `meta` of barebox's own annotate lines.
 - One proxy per runtime: `createProxy` throws "in use by pid N" (`run()` rejects, `sbx run` exits 1) while a live proxy owns the runtime. The claim is held by the proxy process and the kernel frees it when the process dies, so a crashed proxy never blocks the runtime. Use another `SBX_RUNTIME`, or leave it unset for a fresh one.
 - `launch()` starts the agent in the project dir, in a new session (no controlling terminal). Locked drawers are 21 credential stores (see `LOCKED_PATHS` in `src/launcher.js`); the agent's own model credentials in `~/.claude` stay readable until keys move out of its reach.
 - `sbx` exits 0 ok, 1 unknown id / refused / no live proxy / run failure, 2 usage; `sbx run` mirrors the agent's exit code.

@@ -246,3 +246,16 @@ Finding: bareguard's zero-config content patterns scanned the URL and method bef
 So the B1 modes table was not what happened. How it was found: the B2a worker's tests 4, 6 and 7 (labelled PUT in `auto`, deleted gate row in `trust`, matched PUT through the proxy) failed for reasons that were not the labels. The orchestrator reproduced it against `c09283e` with the proxy's action shape. Fix: `gateFor` passes `content: { askPatterns: [], denyPatterns: [] }`; the keyword patterns are gone and only mode letters, labels and the floor decide.
 
 Smoke (`sbx run`, httpbin label folder): `auto` labelled PUT (`w`) 200 with no ask; unlabelled PUT asked (`rwx.ask`), denied by the user, 403; `trust` both PUTs 200; `GET /anything/remove-item` 200 in both modes; `POST api.anthropic.com/v1/messages` allowed as tool `api.anthropic.com.POST /v1/messages`; the label folder was not visible inside the sandbox.
+
+## M3 — B2b one audit file (Oct 30)
+
+Part B2b makes `<runtime>/gate.jsonl` the only audit file. Brief: `docs/logs/m3-b2b-audit-brief.md`. Verified in a real shell: full suite 432/432 three times, 0 skip, typecheck clean, `primitives.json` current. Live smoke in `auto` mode: a labelled PUT and an asked-then-approved POST, each with a body. One file, no `audit.jsonl`; each request's gate and record lines share an `aid`; hold and decide join on id `h1`; the `body` line's SHA-256 is the correct hash of "hello"; a fake bearer token and the body text appear 0 times in `gate.jsonl`.
+
+Measured facts about bareguard 0.29.0:
+- `annotate` keeps every fact in memory until `drainAnnotations()`: 1000 calls left 1000 buffered, kept in full. barebox drains after every annotate.
+- A `meta` over 1000 bytes is replaced whole by `{ _truncated: true, bytes }`, so every key in it is lost. barebox cuts `url` to 400 characters and `note`/`reason` to 200, with a 900-byte fallback that keeps the join ids.
+- A 6 KB URL in `action` is clipped to 211 characters in the gate line; `rid` and `aid` survive.
+
+Decision (user, Oct 30): the audit file holds a body's length and SHA-256 only, with no preview and no request headers. The 4 KB masked preview lives in the ask file only. This replaces the PRD's earlier "each request line carries a 4 KB preview".
+
+Upstream: shape agreed with the guard session for bareguard 0.30.0 (not built; needs the user's approval there; no date): a 256-fact cap (`surface:false` evicted first, `annotate_dropped` phase); oversize `meta` drops whole keys, largest first, with `_droppedKeys`, also at the 3500-byte line cap; docs only for the content defaults. barebox keeps the drain on 0.30.0 (256 facts could reach about 350 KB per gate against a budget of about 0.34 MB per agent).
