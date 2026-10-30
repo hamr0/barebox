@@ -72,6 +72,9 @@ export async function gateFor({ agent, mode, auditPath, humanChannel }) {
   const gate = new Gate({
     audit: { path: auditPath },
     rwx: { agent, agents: { [agent]: letters }, tools: TOOLS, askUnheld },
+    // The mode letters plus the card/payment floor are the whole policy; bareguard's
+    // default word patterns scan the URL and method and would fire before rwx.
+    content: { askPatterns: [], denyPatterns: [] },
     flags: FLAGS,
     humanChannel,
   });
