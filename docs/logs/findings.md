@@ -151,6 +151,8 @@ Lesson: measure the proxy in its own process before sizing a budget from it.
 
 ## M3 — memory, round 2 (Oct 29)
 
+> Superseded Oct 30: this test had no real HTTP traffic; see "M3 — B2c memory bench (Oct 30)" below. Kept as history.
+
 POC `poc/m3/rss2.mjs` + `proxy-host.mjs`. The proxy runs in its own child process. The
 parent hosts the 20 sandboxes and the 360 hold sockets, and reads the child's VmRSS from
 /proc after the child forces GC. 2 variants x 3 runs, real shell, nothing skipped, all
@@ -259,3 +261,64 @@ Measured facts about bareguard 0.29.0:
 Decision (user, Oct 30): the audit file holds a body's length and SHA-256 only, with no preview and no request headers. The 4 KB masked preview lives in the ask file only. This replaces the PRD's earlier "each request line carries a 4 KB preview".
 
 Upstream: shape agreed with the guard session for bareguard 0.30.0 (not built; needs the user's approval there; no date): a 256-fact cap (`surface:false` evicted first, `annotate_dropped` phase); oversize `meta` drops whole keys, largest first, with `_droppedKeys`, also at the 3500-byte line cap; docs only for the content defaults. barebox keeps the drain on 0.30.0 (256 facts could reach about 350 KB per gate against a budget of about 0.34 MB per agent).
+
+## M3 — B2c memory bench (Oct 30)
+
+Part B2c measures the proxy at 10 / 20 / 30 / 40 agents in the full worst case. Brief: `docs/logs/m3-b2c-bench-brief.md`. Script: `npm run bench:agents`. All numbers measured by the orchestrator in a real shell on Oct 30.
+
+Method: the proxy in its own process with forced GC, real gates, a 170-operation label tools table. Every agent at the worst case at once: 1 parked + 16 waiting + 1 turned away with 429 + the working slot filled, all with 64 KB bodies.
+
+First run (bareguard 0.29.0). Proxy RSS:
+
+| Agents | RSS MB |
+|---|---|
+| 10 | 141.9 |
+| 20 | 318.3 (374 on a quiet machine) |
+| 30 | 290.1 |
+| 40 | 383.6 |
+
+Gate asks ran at about 3.5 per second.
+
+**Cause 1, upstream.** bareguard `gate.haltContext()` (gate.js:2163, called while building every ask event) called `audit.readAll()`: it read and parsed the whole shared audit file once per ask.
+- At 20 agents that was 380 full reads, 3.68 GB in total, with JS heap peaking at 776 MB against 16 MB live.
+- Each ask cost O(file size), so asks over a run cost O(n²), and one agent's traffic slowed every agent's asks.
+- It also explains why `--max-old-space-size=48` crashed with "heap out of memory".
+- Proof: a temp patch that skipped the read gave 96 / 118 / 124 / 146 MB.
+- Fix: bareguard ruling #72 (each gate keeps a running tally and reads only the bytes added since its last read), built at 943732e on feat/annotate-bounds for 0.30.0, together with ruling #71 (annotate buffer cap, key-drop meta bound).
+- On 943732e: 99.5 / 114.4 / 124.3 / 143.6 MB, peak heap 24-31 MB, drift +0.8 MB over 7200 more requests.
+- Not verified by barebox: guard's claim of about 20 file walks instead of 380. The read counter could not see the new chunked reads; the low peak heap is the evidence.
+- 0.30.0 was not on npm at the time of writing, so it is not pinned.
+
+**Cause 2, barebox.** Held bodies stayed in memory after being spooled to disk, because the `readBounded` result object kept a reference to the chunk array in the awaiting frame. Fixed with a `readWorkBody(ctx)` helper. Test: 68 held bodies, `arrayBuffers` growth fell from 4.6 MB (106% of the bodies) to 0.28 MB. At 360 bodies it was 29 MB before and 1.4 MB after.
+
+**Ruled out, with numbers:**
+- glibc arenas: `MALLOC_ARENA_MAX=1` gave 109-114 MB, no real change
+- malloc trim settings
+- tools table size: 170 vs 2000 ops gave the same RSS
+- plain Node sockets and file streams
+- `--optimize-for-size`, which saves about 3-6 MB once the upstream bug is fixed
+
+**Where 117 MB goes at 20 agents** (with the read skipped):
+
+| Part | MB |
+|---|---|
+| shared Node runtime code (libnode) | 52.7 |
+| native C heap (sockets, parsers, per-connection state) | about 32 |
+| V8 heap pages | about 25 |
+| other | about 7 |
+
+So 80 MB is not reachable on Node.
+
+**Normal use** (agents joined, 3600 allowed requests, no holds): 83-87 MB. The PRD's earlier 76.4 MB "round 2" figure (above, "M3 — memory, round 2") came from a test with no real HTTP, so it is superseded.
+
+**Scaling.** About 1.4 MB per agent at the proxy (a straight-line estimate over 4 points), plus about 8 MB per sandbox for walls (max 8.0, mean 7.8; limit 10). With bareguard's bug the growth was superlinear (quadratic in asks over a run). With the fix it is linear.
+
+**Comparison with srt** (sandbox-runtime 0.0.81, measured earlier in the PRD: about 100 MB per sandbox because each runs its own proxy):
+
+| Agents | barebox worst case (proxy + 8 MB per sandbox) | srt |
+|---|---|---|
+| 10 | ~180 MB | ~1 GB |
+| 20 | ~274 MB | ~2 GB |
+| 40 | ~464 MB | not measured |
+
+**Decision (user, Oct 30).** Proxy budget 150 MB in the full worst case at 40 agents; 80 MB retired. barebox targets small teams. 40 agents per proxy is the maximum, enforced: `addAgent` refuses the 41st with an error saying to run another proxy; the `tcp` door does not count; `removeAgent` frees a place. Above 40, an orchestrator runs more proxies. Walls stay at 10 MB per sandbox.
