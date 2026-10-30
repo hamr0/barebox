@@ -20,7 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - A runtime-level audit-only `sbx` gate takes lines for agents whose gate is not built, and every line when `gateFor` is omitted. `close()` waits up to 3 s for pending audit writes; later lines are dropped.
 - `GateLike` gains optional `record`, `annotate` and `drainAnnotations`; `check` may return `aid`.
 - Config key `localLlm` and the `allowLocal` option of `run()` and `createProxy()`: exact `host:port` pairs (such as a local model server) pass the wall's private/loopback check; link-local (cloud metadata) never does. `checkUpstream` takes a port argument.
-- New dependency: `bareguard` 0.29.0 (exact).
+- New dependency: `bareguard` 0.30.0 (exact).
 - rwxmap labels. Two config keys: `labels` (folders the rwxmap CLI wrote) and `tenants` (vendor -> server URLs, replacing placeholder hosts such as `your-domain.atlassian.net`). `src/labels.js` exports `loadLabels({ labels, tenants })`, which reads each `<v>.rwxmap.review.json` for request keys (via `rwxmap/match`). The letters come only from the matching `<v>.rwxmap.json` file's `bareguard.tools`, the file you review and can edit; rwxmap's own guessed letter is never used. A bad or missing label file fails `sbx run` before any agent starts.
 - The tool for a request is the label's key when a label documents it, else a model endpoint key (`r`), else `http.<METHOD>`. A key a label documents but the gate file lacks (a row you deleted) is denied (`rwx.unlisted`).
 - Model endpoints are `r`: Anthropic `/v1/messages` and `/v1/messages/count_tokens`; OpenAI `/v1/chat/completions`, `/v1/responses` and `/v1/embeddings`; and on each `localLlm` host:port `/api/chat`, `/api/generate`, `/api/embed`, `/v1/chat/completions` and `/v1/completions` (http only).
@@ -42,7 +42,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Known
 
-- `npm run bench:agents` needs bareguard 0.30.0 to meet 150 MB. 0.29.0, which is pinned, re-reads the whole audit file on every ask and measured 318 MB at 20 agents. 0.30.0 is not yet pinned.
+- At 40 agents the worst case measures 145–148 MB, close to the 150 MB budget. The first ask of each gate walks the existing audit file, and one 20-agent run after a 51 MB audit file measured 144.8 MB on a busy machine, so a very long run may cost more than these figures. Under 54,000 more allowed requests memory stayed flat (98.7–99.0 MB).
 
 ### Removed
 

@@ -197,6 +197,8 @@ The proxy ran in its own child process, with GC forced before each reading. With
 | 20 | ~274 MB | ~2 GB |
 | 40 | ~464 MB | not measured |
 
+**Final on published bareguard 0.30.0 (clean runs):** 99.0–100.2 / 112.7–116.0 / 126.8–133.4 / 145.0–147.7 MB at 10 / 20 / 30 / 40 agents. Memory stayed flat over 54,000 more requests. Open: one reading of 144.8 MB at 20 agents after a 51.6 MB audit file suggests the worst case may depend on audit file size; see `docs/logs/findings.md`.
+
 **Decision (user, Oct 30):** the proxy budget is 150 MB in the full worst case at 40 agents; 80 MB is retired. barebox targets small teams. 40 agents per proxy is the maximum, enforced: `addAgent` refuses the 41st with an error that says to run another proxy; the `tcp` door does not count; `removeAgent` frees a place. The bench fails when any reading at up to 40 agents exceeds 150 MB or any walls reading exceeds 10 MB. Go/no-go (c) is re-decided at this budget: met at 143.6 MB with bareguard 0.30.0.
 
 ### Baseline
@@ -590,7 +592,7 @@ This is a plan, not a result. It shifts as POCs return. Review cap per module: o
 | 2 | Oct 27 | Graduation rewrite, reviews, rewrite bench (done) | Branch review: ready |
 | 3 | Oct 28 | M2.5 ask seam, M4 undo layer, hardening, release 0.4.0 (done) | 0.4.0 on npm |
 | 4 | Oct 29 | M3 scoping, memory POC (rounds 1 and 2 done) | |
-| 5–6 | Oct 30–31 | M3 build and review. bareguard 0.29.0 and rwxmap 0.8.0 land upstream. | Proxy ≤ 150 MB at 40 agents with bareguard 0.30.0 (re-decided Oct 30; was ≤ 80 MB) |
+| 5–6 | Oct 30–31 | M3 build and review. bareguard 0.29.0 and rwxmap 0.8.0 land upstream. | Proxy ≤ 150 MB at 40 agents on bareguard 0.30.0, pinned (145–148 MB measured; re-decided Oct 30; was ≤ 80 MB) |
 | 7 | Nov 1 | M5 (keys) | |
 | 8 | Nov 2 | M6 numbers. Demo B. | Memory targets measured |
 | 9 | Nov 3 | Demo A, README. Freeze in the evening. | |

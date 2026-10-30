@@ -322,3 +322,20 @@ So 80 MB is not reachable on Node.
 | 40 | ~464 MB | not measured |
 
 **Decision (user, Oct 30).** Proxy budget 150 MB in the full worst case at 40 agents; 80 MB retired. barebox targets small teams. 40 agents per proxy is the maximum, enforced: `addAgent` refuses the 41st with an error saying to run another proxy; the `tcp` door does not count; `removeAgent` frees a place. Above 40, an orchestrator runs more proxies. Walls stay at 10 MB per sandbox.
+
+### Final numbers on published bareguard 0.30.0 (Oct 30)
+
+Suite 436/436, 3 runs, 0 skip. The published release has two changes after the tested commit 943732e, so the bench was rerun.
+
+| Agents | Clean run 1 | Clean run 2 |
+|---|---|---|
+| 10 | 99.0 | 100.2 |
+| 20 | 112.7 | 116.0 |
+| 30 | 126.8 | 133.4 |
+| 40 | 145.0 | 147.7 |
+
+Both clean runs pass at 150 MB, with 2–5 MB to spare at 40 agents. A run at load average 38–54 read 154.0 MB at 40 agents and is discarded as load noise, but it shows how thin the margin is.
+
+Drift over 7200 requests read +0.8, +3.5, +2.4, +1.1 and +4.8 MB across five runs. A long run settled it: 20 agents, 61,200 allowed requests, RSS 98.7 to 99.0 MB over the first 54,000, heap flat at about 12 MB, so no steady leak. RSS then stepped to 114.0 MB with the heap still flat, on a busy machine (load about 30); that step is unexplained.
+
+Open: the same long run read 144.8 MB in the 20-agent worst case with a 51.6 MB audit file, against 113–116 MB after a short run. Each gate's first ask walks the existing file, so the worst case may depend on audit file size. Load was also high, so this is one reading, not a measurement. The 40-agent case after a long run is unmeasured and could exceed 150 MB.

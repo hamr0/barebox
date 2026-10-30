@@ -82,13 +82,13 @@ Measured, not estimated. Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22.
 | | barebox (measured) | [srt](https://github.com/anthropic-experimental/sandbox-runtime) 0.0.81 (measured) |
 |---|---|---|
 | Memory per sandbox | **7.8 MB** mean, 8.0 MB max | ~100 MB (each sandbox runs its own proxy) |
-| Proxy | one shared: **~84-87 MB** in normal use; **99.5 / 114.4 / 124.3 / 143.6 MB** at 10 / 20 / 30 / 40 agents in the full worst case (each agent with 1 parked + 16 waiting + a filled body slot) | one per sandbox |
+| Proxy | one shared: **~84-87 MB** in normal use; **about 100 / 114 / 130 / 146 MB** at 10 / 20 / 30 / 40 agents in the full worst case (each agent with 1 parked + 16 waiting + a filled body slot) | one per sandbox |
 | Start + exit | **10 ms** (M0 POC; unmeasured on the rewrite, TODO re-measure) | 1.87-2.05 s |
 | 10 agents | ~180 MB worst case (proxy + 10 x 8 MB) | ~1 GB |
 | 20 agents | ~274 MB worst case | ~2 GB |
-| 40 agents | ~464 MB worst case | not measured |
+| 40 agents | ~466 MB worst case | not measured |
 
-barebox is for small teams. Budget: shared proxy 150 MB in the full worst case at 40 agents, each extra sandbox 10 MB or less. 40 agents per proxy is the maximum and it is enforced: `addAgent` refuses the 41st with an error telling you to run another proxy. Above 40, run more proxies. The worst-case proxy figures need bareguard 0.30.0 (0.29.0 re-read the whole audit file on every ask and measured 318 MB at 20 agents). Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/logs/findings.md).
+barebox is for small teams. Budget: shared proxy 150 MB in the full worst case at 40 agents, each extra sandbox 10 MB or less. 40 agents per proxy is the maximum and it is enforced: `addAgent` refuses the 41st with an error telling you to run another proxy. Above 40, run more proxies. At 40 agents the worst case measured 145–148 MB on bareguard 0.30.0 and is close to the budget; a very long audit file can add to it. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/logs/findings.md).
 
 ## Roadmap
 
