@@ -19,6 +19,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - bareguard's decisions are audited in `<runtime>/gate.jsonl` (`runtimePaths().gateAudit`); the proxy's own audit log is unchanged.
 - Config key `localLlm` and the `allowLocal` option of `run()` and `createProxy()`: exact `host:port` pairs (such as a local model server) pass the wall's private/loopback check; link-local (cloud metadata) never does. `checkUpstream` takes a port argument.
 - New dependency: `bareguard` 0.29.0 (exact).
+- rwxmap labels. Two config keys: `labels` (folders the rwxmap CLI wrote) and `tenants` (vendor -> server URLs, replacing placeholder hosts such as `your-domain.atlassian.net`). `src/labels.js` exports `loadLabels({ labels, tenants })`, which reads each `<v>.rwxmap.review.json` for request keys (via `rwxmap/match`). The letters come only from the matching `<v>.rwxmap.json` file's `bareguard.tools`, the file you review and can edit; rwxmap's own guessed letter is never used. A bad or missing label file fails `sbx run` before any agent starts.
+- The tool for a request is the label's key when a label documents it, else a model endpoint key (`r`), else `http.<METHOD>`. A key a label documents but the gate file lacks (a row you deleted) is denied (`rwx.unlisted`).
+- Model endpoints are `r`: Anthropic `/v1/messages` and `/v1/messages/count_tokens`; OpenAI `/v1/chat/completions`, `/v1/responses` and `/v1/embeddings`; and on each `localLlm` host:port `/api/chat`, `/api/generate`, `/api/embed`, `/v1/chat/completions` and `/v1/completions` (http only).
+- `src/policy.js` exports `buildTools`, `toolFor` and `emptyMatcher`; `gateFor` takes `tools`; `createProxy` and `run()` take `labels`; `launch()` takes `maskDirs`.
+- New dependency: `rwxmap` 0.8.0 (exact). Label files written before rwxmap 0.8.0 fail to load with rwxmap's "regenerate" message.
 
 ### Changed
 
@@ -38,6 +43,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Card numbers no longer land verbatim in the audit log or the ask files. Known gap: other secrets inside a body still show in the 4 KB preview until bareguard redaction lands.
 - The config file is hidden inside the sandbox wherever it resolves (the mask follows `XDG_CONFIG_HOME`).
+- Label folders are hidden inside the sandbox the same way, so the agent cannot rewrite a letter for the next run.
+- The modes decide, with no keyword patterns: the gate runs with empty content patterns, so no word in a URL or method (`remove`, `drop`, `TRUNCATE TABLE`) asks or denies on its own. Only the mode letters, the labels and the floor (card number, payment path) decide.
 
 ## [0.4.0] - 2026-10-29
 

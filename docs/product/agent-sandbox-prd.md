@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Name: barebox (CLI `sbx`).
-> Status: M0–M2 PASS. **barebox 0.4.0 is on npm** (provenance-signed); M2.5 (ask seam), M4 (undo layer) and the hardening branch are released. M3 is in progress on branch `m3` (design decided Oct 29; memory POC rounds 1 and 2, part A, bodies and part B1 done — bareguard decides every request; B2 waits on rwxmap 0.8.0). Next: M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M0–M2 PASS. **barebox 0.4.0 is on npm** (provenance-signed); M2.5 (ask seam), M4 (undo layer) and the hardening branch are released. M3 is in progress on branch `m3` (design decided Oct 29; memory POC rounds 1 and 2, part A, bodies and parts B1 and B2a done — bareguard decides every request; labels and model endpoints are wired; B2b and B2c are next). Next: M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 2026 until the cutoff on **Nov 5 2026, 01:00 Amsterdam time (CET, GMT+1)**. Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -464,6 +464,15 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 - The audit log no longer stores whole bodies (today up to 1 MB verbatim, kept in memory per request while it streams). Each request line carries a 4 KB body preview with card numbers masked except the last 4 digits, plus the full body length and a SHA-256 hash. The ask file uses the same 4 KB masked preview (one function makes both).
 - Known gap: API keys or passwords inside a body still appear in the preview. bareguard's redaction covers common token shapes once the log moves to bareguard's format in M3. barebox does not build its own secret scrubber.
 - Known gap: compressed (gzip) bodies are not checked.
+
+**Part B2a, done (Oct 30), brief `docs/logs/m3-b2a-labels-brief.md`.** Decided by the user Oct 30:
+- *The gate file's letters win.* The letters come only from `<v>.rwxmap.json`'s `bareguard.tools` (the file the user reviews and can edit); rwxmap's guessed letter is never used. A spec key the gate file lacks is denied (fail closed).
+- *Key names.* `labels` (folders the rwxmap CLI wrote) and `tenants` (vendor -> server URLs, replacing placeholder hosts) in the one config file. Label folders are masked inside the sandbox.
+- *Tool order.* Spec key when a label documents the request, else a model endpoint key (`r`), else `http.<METHOD>`. Model endpoints: Anthropic `/v1/messages`, `/v1/messages/count_tokens`; OpenAI `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`; each `localLlm` host:port `/api/chat`, `/api/generate`, `/api/embed`, `/v1/chat/completions`, `/v1/completions`.
+- *Correction to B1 (content defaults).* bareguard's zero-config content word patterns scanned the URL and method before the mode letters. In every mode, `trust` included, they made PUT/PATCH/DELETE ask, made GETs with words like "remove" or "drop" ask, and denied a URL containing "TRUNCATE TABLE". `gateFor` now passes `content: { askPatterns: [], denyPatterns: [] }`, so the modes table is what happens. Evidence: found by the B2a worker's tests 4, 6 and 7, reproduced by the orchestrator against `c09283e`; details in `docs/logs/findings.md`, "M3 — B2a labels".
+- New dependency `rwxmap` 0.8.0 (exact). Verified: full suite 421/421 three times, 0 skip, typecheck clean; an `sbx run` smoke with an httpbin label folder (labelled PUT `w` passed in `auto` with no ask; unlabelled PUT asked, denied, 403; both PUTs 200 in `trust`; label folder not visible in the sandbox).
+- **B2b (next):** merge barebox's audit into `gate.jsonl` through `gate.record` and `gate.annotate`. bareguard buffers every `annotate()` fact until `drainAnnotations()` (measured: 1000 kept), so barebox must drain after each one.
+- **B2c (next):** the memory bench at 10, 20, 30 and 40 agents.
 
 **We build:**
 1. **The action barebox hands the gate**: `{ type: "net", tool: <rwxmap request key, or http.<METHOD>>, url, method, agent, cardLike?, paymentPath? }`. No letter.

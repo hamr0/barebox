@@ -233,3 +233,16 @@ Smoke test (orchestrator, real internet): `sbx run --mode auto --json -- bash -c
 Concurrent audit writes (20 gates, one `gate.jsonl`): safe by reading, not stress-tested. bareguard's audit writer appends each line with one `appendFile` in append mode on Linux (`node_modules/bareguard/src/primitives/audit.js:575`) and caps a line at 3500 bytes (`MAX_LINE_BYTES`, `audit.js:11`), under the 4096-byte PIPE_BUF its comment cites. The code comment relies on the kernel keeping such appends whole. One file per agent was not needed on that reading; a concurrent stress test is in the fix ledger.
 
 Still separate: barebox's `audit.jsonl` and bareguard's `gate.jsonl`. They merge in B2.
+
+## M3 — B2a labels (Oct 30)
+
+Part B2a adds rwxmap labels, model endpoints (`r`) and the `labels` / `tenants` config keys. Brief: `docs/logs/m3-b2a-labels-brief.md`. Verified in a real shell: full suite 421/421 three times, 0 skip, typecheck clean.
+
+Finding: bareguard's zero-config content patterns scanned the URL and method before the mode letters (B1, `c09283e`). In every mode, `trust` included:
+- PUT, PATCH and DELETE asked;
+- a GET with a word like "remove" or "drop" in its URL asked;
+- a URL containing "TRUNCATE TABLE" was denied.
+
+So the B1 modes table was not what happened. How it was found: the B2a worker's tests 4, 6 and 7 (labelled PUT in `auto`, deleted gate row in `trust`, matched PUT through the proxy) failed for reasons that were not the labels. The orchestrator reproduced it against `c09283e` with the proxy's action shape. Fix: `gateFor` passes `content: { askPatterns: [], denyPatterns: [] }`; the keyword patterns are gone and only mode letters, labels and the floor decide.
+
+Smoke (`sbx run`, httpbin label folder): `auto` labelled PUT (`w`) 200 with no ask; unlabelled PUT asked (`rwx.ask`), denied by the user, 403; `trust` both PUTs 200; `GET /anything/remove-item` 200 in both modes; `POST api.anthropic.com/v1/messages` allowed as tool `api.anthropic.com.POST /v1/messages`; the label folder was not visible inside the sandbox.

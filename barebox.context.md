@@ -108,6 +108,7 @@ agent's.
 (positive integer) and `localLlm` (array of `"host:port"`). A flag beats the file, the file beats the default; an
 unknown key, bad value or bad JSON exits 2 naming the file and key. The file
 is hidden inside the sandbox wherever it resolves. The library does not read it.
+Two more keys, `labels` and `tenants`, are described under "Labels and model endpoints".
 
 ## Modes and the gate
 
@@ -122,8 +123,10 @@ table. The mode picks the agent's rwx letters:
 | `trust` | `rwx` | nothing |
 
 `GET`/`HEAD` are `r`; `POST`/`PUT`/`PATCH`/`DELETE` are `x`; any other method
-is denied in every mode (`rwx.unlisted`). Until rwxmap labels arrive every
-request is the tool `http.<METHOD>`. The floor is two bareguard flags,
+is denied in every mode (`rwx.unlisted`). Without a label a request is the tool
+`http.<METHOD>` (see "Labels and model endpoints"). The gate runs with empty
+content patterns, so no word in a URL or method asks or denies on its own: the
+mode letters, the labels and the floor decide. The floor is two bareguard flags,
 `cardLike` (a body of 64 KB or less holding a card number: 13-19 digits,
 optional single space or dash, first digit 2-6, Luhn-valid) and `paymentPath`
 (`/checkout`, `/payment`, `/orders`, `/purchase`); both ask in every mode,
@@ -150,6 +153,41 @@ still inside a `check()`.
 `localLlm` (config key; `allowLocal` on `run()` and `createProxy()`) is an
 array of `"host:port"` strings. Only those exact pairs pass the wall's
 private/loopback check, never link-local (cloud metadata).
+
+## Labels and model endpoints
+
+Two config keys turn on rwxmap labels. `labels` is an array of folders the
+rwxmap CLI wrote (`rwxmap <spec> -o <dir> --vendor <v>`); a leading `~/` means
+`$HOME`. `tenants` is `{ "<vendor>": ["https://tenant.example.com"] }` (a
+non-empty array of http(s) URLs per vendor); it replaces that vendor's server
+URLs, so a placeholder host such as `your-domain.atlassian.net` matches your
+tenant. A `tenants` vendor that no label folder defines is an error.
+
+`loadLabels({ labels, tenants })` (`src/labels.js`) reads each
+`<v>.rwxmap.review.json` for request keys, through `rwxmap/match`. The letters
+come only from the sibling `<v>.rwxmap.json` file's `bareguard.tools`, the file
+you review and can edit; rwxmap's own guessed letter is never used. A folder
+with no review file, a review file without its gate file, or two vendors
+defining the same key fails `sbx run` before any agent starts. A label file
+written before rwxmap 0.8.0 fails with rwxmap's "regenerate it with rwxmap
+0.8.0" message.
+
+The tool for a request is chosen in this order: the label's key when a label
+documents the request; else a model endpoint key when known; else
+`http.<METHOD>`. A label key the gate file lacks (a row you deleted) reaches the
+gate unlisted and is denied (`rwx.unlisted`), in every mode: it fails closed.
+
+Model endpoints are `r` (free in every mode): `api.anthropic.com`
+`POST /v1/messages` and `/v1/messages/count_tokens`; `api.openai.com`
+`POST /v1/chat/completions`, `/v1/responses` and `/v1/embeddings`; and on each
+`localLlm` host:port `POST /api/chat`, `/api/generate`, `/api/embed`,
+`/v1/chat/completions` and `/v1/completions` (http only). Any other path on
+those hosts is a normal `POST`.
+
+Label folders are hidden inside the sandbox like the config file, so the agent
+cannot rewrite a letter. `run()` and `createProxy()` take `labels:
+{ matcher, tools }` (what `loadLabels` returns); omitted means no labels and
+only the built-in model endpoints.
 
 ## Undo layer
 
