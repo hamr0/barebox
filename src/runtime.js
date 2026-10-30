@@ -256,7 +256,7 @@ export function shellQuote(s) {
  * Every path in a runtime dir. The one place that names them.
  *
  * @param {string} runtime runtime dir
- * @returns {{ socket: (agent: string) => string, asksDir: string, answersDir: string, askFile: (id: string) => string, answerFile: (id: string) => string, heldDir: string, heldFile: (id: string) => string, certsDir: string, caBundle: string, audit: string, gateAudit: string, owner: string, overlay: (agent: string) => { base: string, upper: string, work: string, manifest: string } }} layout
+ * @returns {{ socket: (agent: string) => string, asksDir: string, answersDir: string, askFile: (id: string) => string, answerFile: (id: string) => string, heldDir: string, heldFile: (id: string) => string, certsDir: string, caBundle: string, audit: string, owner: string, overlay: (agent: string) => { base: string, upper: string, work: string, manifest: string } }} layout
  */
 export function runtimePaths(runtime) {
   const asksDir = path.join(runtime, 'asks');
@@ -285,9 +285,8 @@ export function runtimePaths(runtime) {
     },
     certsDir: path.join(runtime, 'certs'),
     caBundle: path.join(runtime, 'ca-bundle.pem'),
-    audit: path.join(runtime, 'audit.jsonl'),
-    // bareguard's audit: every agent's gate appends here (one atomic line per write).
-    gateAudit: path.join(runtime, 'gate.jsonl'),
+    // The one audit file, in bareguard's shape: every agent's gate and the runtime's own `sbx` gate append here (one atomic line per write).
+    audit: path.join(runtime, 'gate.jsonl'),
     overlay: (agent) => {
       const base = path.join(runtime, 'overlay', agent);
       return {

@@ -153,10 +153,10 @@ describe('through the proxy', () => {
     const labels = loadLabels({ labels: [copyLabels()], tenants: { jira: [`http://127.0.0.1:${up.port}`] } });
     const rt = mkdtempSync(join(tmpdir(), 'bb-lblp-'));
     const paths = runtimePaths(rt);
-    const proxy = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), runtime: rt, clientIdleMs: 5000,
+    const proxy = createProxy({ port: 0, logFile: paths.audit, runtime: rt, clientIdleMs: 5000,
       unsafeTestOnly: { allowLoopback: true }, labels,
       gateFor: (agent, { humanChannel, tools }) =>
-        policyGate({ agent, mode: 'trust', auditPath: paths.gateAudit, humanChannel, tools }),
+        policyGate({ agent, mode: 'trust', auditPath: paths.audit, humanChannel, tools }),
       hold: { timeoutMs: 15000, pollMs: 25 } });
     try {
       const { port } = await proxy.ready;
@@ -168,7 +168,7 @@ describe('through the proxy', () => {
         req.end();
       });
       assert.equal(status, 200);
-      const lines = readFileSync(paths.gateAudit, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const lines = readFileSync(paths.audit, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
       assert.ok(lines.some((l) => l.action?.tool === 'jira.editIssue'), JSON.stringify(lines));
     } finally {
       await Promise.race([proxy.close(), new Promise((r) => setTimeout(r, 5000))]);

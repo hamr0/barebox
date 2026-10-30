@@ -343,7 +343,7 @@ describe('negatives', () => {
     await new Promise((r) => srv.close(r));
     const code = await curl('-o', '/dev/null', '-w', '%{http_code}', `http://127.0.0.1:${dead}/one-deny`);
     assert.equal(code.stdout, '502');
-    const denyLines = () => log().split('\n').filter((l) => l.includes('"ev":"deny"') && l.includes(`:${dead}`));
+    const denyLines = () => log().split('\n').filter((l) => l.includes('"verdict":"deny"') && l.includes(`:${dead}`));
     await waitFor(() => denyLines().length > 0, 'a deny line for the dead upstream');
     const denies = denyLines();
     assert.equal(denies.length, 1, denies.join('\n'));
@@ -1460,9 +1460,12 @@ describe('two agents keep identity under interleave', () => {
         assert.match(rA.body, /FA1/);
         assert.equal(rB.status, 200);
         assert.match(rB.body, /FB1/);
-        await waitFor(() => /"agent":"fb"/.test(tlog()) && /m=FB1/.test(tlog()),
-          'log to name fb');
-        assert.match(tlog(), /"agent":"fa"/);
+        // The audit file names each hold's own agent (annotate meta carries id + agent).
+        const holdAgent = (id) => tlog().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+          .find((l) => l.phase === 'annotate' && l.verdict === 'hold' && l.meta?.id === id)?.meta.agent;
+        await waitFor(() => holdAgent(gotB.id) && holdAgent(gotA.id), 'hold lines to name both agents');
+        assert.equal(holdAgent(gotA.id), 'fa');
+        assert.equal(holdAgent(gotB.id), 'fb');
       } finally {
         for (const s of sa) { try { s.destroy(); } catch {} }
         try { tp.removeAgent('fa'); } catch {}
@@ -1479,7 +1482,7 @@ describe('audit log secrets', () => {
     assert.equal(st.mode & 0o777, 0o600);
   });
 
-  it('authorization headers leave no secret in logged req lines', async () => {
+  it('authorization headers leave no secret in the audit file', async () => {
     const bearer = `Bearer probe-bearer-${process.pid}`;
     const proxyCreds = 'Basic cHJvYmU6c2VjcmV0';
     const r = await curl('-H', `Authorization: ${bearer}`,
@@ -1490,12 +1493,10 @@ describe('audit log secrets', () => {
     const text = log();
     assert.ok(!text.includes(bearer), 'bearer secret must not appear in the log');
     assert.ok(!text.includes(proxyCreds), 'proxy credentials must not appear in the log');
-    const line = text.split('\n').find((l) => l.includes('m=authz'));
-    assert.ok(line, 'authz req line is logged');
-    assert.match(line, /\[redacted\]/);
+    assert.ok(text.split('\n').some((l) => l.includes('m=authz')), 'the request is logged');
   });
 
-  it('user redact hook runs after built-in scrubbing', async () => {
+  it('user redact hook shapes the annotate meta and no secret survives', async () => {
     // Own runtime: the shared RT is claimed by the module proxy.
     const trt = mkdtempSync(join(tmpdir(), 'bb-hook-'));
     const hookLogPath = join(trt, 'mitm-hook.log');
@@ -1516,8 +1517,7 @@ describe('audit log secrets', () => {
       await waitFor(() => /m=hookredact/.test(hookLog()), 'hook log line');
       assert.equal(statSync(hookLogPath).mode & 0o777, 0o600);
       const text = hookLog();
-      assert.match(text, /"hookRan":"req"/);
-      assert.match(text, /\[redacted\]/);
+      assert.match(text, /"hookRan":"resp"/);
       assert.ok(!text.includes(secret), 'secret must not survive the hook either');
     } finally {
       await tp.close();
@@ -1538,7 +1538,7 @@ describe('upstream fallback (2.1 item 1)', () => {
 });
 
 describe('audit log secrets, continued (2.1 items 3-4)', () => {
-  it('cookie and api-key headers leave no secret in logged req lines', async () => {
+  it('cookie and api-key headers leave no secret in the audit file', async () => {
     const session = `session=${process.pid}-secret`;
     const apiKey = `key-${process.pid}-secret`;
     const r = await curl('-H', `Cookie: ${session}`,
@@ -1549,9 +1549,7 @@ describe('audit log secrets, continued (2.1 items 3-4)', () => {
     const text = log();
     assert.ok(!text.includes(session), 'cookie must not appear in the log');
     assert.ok(!text.includes(apiKey), 'api key must not appear in the log');
-    const line = text.split('\n').find((l) => l.includes('m=cookiekey'));
-    assert.ok(line, 'cookiekey req line is logged');
-    assert.match(line, /\[redacted\]/);
+    assert.ok(text.split('\n').some((l) => l.includes('m=cookiekey')), 'the request is logged');
   });
 
   it('an existing 0644 log is tightened to 0600 on start', async () => {

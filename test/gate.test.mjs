@@ -57,10 +57,10 @@ after(async () => { await up?.close(); });
 async function withProxy({ mode = 'auto', gateFor, hold = {} }, fn) {
   const rt = mkdtempSync(join(tmpdir(), 'bb-gate-'));
   const paths = runtimePaths(rt);
-  const proxy = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), runtime: rt, clientIdleMs: 5000,
+  const proxy = createProxy({ port: 0, logFile: paths.audit, runtime: rt, clientIdleMs: 5000,
     unsafeTestOnly: { allowLoopback: true },
     gateFor: gateFor ?? ((agent, { humanChannel }) =>
-      policyGate({ agent, mode, auditPath: paths.gateAudit, humanChannel })),
+      policyGate({ agent, mode, auditPath: paths.audit, humanChannel })),
     hold: { timeoutMs: 15000, pollMs: 25, ...hold } });
   const { port } = await proxy.ready;
   const t = {
@@ -74,7 +74,7 @@ async function withProxy({ mode = 'auto', gateFor, hold = {} }, fn) {
       renameSync(tmp, paths.answerFile(id));
     },
     gateLines: () => {
-      try { return readFileSync(paths.gateAudit, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); }
+      try { return readFileSync(paths.audit, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); }
       catch { return []; }
     },
     parked: (n = 1) => waitFor(() => (proxy.pending().length >= n ? proxy.pending() : null), `${n} hold(s) to park`),
@@ -256,7 +256,7 @@ describe('audit', () => {
       const reply = lines.find((l) => l.phase === 'approval');
       assert.equal(reply.aid, ask.aid);
       assert.ok(lines.indexOf(reply) > lines.indexOf(ask));
-      assert.ok(!readFileSync(t.paths.gateAudit, 'utf8').includes(marker), 'no body bytes in gate.jsonl');
+      assert.ok(!readFileSync(t.paths.audit, 'utf8').includes(marker), 'no body bytes in gate.jsonl');
     });
   });
 });
@@ -322,9 +322,9 @@ describe('close and removeAgent with requests inside a gate check', () => {
     const rt = mkdtempSync(join(tmpdir(), 'bb-gate-ra-'));
     const paths = runtimePaths(rt);
     const events = [];
-    const proxy = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), runtime: rt, clientIdleMs: 5000,
+    const proxy = createProxy({ port: 0, logFile: paths.audit, runtime: rt, clientIdleMs: 5000,
       unsafeTestOnly: { allowLoopback: true },
-      gateFor: (agent, { humanChannel }) => policyGate({ agent, mode: 'auto', auditPath: paths.gateAudit, humanChannel }),
+      gateFor: (agent, { humanChannel }) => policyGate({ agent, mode: 'auto', auditPath: paths.audit, humanChannel }),
       hold: { timeoutMs: 15000, pollMs: 25, onEvent: (e) => events.push(e) } });
     try {
       await proxy.ready;

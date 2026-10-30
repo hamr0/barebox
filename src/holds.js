@@ -60,7 +60,7 @@ export const ASK_BODY_LIMIT = 4096;
 export const DEFAULT_HOLD_MAX_BODY = 52428800;
 
 /**
- * The one body preview, for the ask file and the audit log alike: the first
+ * The one body preview, for the ask file: the first
  * ASK_BODY_LIMIT bytes as utf8, with card numbers masked.
  *
  * @param {Buffer} head the body's first bytes (anything past ASK_BODY_LIMIT is ignored)

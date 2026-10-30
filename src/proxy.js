@@ -23,6 +23,7 @@ import { ASK_BODY_LIMIT, DEFAULT_HOLD_MAX_BODY, bodyPreview, createHolds } from 
 import { claimRuntime, ensurePrivateDir, runtimePaths } from './runtime.js';
 import { paymentPath, toolFor, buildTools, emptyMatcher } from './policy.js';
 import { checkUpstream } from './wall.js';
+import { Gate } from 'bareguard';
 
 const AGENT = Symbol('agent');
 const SECURE = Symbol('secure');
@@ -36,39 +37,11 @@ const EMPTY = Buffer.alloc(0);
 const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
   'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
 
-// Secrets never land in the audit log verbatim: Authorization-style header
-// values are replaced with a fixed marker before an entry is written. The
-// user's `redact` hook runs after this scrubbing, so it sees (and further
-// shapes) an already-safe entry. Bodies are logged as a masked preview only.
-const REDACTED = '[redacted]';
-// Interim set (M3 replaces this with bareguard's `secrets` redaction): header names whose values never land verbatim.
-const SENSITIVE_HEADERS = new Set(['authorization', 'proxy-authorization',
-  'cookie', 'set-cookie', 'x-api-key', 'x-auth-token', 'api-key']);
-
-/**
- * Copy a log entry with sensitive header values replaced by `[redacted]`.
- * The caller's headers object is never mutated.
- *
- * @param {Record<string, unknown>} entry log entry about to be written
- * @returns {Record<string, unknown>} entry with secrets scrubbed
- */
-function scrubSecrets(entry) {
-  const h = entry['headers'];
-  if (!h || typeof h !== 'object') return entry;
-  const src = /** @type {Record<string, unknown>} */ (h);
-  if (!Object.keys(src).some((k) => SENSITIVE_HEADERS.has(k.toLowerCase()))) return entry;
-  const headers = { ...src };
-  for (const k of Object.keys(headers)) {
-    if (SENSITIVE_HEADERS.has(k.toLowerCase())) headers[k] = REDACTED;
-  }
-  return { ...entry, headers };
-}
-
 /**
  * Options for {@link createProxy}.
  *
  * @typedef {object} ProxyOptions
- * @property {string} logFile JSON-lines log path (`req`, `resp`, `deny`, `hold`, `decide`, `hold-abandoned`)
+ * @property {string} logFile the runtime's one audit file (`runtimePaths(runtime).audit`), in bareguard's JSON-lines shape: every agent's gate and the runtime's own `sbx` gate append to it. barebox's own facts are `annotate` lines (`verdict` = `resp`, `deny`, `hold`, `decide`, `hold-abandoned`, ...); a response status is a `record` line joined to its request's `check` by `aid`.
  * @property {string} runtime runtime dir; required. Holds the CA + minted host certs (`certs/`, see `runtime.js`), the agent sockets, and the hold queue files.
  * @property {number} [port] opt-in TCP listener for tests, bound to 127.0.0.1 only (default: none)
  * @property {string} [upstreamCa] extra PEM the proxy trusts for upstream TLS, on top of system roots
@@ -85,14 +58,14 @@ function scrubSecrets(entry) {
  * @property {(host: string) => Promise<string[] | string | null>} [unsafeTestOnly.resolveUpstream]
  *   DNS stub: replaces the wall's resolver so rebinding is testable. Production omits it.
  * @property {number} [clientIdleMs] kill a client tunnel idle this long; never fires mid-request (default 60000)
- * @property {(entry: Record<string, unknown>) => Record<string, unknown>} [redact] log redaction hook, applied after built-in secret scrubbing (default: identity)
+ * @property {(entry: Record<string, unknown>) => Record<string, unknown>} [redact] log redaction hook, applied after built-in secret scrubbing; its result becomes the `meta` of an `annotate` line (default: identity)
  */
 
 /**
  * Anything with bareguard's `check`: a `Gate`, or a plain object for tests. An
  * `askHuman` outcome from a plain object goes to the same human channel.
  *
- * @typedef {{ check: (action: Record<string, unknown>) => Promise<{ outcome: string, rule?: string, reason?: string | null }> }} GateLike
+ * @typedef {{ check: (action: Record<string, unknown>) => Promise<{ outcome: string, rule?: string, reason?: string | null, aid?: string }>, record?: (action: Record<string, unknown>, result: Record<string, unknown>, opts?: { aid?: string }) => Promise<void>, annotate?: (fact: Record<string, unknown>) => Promise<void>, drainAnnotations?: () => unknown[] }} GateLike
  */
 
 /**
@@ -120,6 +93,7 @@ function scrubSecrets(entry) {
  * @property {Buffer} [prefix] bytes already read from `stream`, written upstream before it
  * @property {import('node:stream').Readable} [stream] live body: the request itself, or a held body's file
  * @property {import('node:http').ServerResponse} cres parked or live client response
+ * @property {{ gate: GateLike, action: Record<string, unknown>, aid: string }} [rec] the deciding gate, the request's action and the decision's aid: the response status is recorded there (absent: it is logged as a `resp` fact)
  */
 
 /**
@@ -129,8 +103,7 @@ function scrubSecrets(entry) {
  */
 
 /**
- * Start the front-door proxy. Every request is logged with its method, URL,
- * headers and a masked body preview, byte count and SHA-256; bytes go upstream untouched. Requests the hold rule
+ * Start the front-door proxy. Every request is audited with its method and URL, and a request with a body also with its byte count and SHA-256 (never headers or body text); bytes go upstream untouched. Requests the hold rule
  * flags park for a human decision instead of forwarding.
  *
  * @param {ProxyOptions} opts
@@ -171,34 +144,96 @@ export function createProxy(opts) {
   const holdMaxBody = hold?.maxBody ?? DEFAULT_HOLD_MAX_BODY;
   const heldFile = runtimePaths(runtime).heldFile;
 
-  // Open the audit log synchronously: a bad `logFile` (a directory, a
+  // Open the audit file synchronously: a bad `logFile` (a directory, a
   // missing parent, no permission) throws here, where the claim can still
-  // be released — not later as an uncaught stream error.
-  let logFd;
+  // be released — not later as an uncaught error. bareguard appends to it.
   try {
-    logFd = fs.openSync(logFile, 'a', 0o600);
+    fs.closeSync(fs.openSync(logFile, 'a', 0o600));
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     releaseClaim();
     throw new Error(`createProxy: cannot open logFile ${logFile}: ${msg}`);
   }
-  const logStream = fs.createWriteStream(logFile, { fd: logFd });
   // `openSync`'s mode is masked by the umask and doesn't apply to an
   // existing file: a 0644 log from an older run would stay world-readable
   // while new lines append, so fix it up on every start.
   try { fs.chmodSync(logFile, 0o600); } catch {}
+
+  // The audit file has one shape: bareguard's. A response status is a
+  // `gate.record` joined to its request's `check` by aid; every other fact is
+  // an `annotate({ surface: false })` on the agent's gate when it is built, else
+  // on the runtime's own `sbx` gate (which never runs `check()`).
+  /** @type {GateLike} */
+  let sbxGate;
+  try {
+    sbxGate = /** @type {GateLike} */ (/** @type {unknown} */ (new Gate({ audit: { path: logFile } })));
+  } catch (e) {
+    releaseClaim();
+    throw e;
+  }
+  const sbxInit = /** @type {{ init: () => Promise<void> }} */ (/** @type {unknown} */ (sbxGate)).init();
+  sbxInit.catch(() => {}); // reported by the first line that awaits it
+  /** Gates by agent: the only place a gate is kept (see `gateOf`). @type {Map<string, { p: Promise<GateLike>, gate: GateLike|null }>} */
+  const gates = new Map();
+  /** @type {Set<Promise<void>>} */
+  const pendingLog = new Set();
+  let logClosing = false;
   let logFailed = false;
-  logStream.on('error', (e) => {
+  /** @param {unknown} e */
+  const logFail = (e) => {
     if (logFailed) return;
     logFailed = true;
     console.error(`sbx: audit log ${logFile} write failed: ${e instanceof Error ? e.message : String(e)}`);
-  });
-  // After close() ends the stream a late line (a socket torn down by close)
-  // is dropped on purpose: a write after end() would destroy the stream.
-  const log = (o) => {
-    if (logStream.writableEnded) return;
-    logStream.write(JSON.stringify(redact(scrubSecrets(o))) + '\n');
   };
+  /** Track one audit write; a failure is reported once, never thrown. @param {() => Promise<unknown>} fn */
+  const track = (fn) => {
+    // After close() ends the flush a late line (a socket torn down by close)
+    // is dropped on purpose: a write nobody waits for would wedge close().
+    if (logClosing) return;
+    const p = fn().then(() => {}, logFail).then(() => { pendingLog.delete(p); });
+    pendingLog.add(p);
+  };
+  /** Cut a string field. @param {unknown} v @param {number} n */
+  const cut = (v, n) => (typeof v === 'string' ? v.slice(0, n) : v);
+  /**
+   * barebox's fact as the `meta` of an annotate. The bound is an adapter for
+   * bareguard (upstream ask pending).
+   * @param {Record<string, unknown>} o
+   * @returns {Record<string, unknown>}
+   */
+  const metaOf = (o) => {
+    const { ev: _ev, ...meta } = redact(o);
+    meta['url'] = cut(meta['url'], 400);
+    meta['note'] = cut(meta['note'], 200);
+    meta['reason'] = cut(meta['reason'], 200);
+    if (Buffer.byteLength(JSON.stringify(meta)) <= 900) return meta;
+    /** @type {Record<string, unknown>} */
+    const small = {};
+    for (const k of ['id', 'agent', 'method', 'code', 'decision']) if (meta[k] !== undefined) small[k] = meta[k];
+    if (meta['url'] !== undefined) small['url'] = cut(meta['url'], 200);
+    return small;
+  };
+  /** @param {Record<string, unknown>} o */
+  async function writeLog(o) {
+    const agent = typeof o['agent'] === 'string' ? o['agent'] : null;
+    // Never build a gate from here: a built one, else the sbx gate.
+    const entry = agent ? gates.get(agent) : undefined;
+    const cand = entry?.gate ?? null;
+    const g = cand && typeof cand.annotate === 'function' ? cand : sbxGate;
+    if (g === sbxGate) await sbxInit;
+    const where = [o['id'], o['agent'], o['code'], o['method'], o['url'] ?? o['note']]
+      .filter((x) => x !== undefined && x !== null).join(' ');
+    try {
+      await /** @type {NonNullable<GateLike['annotate']>} */ (g.annotate)({
+        surface: false, verdict: String(o['ev']), where, meta: metaOf(o) });
+    } finally {
+      // Adapter for bareguard (upstream ask pending): barebox has no turns, so nothing else drains the buffer.
+      g.drainAnnotations?.();
+    }
+  }
+  // Synchronous for callers (holds.js shares it); the write is tracked.
+  /** @param {Record<string, unknown>} o */
+  const log = (o) => { track(() => writeLog(o)); };
   let trust = null;
   if (upstreamCa) {
     let extra;
@@ -255,7 +290,7 @@ export function createProxy(opts) {
   }
 
   /** @param {ForwardArgs} args */
-  async function forward({ agent, method, url, headers, body, prefix, stream, cres }) {
+  async function forward({ agent, method, url, headers, body, prefix, stream, cres, rec }) {
     let u;
     try {
       u = new URL(url);
@@ -274,7 +309,7 @@ export function createProxy(opts) {
     // throw before it can answer must still be loud, never a floating reject.
     // The dial is pinned to the checked IPs: no second DNS resolution.
     try {
-      forwardInner({ agent, method, url, headers, body, prefix, stream, cres, u, upstreamIps: verdict.ips });
+      forwardInner({ agent, method, url, headers, body, prefix, stream, cres, rec, u, upstreamIps: verdict.ips });
     } catch (e) {
       // The live stream arrives paused (see handleRequest): unpause so no
       // paused stream leaks on this path.
@@ -284,7 +319,7 @@ export function createProxy(opts) {
   }
 
   /** @param {ForwardArgs & { u: URL, upstreamIps: string[] }} args */
-  function forwardInner({ agent, method, url, headers, body, prefix, stream, cres, u, upstreamIps }) {
+  function forwardInner({ agent, method, url, headers, body, prefix, stream, cres, rec, u, upstreamIps }) {
     const sock = cres.socket;
     if (!sock) { discard(stream); return; } // no transport left to answer on
     const secure = u.protocol === 'https:';
@@ -339,7 +374,11 @@ export function createProxy(opts) {
         if (!HOP_RESP.has(k.toLowerCase()) && v !== undefined) respHeaders[k] = v;
       }
       if (ures.statusCode === undefined) { fail('upstream sent no status'); up.destroy(); return; }
-      log({ ev: 'resp', agent, url, status: ures.statusCode });
+      const status = ures.statusCode;
+      if (rec && typeof rec.gate.record === 'function') {
+        const { gate: g, action, aid } = rec;
+        track(() => /** @type {NonNullable<GateLike['record']>} */ (g.record)(action, { status }, { aid }));
+      } else log({ ev: 'resp', agent, url, status });
       try {
         cres.writeHead(ures.statusCode, respHeaders);
       } catch (e) { fail(`cannot frame upstream response: ${e.message}`); up.destroy(); return; }
@@ -405,22 +444,25 @@ export function createProxy(opts) {
 
   /**
    * Gates by agent, built lazily (and at `addAgent`): one per agent, so the
-   * grant is the agent's own. The map is the only place a gate is kept.
+   * grant is the agent's own. `gates` (declared with the log) is the only
+   * place a gate is kept; `entry.gate` is set once the build settled.
    *
-   * @type {Map<string, Promise<GateLike>>}
+   * @param {string} agent
+   * @returns {Promise<GateLike>}
    */
-  const gates = new Map();
-  /** @param {string} agent @returns {Promise<GateLike>} */
   function gateOf(agent) {
-    let g = gates.get(agent);
-    if (!g) {
+    let e = gates.get(agent);
+    if (!e) {
       if (!gateFor) throw new Error('createProxy: no gateFor');
-      g = Promise.resolve().then(() => gateFor(agent, { humanChannel: askHuman, tools }));
-      gates.set(agent, g);
-      // A failed build must not stick: the next request tries again, loudly.
-      g.catch(() => { if (gates.get(agent) === g) gates.delete(agent); });
+      const p = Promise.resolve().then(() => gateFor(agent, { humanChannel: askHuman, tools }));
+      const entry = { p, gate: /** @type {GateLike|null} */ (null) };
+      e = entry;
+      gates.set(agent, entry);
+      p.then((g) => { entry.gate = g; },
+        // A failed build must not stick: the next request tries again, loudly.
+        () => { if (gates.get(agent) === entry) gates.delete(agent); });
     }
-    return g;
+    return e.p;
   }
 
   /**
@@ -584,15 +626,15 @@ export function createProxy(opts) {
    *
    * @param {GateLike} g the agent's gate
    * @param {Record<string, unknown>} action the request as an action
-   * @returns {Promise<{ outcome: string, rule?: string, reason?: string | null }>} terminal allow or deny
+   * @returns {Promise<{ outcome: string, rule?: string, reason?: string | null, aid?: string }>} terminal allow or deny
    */
   async function decideAction(g, action) {
     const d = await g.check(action);
     if (d.outcome !== 'askHuman') return d;
     const h = await askHuman({ action, rule: d.rule });
     return h.decision === 'allow'
-      ? { outcome: 'allow', rule: 'humanChannel.allow' }
-      : { outcome: 'deny', rule: d.rule, reason: h.reason ?? 'denied' };
+      ? { outcome: 'allow', rule: 'humanChannel.allow', aid: d.aid }
+      : { outcome: 'deny', rule: d.rule, reason: h.reason ?? 'denied', aid: d.aid };
   }
 
   async function handleRequest(creq, cres) {
@@ -623,15 +665,18 @@ export function createProxy(opts) {
 
     // Pause before any body listener: a listener would put the stream in
     // flowing mode and starve whoever reads it next. The tee sees every body
-    // byte once, whatever path reads it, and feeds only the log: a masked
-    // 4 KB preview, the byte count and a SHA-256 (constant memory).
+    // byte once, whatever path reads it, and feeds the ask (a masked
+    // 4 KB preview) and the audit's `body` fact (byte count and SHA-256).
     creq.pause();
     const tee = makeTee();
     creq.on('data', (c) => tee.push(c));
-    creq.on('end', () => {
-      log({ ev: 'req', agent, method, url: urlStr, headers: creq.headers,
-        bodyPreview: bodyPreview(tee.head), bodyBytes: tee.bytes, bodySha256: tee.digest() });
-    });
+    // `end` fires once the whole body was read, whichever path read it (also
+    // a streamed body past 64 KB), so the values cover all of it. A client
+    // that aborts mid-body never reaches `end`: no line, as before.
+    const rid = `r${++ridN}`;
+    if (hasBody) {
+      creq.on('end', () => log({ ev: 'body', agent, rid, bodyBytes: tee.bytes, bodySha256: tee.digest() }));
+    }
     creq.on('error', () => {});
 
     // No gate: straight through. pipe() resumes the flow.
@@ -647,7 +692,6 @@ export function createProxy(opts) {
     /** @type {() => void} */
     let free = () => {};
     const freeWork = () => { if (!freed) { freed = true; free(); } };
-    const rid = `r${++ridN}`;
     try {
       if (hasBody) {
         free = await takeWorkSlot(agent, cres);
@@ -670,9 +714,11 @@ export function createProxy(opts) {
       const action = { type: 'net', tool: toolFor(matcher, tools, method, urlStr), url: urlStr, method, agent,
         cardLike, paymentPath: paymentPath(urlStr), rid };
       inflightCtx.set(rid, ctx);
-      const d = await decideAction(await gateOf(agent), action);
+      const g = await gateOf(agent);
+      const d = await decideAction(g, action);
       if (d.outcome === 'allow') {
-        const common = { agent, method, url: urlStr, headers: ctx.headers, cres };
+        const common = { agent, method, url: urlStr, headers: ctx.headers, cres,
+          ...(d.aid ? { rec: { gate: g, action, aid: d.aid } } : {}) };
         if (ctx.heldId) {
           // The file is the exact body; the client's own framing (length or
           // chunked) still describes it. It is deleted once the upstream is done.
@@ -950,17 +996,18 @@ export function createProxy(opts) {
     for (const s of clients) { try { s.destroy(); } catch {} }
     clients.clear();
     server.close();
-    logStream.end();
-    /** @type {Promise<void>} */
-    const flushed = new Promise((resolve) => {
-      if (logStream.writableFinished || logStream.destroyed) resolve();
-      else {
-        // A destroyed stream emits 'close', never 'finish'.
-        logStream.once('finish', () => resolve());
-        logStream.once('close', () => resolve());
-      }
-    });
-    await flushed;
+    // Lines logged from here on are dropped; the ones in flight are awaited,
+    // but never forever (a wedged disk must not wedge close).
+    logClosing = true;
+    if (pendingLog.size) {
+      /** @type {ReturnType<typeof setTimeout>|undefined} */
+      let cap;
+      await Promise.race([
+        Promise.allSettled([...pendingLog]),
+        new Promise((resolve) => { cap = setTimeout(resolve, 3000); }),
+      ]);
+      clearTimeout(cap);
+    }
     releaseClaim();
   }
 

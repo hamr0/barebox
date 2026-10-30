@@ -74,7 +74,7 @@ async function withProxy(holdExtra, fn) {
       writeFileSync(tmp, JSON.stringify(obj));
       renameSync(tmp, join(dir, `${id}.json`));
     },
-    logLines: () => readFileSync(logFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)),
+    logFile,
     parked: (n = 1) => waitFor(() => (proxy.pending().length >= n ? proxy.pending() : null), `${n} hold(s) to park`),
     /** Send through the proxy; `done` resolves { status, body: Buffer }. */
     send(path, body, { method = 'POST', chunked = false, headers = {} } = {}) {
@@ -336,28 +336,24 @@ describe('held bodies live on disk', () => {
   });
 });
 
-describe('one preview for the log and the ask', () => {
-  it('a 1 MB allowed POST logs bytes, sha256 and a preview of at most 4096 bytes', { timeout: 30000 }, async () => {
+describe('one preview for the ask; the audit file carries no body', () => {
+  it('a 1 MB allowed POST goes through intact and its bytes never reach the audit file', { timeout: 30000 }, async () => {
     await withProxy({}, async (t) => {
       const body = filler(1024 * 1024, 13);
       const r = await t.send('ok?m=BIG1', body).done;
       assert.equal(sha(r.body), sha(body));
-      const line = await waitFor(() => t.logLines().find((l) => l.ev === 'req' && /m=BIG1/.test(l.url)), 'req line');
-      assert.equal(line.bodyBytes, 1048576);
-      assert.equal(line.bodySha256, sha(body));
-      assert.ok(Buffer.byteLength(line.bodyPreview) <= 4096);
-      assert.equal(line.bodyPreview, body.subarray(0, 4096).toString('utf8'));
-      assert.ok(!('body' in line) && !('truncated' in line));
+      const text = await waitFor(() => { const x = readFileSync(t.logFile, 'utf8'); return /m=BIG1/.test(x) ? x : null; }, 'audit line');
+      assert.ok(!text.includes(body.subarray(0, 64).toString('utf8')), 'no body bytes in the audit file');
+      assert.ok(text.length < 20000, 'the audit file stays small');
     });
   });
 
-  it('a card in a small allowed body is masked in the log preview', { timeout: 20000 }, async () => {
+  it('a card in a small body is masked in the ask preview and never reaches the audit file', { timeout: 20000 }, async () => {
     await withProxy({}, async (t) => {
       const { done } = t.send('ok?m=CARDLOG', Buffer.from(`order ${CARD} please`));
       const [h] = await t.parked();
-      const line = await waitFor(() => t.logLines().find((l) => l.ev === 'req' && /m=CARDLOG/.test(l.url)), 'req line');
-      assert.equal(line.bodyPreview, 'order **** **** **** 4242 please');
-      assert.ok(!JSON.stringify(t.logLines()).includes(CARD), 'the raw card never reaches the log');
+      assert.equal(t.askOf(h.id).bodyPreview, 'order **** **** **** 4242 please');
+      assert.ok(!readFileSync(t.logFile, 'utf8').includes(CARD), 'the raw card never reaches the audit file');
       t.answer(h.id, { decision: 'deny' });
       await done;
     });
@@ -372,23 +368,8 @@ describe('one preview for the log and the ask', () => {
       assert.equal(ask.truncated, true);
       assert.ok(Buffer.byteLength(ask.bodyPreview) <= 4096);
       assert.match(ask.bodyPreview, /^\*{4} \*{4} \*{4} 4242 /);
-      const line = t.logLines().find((l) => l.ev === 'req' && l.bodySha256 === sha(body));
-      assert.ok(line, 'req line with the full-body hash');
-      assert.equal(line.bodyPreview, ask.bodyPreview, 'log and ask carry one preview');
       t.answer(h.id, { decision: 'deny' });
       await done;
-    });
-  });
-
-  it('no req line ever carries more than 4 KB of body', { timeout: 30000 }, async () => {
-    await withProxy({}, async (t) => {
-      await t.send('ok', filler(300000, 15)).done;
-      await t.send('ok', filler(50000, 16)).done;
-      await waitFor(() => t.logLines().filter((l) => l.ev === 'req').length >= 2, 'req lines');
-      for (const l of t.logLines().filter((x) => x.ev === 'req')) {
-        assert.ok(Buffer.byteLength(l.bodyPreview) <= 4096);
-        assert.ok(!('body' in l));
-      }
     });
   });
 });

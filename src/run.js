@@ -117,7 +117,6 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
   // Short temp dir: agent socket paths inherit it and cap at ~108 chars.
   const rt = runtime ?? createRuntime();
   const audit = runtimePaths(rt).audit;
-  const gateAudit = runtimePaths(rt).gateAudit;
 
   // Outcomes are reported, never reconstructed: the queue's `onEvent`
   // builds the ask records in park order, for both channels alike.
@@ -139,7 +138,7 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
   const proxy = createProxy({
     runtime: rt, logFile: audit, allowLocal, unsafeTestOnly,
     ...(labels ? { labels } : {}),
-    gateFor: (name, { humanChannel, tools }) => gateFor({ agent: name, mode, auditPath: gateAudit, humanChannel, tools }),
+    gateFor: (name, { humanChannel, tools }) => gateFor({ agent: name, mode, auditPath: audit, humanChannel, tools }),
     hold: { onAsk, timeoutMs, maxBody: heldBodyMaxBytes, onEvent: holdOnEvent },
   });
   try {

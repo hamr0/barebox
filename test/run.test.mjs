@@ -228,7 +228,7 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
     assert.equal(res.asks.length, 1);
     assert.equal(res.asks[0].id, id);
     assert.equal(res.asks[0].decision, 'allow');
-    assert.match(res.audit && readFileSync(res.audit, 'utf8'), /"ev":"decide"/);
+    assert.match(res.audit && readFileSync(res.audit, 'utf8'), /"verdict":"decide"/);
   });
 
   it('a held request whose client disconnects ends as deny / client gone in asks', async () => {
