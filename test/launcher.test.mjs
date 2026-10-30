@@ -427,7 +427,16 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
       '[ -z "$(cat "$HOME/.config/barebox/config.json" 2>/dev/null)" ] || exit 11',
       '[ -z "$(ls -A "$HOME/.config/barebox")" ] || exit 12',
     ].join('\n');
-    const c = launch({ runtime: rt, agent: 't1c', proj, command: ['bash', '-c', script] });
+    // The fake home only holds if XDG_CONFIG_HOME is unset: configPath() prefers it over $HOME/.config.
+    const prev = process.env.XDG_CONFIG_HOME;
+    delete process.env.XDG_CONFIG_HOME;
+    let c;
+    try {
+      c = launch({ runtime: rt, agent: 't1c', proj, command: ['bash', '-c', script] });
+    } finally {
+      if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prev;
+    }
     const r = await run(c);
     assert.equal(r.code, 0, `exit ${r.code} (11 config.json readable, 12 drawer not empty): ${r.err}`);
   });
