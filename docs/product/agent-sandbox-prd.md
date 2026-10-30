@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Name: barebox (CLI `sbx`).
-> Status: M0–M2 PASS. **barebox 0.4.0 is on npm** (provenance-signed); M2.5 (ask seam), M4 (undo layer) and the hardening branch are released. M3 is in progress on branch `m3` (design decided Oct 29; memory POC rounds 1 and 2, part A, bodies and parts B1, B2a and B2b done — bareguard decides every request; labels and model endpoints are wired; one audit file; B2c, the memory bench, done Oct 30: budget is a range, about 145-175 MB at 40 agents per proxy). Next: finish M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M0–M2 PASS. **barebox 0.5.0 is on npm** (provenance-signed, Oct 30); M2.5 (ask seam), M4 (undo layer), the hardening branch and M3 (bareguard decides every request; rwxmap labels and model endpoints; one audit file; 40 agents per proxy; proxy memory budget about 145-175 MB at 40 agents) are released. Next: M5 (keys the agent never holds), then M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 2026 until the cutoff on **Nov 5 2026, 01:00 Amsterdam time (CET, GMT+1)**. Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -593,11 +593,11 @@ This is a plan, not a result. It shifts as POCs return. Review cap per module: o
 | 2 | Oct 27 | Graduation rewrite, reviews, rewrite bench (done) | Branch review: ready |
 | 3 | Oct 28 | M2.5 ask seam, M4 undo layer, hardening, release 0.4.0 (done) | 0.4.0 on npm |
 | 4 | Oct 29 | M3 scoping, memory POC (rounds 1 and 2 done) | |
-| 5–6 | Oct 30–31 | M3 build and review. bareguard 0.29.0 and rwxmap 0.8.0 land upstream. | Proxy about 145-175 MB at 40 agents on bareguard 0.30.0, pinned (143–172 MB measured, quiet to busy machine; re-decided Oct 30; was ≤ 80 MB) |
+| 5–6 | Oct 30–31 | M3 build and review. bareguard 0.29.0 and rwxmap 0.8.0 land upstream. (done Oct 30: 0.5.0 released) | Proxy about 145-175 MB at 40 agents on bareguard 0.30.0, pinned (143–172 MB measured, quiet to busy machine; re-decided Oct 30; was ≤ 80 MB) |
 | 7 | Nov 1 | M5 (keys) | |
 | 8 | Nov 2 | M6 numbers. Demo B. | Memory targets measured |
 | 9 | Nov 3 | Demo A, README. Freeze in the evening. | |
-| 10 | Nov 4 | Release 0.5.0 and submission | |
+| 10 | Nov 4 | Release 0.6.0 and submission (0.5.0 shipped M3 on Oct 30) | |
 | 11 | Nov 5 | Buffer only, before 01:00 Amsterdam time | |
 
 Days 1–3 are results; the rest is a plan. F1 (bareguard `askUnheld`) and F2 (rwxmap `match` entry) land in their own repos and gate M3's `auto`/`ask` modes; if either slips, M3 ships `trust` + floor first.
