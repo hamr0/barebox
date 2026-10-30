@@ -432,6 +432,20 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     assert.equal(r.code, 0, `exit ${r.code} (11 config.json readable, 12 drawer not empty): ${r.err}`);
   });
 
+  it('masks a maskDirs folder (the labels folders): files and the drawer read empty', async () => {
+    await listenSock('t1e');
+    mkdirSync(join(home, 'rwx-labels'), { recursive: true });
+    writeFileSync(join(home, 'rwx-labels', 'jira.rwxmap.json'), '{"bareguard":{"tools":{}}}\n');
+    const script = [
+      '[ -z "$(cat "$HOME/rwx-labels/jira.rwxmap.json" 2>/dev/null)" ] || exit 11',
+      '[ -z "$(ls -A "$HOME/rwx-labels")" ] || exit 12',
+    ].join('\n');
+    const c = launch({ runtime: rt, agent: 't1e', proj, command: ['bash', '-c', script],
+      maskDirs: [join(home, 'rwx-labels')] });
+    const r = await run(c);
+    assert.equal(r.code, 0, `exit ${r.code} (11 gate file readable, 12 drawer not empty): ${r.err}`);
+  });
+
   it('masks the config where XDG_CONFIG_HOME puts it', async () => {
     await listenSock('t1d');
     mkdirSync(join(home, 'altcfg', 'barebox'), { recursive: true });

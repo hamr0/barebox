@@ -1,0 +1,5 @@
+{"openapi":"3.0.0","info":{"title":"t","version":"1"},"servers":[{"url":"https://your-domain.atlassian.net"}],
+"paths":{"/rest/api/3/issue":{"post":{"operationId":"createIssue","responses":{"200":{"description":"ok"}}}},
+"/rest/api/3/issue/{id}":{"get":{"operationId":"getIssue","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}},
+"put":{"operationId":"editIssue","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}},
+"delete":{"operationId":"deleteIssue","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}}}}

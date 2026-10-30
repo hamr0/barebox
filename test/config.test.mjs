@@ -35,17 +35,17 @@ describe('config file', () => {
 
   it('no file means the defaults', () => {
     const { XDG_CONFIG_HOME } = xdg();
-    assert.deepEqual(loadConfig({ XDG_CONFIG_HOME }), { mode: 'auto', holdTimeoutSec: 120, localLlm: [] });
+    assert.deepEqual(loadConfig({ XDG_CONFIG_HOME }), { mode: 'auto', holdTimeoutSec: 120, localLlm: [], labels: [], tenants: {} });
   });
 
   it('the file\'s mode and holdTimeoutSec are used', () => {
     const { XDG_CONFIG_HOME } = xdg('{"mode":"ask","holdTimeoutSec":"never"}');
-    assert.deepEqual(resolveConfig({}, { XDG_CONFIG_HOME }), { mode: 'ask', holdTimeoutSec: 'never', localLlm: [] });
+    assert.deepEqual(resolveConfig({}, { XDG_CONFIG_HOME }), { mode: 'ask', holdTimeoutSec: 'never', localLlm: [], labels: [], tenants: {} });
   });
 
   it('a CLI --mode beats the file; the file still beats the default for the rest', () => {
     const { XDG_CONFIG_HOME } = xdg('{"mode":"ask","holdTimeoutSec":30}');
-    assert.deepEqual(resolveConfig({ mode: 'trust' }, { XDG_CONFIG_HOME }), { mode: 'trust', holdTimeoutSec: 30, localLlm: [] });
+    assert.deepEqual(resolveConfig({ mode: 'trust' }, { XDG_CONFIG_HOME }), { mode: 'trust', holdTimeoutSec: 30, localLlm: [], labels: [], tenants: {} });
   });
 
   it('an unknown key is refused, naming the file and the key', () => {
@@ -72,6 +72,24 @@ describe('config file', () => {
       const { XDG_CONFIG_HOME, file } = xdg(text);
       assert.throws(() => loadConfig({ XDG_CONFIG_HOME }),
         (e) => e.message.includes(file) && e.message.includes('"heldBodyMaxMB"'), text);
+    }
+  });
+
+  it('labels and tenants: accepted, defaults empty, each bad shape names the key', () => {
+    const good = '{"labels":["~/rwx/jira","/abs/x"],"tenants":{"jira":["https://acme.atlassian.net"]}}';
+    const c = loadConfig({ XDG_CONFIG_HOME: xdg(good).XDG_CONFIG_HOME });
+    assert.deepEqual(c.labels, ['~/rwx/jira', '/abs/x']);
+    assert.deepEqual(c.tenants, { jira: ['https://acme.atlassian.net'] });
+    const d = loadConfig({ XDG_CONFIG_HOME: xdg().XDG_CONFIG_HOME });
+    assert.deepEqual([d.labels, d.tenants], [[], {}]);
+    const bad = [['labels', '{"labels":"x"}'], ['labels', '{"labels":[1]}'],
+      ['tenants', '{"tenants":[]}'], ['tenants', '{"tenants":{"j":"https://a.b"}}'],
+      ['tenants', '{"tenants":{"j":[]}}'], ['tenants', '{"tenants":{"j":[3]}}'],
+      ['tenants', '{"tenants":{"j":["ftp://a.b"]}}'], ['tenants', '{"tenants":{"j":["acme.net"]}}']];
+    for (const [key, text] of bad) {
+      const { XDG_CONFIG_HOME, file } = xdg(text);
+      assert.throws(() => loadConfig({ XDG_CONFIG_HOME }),
+        (e) => e.message.includes(file) && e.message.includes(`"${key}"`), text);
     }
   });
 

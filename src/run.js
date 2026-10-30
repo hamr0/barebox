@@ -62,6 +62,7 @@ import { MODES, gateFor } from './policy.js';
  * @property {string} [agent] agent name (default `'agent'`)
  * @property {number|string} [timeoutMs] hold deadline in ms, or `'never'` (default 120000)
  * @property {number} [heldBodyMaxBytes] cap on a held request's body, in bytes (default 52428800); over it the request is denied
+ * @property {{ matcher: any, tools: Record<string, any>, dirs?: string[] }} [labels] the loaded label files (`loadLabels`); their folders are masked from the sandbox
  * @property {string[]} [allowLocal] exact `host:port` pairs (for example a local model server) that may pass the wall's private/loopback check (the `localLlm` setting)
  * @property {object} [unsafeTestOnly] TEST-ONLY escape hatch, forwarded to the proxy (see `createProxy`): everything under it weakens the sandbox wall
  * @property {NodeJS.WritableStream} [stdout] where the agent's stdout goes (default process.stdout)
@@ -83,6 +84,7 @@ import { MODES, gateFor } from './policy.js';
  * @param {string} [opts.agent] agent name (default `'agent'`)
  * @param {number|string} [opts.timeoutMs] hold deadline in ms, or `'never'` (default 120000)
  * @param {number} [opts.heldBodyMaxBytes] cap on a held request's body, in bytes (default 52428800); over it the request is denied
+ * @param {{ matcher: any, tools: Record<string, any>, dirs?: string[] }|null} [opts.labels] the loaded label files (`loadLabels`); their folders are masked from the sandbox
  * @param {string[]} [opts.allowLocal] exact `host:port` pairs (for example a local model server) that may pass the wall's private/loopback check (the `localLlm` setting)
  * @param {object|null} [opts.unsafeTestOnly] TEST-ONLY escape hatch, forwarded to the proxy (see `createProxy`)
  * @param {NodeJS.WritableStream|null} [opts.stdout] where the agent's stdout goes (default process.stdout)
@@ -98,7 +100,7 @@ import { MODES, gateFor } from './policy.js';
  */
 export async function run({ proj, command, mode = 'auto', onAsk = null,
   onEvent = null, runtime = null, agent = 'agent', timeoutMs, heldBodyMaxBytes,
-  allowLocal = [], unsafeTestOnly = null, stdout = null, stderr = null,
+  allowLocal = [], labels = null, unsafeTestOnly = null, stdout = null, stderr = null,
   overlay = false, overlayIgnore }) {
   if (typeof proj !== 'string' || !proj) throw new Error('run: proj must be a non-empty string');
   if (!fs.existsSync(proj)) throw new Error(`run: proj does not exist: ${proj}`);
@@ -136,7 +138,8 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
 
   const proxy = createProxy({
     runtime: rt, logFile: audit, allowLocal, unsafeTestOnly,
-    gateFor: (name, { humanChannel }) => gateFor({ agent: name, mode, auditPath: gateAudit, humanChannel }),
+    ...(labels ? { labels } : {}),
+    gateFor: (name, { humanChannel, tools }) => gateFor({ agent: name, mode, auditPath: gateAudit, humanChannel, tools }),
     hold: { onAsk, timeoutMs, maxBody: heldBodyMaxBytes, onEvent: holdOnEvent },
   });
   try {
@@ -158,7 +161,7 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
     const child = launch({
       runtime: rt, agent, proj, command,
       socket: sock, caFile: proxy.caFile,
-      overlay, overlayIgnore,
+      overlay, overlayIgnore, maskDirs: labels?.dirs ?? [],
     });
     const out = stdout ?? process.stdout;
     const err = stderr ?? process.stderr;

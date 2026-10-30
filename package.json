@@ -49,6 +49,7 @@
     "typescript": "5"
   },
   "dependencies": {
-    "bareguard": "0.29.0"
+    "bareguard": "0.29.0",
+    "rwxmap": "0.8.0"
   }
 }

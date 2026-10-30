@@ -21,7 +21,7 @@ import { ensureCA, certFor, HOST_RE } from './certs.js';
 import { createCardScanner } from './cardscan.js';
 import { ASK_BODY_LIMIT, DEFAULT_HOLD_MAX_BODY, bodyPreview, createHolds } from './holds.js';
 import { claimRuntime, ensurePrivateDir, runtimePaths } from './runtime.js';
-import { paymentPath } from './policy.js';
+import { paymentPath, toolFor, buildTools, emptyMatcher } from './policy.js';
 import { checkUpstream } from './wall.js';
 
 const AGENT = Symbol('agent');
@@ -72,7 +72,8 @@ function scrubSecrets(entry) {
  * @property {string} runtime runtime dir; required. Holds the CA + minted host certs (`certs/`, see `runtime.js`), the agent sockets, and the hold queue files.
  * @property {number} [port] opt-in TCP listener for tests, bound to 127.0.0.1 only (default: none)
  * @property {string} [upstreamCa] extra PEM the proxy trusts for upstream TLS, on top of system roots
- * @property {(agent: string, ctx: { humanChannel: (event: any) => Promise<{ decision: 'allow' | 'deny', reason?: string }> }) => GateLike | Promise<GateLike>} [gateFor] builds the gate that decides one agent's requests (called once per agent, and once for the TCP door's `tcp` agent); `ctx.humanChannel` is the hold queue, to hand to a bareguard `Gate`. Omit it to forward everything.
+ * @property {(agent: string, ctx: { humanChannel: (event: any) => Promise<{ decision: 'allow' | 'deny', reason?: string }>, tools: Record<string, any> }) => GateLike | Promise<GateLike>} [gateFor] builds the gate that decides one agent's requests (called once per agent, and once for the TCP door's `tcp` agent); `ctx.humanChannel` is the hold queue and `ctx.tools` the runtime's one tools table, both to hand to a bareguard `Gate`. Omit it to forward everything.
+ * @property {{ matcher: { match: (method: string, url: string) => { key: string, source: string } }, tools: Record<string, any> }} [labels] the loaded label files (see `loadLabels`); omitted means no labels, only the built-in model endpoints
  * @property {string[]} [allowLocal] exact `host:port` pairs (the `localLlm` setting) that may pass the wall's private/loopback check; any other local destination is still denied
  * @property {HoldOptions} [hold] hold queue config (deadline, caps, ask seam)
  * @property {number} [upstreamTimeoutMs] give up on an upstream response after this (default 120000)
@@ -144,7 +145,7 @@ function scrubSecrets(entry) {
  */
 export function createProxy(opts) {
   const { logFile, runtime, port = null,
-    upstreamCa = null, hold = null, gateFor = null, allowLocal = [],
+    upstreamCa = null, hold = null, gateFor = null, allowLocal = [], labels = null,
     upstreamTimeoutMs = 120000, clientIdleMs = 60000,
     unsafeTestOnly = null,
     redact = (e) => e } = opts ?? {};
@@ -155,6 +156,9 @@ export function createProxy(opts) {
   };
   /** @param {URL} u @returns {number} */
   const portOf = (u) => (u.port ? parseInt(u.port, 10) : (u.protocol === 'https:' ? 443 : 80));
+  // One tools table and one matcher per runtime, shared by every gate.
+  const matcher = labels?.matcher ?? emptyMatcher;
+  const tools = buildTools(labels?.tools, [...allowLocal]);
   if (!logFile) throw new Error('createProxy: logFile is required');
   if (typeof runtime !== 'string' || !runtime) throw new Error('createProxy: runtime is required');
   // One live proxy per runtime, enforced here: claimed before the hold
@@ -411,7 +415,7 @@ export function createProxy(opts) {
     let g = gates.get(agent);
     if (!g) {
       if (!gateFor) throw new Error('createProxy: no gateFor');
-      g = Promise.resolve().then(() => gateFor(agent, { humanChannel: askHuman }));
+      g = Promise.resolve().then(() => gateFor(agent, { humanChannel: askHuman, tools }));
       gates.set(agent, g);
       // A failed build must not stick: the next request tries again, loudly.
       g.catch(() => { if (gates.get(agent) === g) gates.delete(agent); });
@@ -663,7 +667,7 @@ export function createProxy(opts) {
         if (!r.over) cardLike = createCardScanner().push(Buffer.concat(r.chunks));
       }
       // The body never goes in the action: bareguard writes the action to its audit file.
-      const action = { type: 'net', tool: `http.${method}`, url: urlStr, method, agent,
+      const action = { type: 'net', tool: toolFor(matcher, tools, method, urlStr), url: urlStr, method, agent,
         cardLike, paymentPath: paymentPath(urlStr), rid };
       inflightCtx.set(rid, ctx);
       const d = await decideAction(await gateOf(agent), action);

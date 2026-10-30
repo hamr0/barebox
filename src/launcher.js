@@ -134,6 +134,7 @@ export function buildCaBundle(runtime, caFile) {
  * @param {object} [opts.extraEnv] extra environment entries for the inside
  * @param {string|null} [opts.socket] agent socket path, as returned by `proxy.addAgent` (default `<runtime>/socks/<agent>.sock`; the two must agree)
  * @param {string|null} [opts.caFile] barebox CA cert path (from `proxy.caFile`); when set, the sandbox trusts it for HTTPS alongside the system roots
+ * @param {string[]} [opts.maskDirs] extra folders hidden from the agent exactly like barebox's config dir (the `labels` folders: the agent must not read or rewrite a letter)
  * @param {boolean} [opts.overlay] when true, mount a per-run overlay upper over the project (M4 tracing paper) instead of binding it read-only; diff/commit/rollback address it as `runtimePaths(runtime).overlay(agent)`
  * @param {string[]} [opts.overlayIgnore] path segments invisible to the overlay (default `node_modules`; see overlay.js Q3)
  * @returns {import('node:child_process').ChildProcess} the bwrap child (stdio piped); `close` gives its exit code
@@ -145,7 +146,7 @@ export function buildCaBundle(runtime, caFile) {
  * await new Promise((r) => child.on("close", r)); // child.exitCode === 0
  */
 export function launch({ runtime, agent, proj, command, proxyPort = 3128,
-  extraEnv = {}, socket = null, caFile = null, overlay = false, overlayIgnore }) {
+  extraEnv = {}, socket = null, caFile = null, overlay = false, overlayIgnore, maskDirs = [] }) {
   for (const [k, v] of Object.entries({ runtime, agent, proj })) {
     if (typeof v !== 'string' || !v) throw new Error(`launch: ${k} must be a non-empty string`);
   }
@@ -204,6 +205,8 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   // barebox's own config: settings the agent must neither read nor edit.
   // Masked wherever it resolves (XDG_CONFIG_HOME may move it).
   args.push(...lockMask(dirname(configPath(process.env)), home, proj));
+  // The label folders (the letters live there) get the same mask.
+  for (const d of maskDirs) args.push(...lockMask(d, home, proj));
   // The runtime tree holds the file-checkpoint dirs (`asks/`, `answers/`
   // — the approve/deny capability) and every agent's socket (identity). A
   // read-only bind does NOT stop connect(2) to a unix socket, so wherever

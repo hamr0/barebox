@@ -5,11 +5,14 @@
 //   ask   -> holds "r--", asks for w and x
 //   auto  -> holds "rw-", asks for x
 //   trust -> holds "rwx", asks for nothing
-// Until rwxmap lands (B2) every HTTP method is one tool, `http.<METHOD>`:
-// GET and HEAD are `r`; POST, PUT, PATCH and DELETE are `x`. A method that is
-// not listed is denied (`rwx.unlisted`) in every mode. The card/payment floor
+// A request is one tool: `<vendor>.<operationId>` when a label file documents
+// it (letters come from the gate file), `<host>.POST <path>` for a known model
+// endpoint (`r`), else `http.<METHOD>`: GET and HEAD are `r`; POST, PUT, PATCH
+// and DELETE are `x`. A tool that is not listed is denied (`rwx.unlisted`) in
+// every mode. The card/payment floor
 // is `flags`: it asks in every mode, trust included.
 import { Gate } from 'bareguard';
+import { matcherFrom } from 'rwxmap/match';
 
 /** The mode names, in the order the CLI and config list them. */
 export const MODES = ['ask', 'auto', 'trust'];
@@ -30,6 +33,57 @@ const TOOLS = {
   'http.PATCH': 'x',
   'http.DELETE': 'x',
 };
+
+/** Model-call endpoints per host (`host[:port]`); each is `POST` and reads (`r`). */
+const MODEL_PATHS = {
+  'api.anthropic.com': ['/v1/messages', '/v1/messages/count_tokens'],
+  'api.openai.com': ['/v1/chat/completions', '/v1/responses', '/v1/embeddings'],
+};
+const LOCAL_LLM_PATHS = ['/api/chat', '/api/generate', '/api/embed',
+  '/v1/chat/completions', '/v1/completions'];
+
+/** The matcher used when no label files are loaded: every request is request-only. */
+export const emptyMatcher = matcherFrom([]);
+
+/**
+ * The one tools table of a runtime: the `http.*` tools, the model endpoints
+ * (`r`) and the label tools. Model keys come from `matcher.match()` itself so
+ * there is no second key builder.
+ *
+ * @param {Record<string, any>} [labelTools] the label files' gate-file tools (`{ key: { letter, marker } }`)
+ * @param {string[]} [localLlm] `host:port` pairs of local model servers
+ * @returns {Record<string, any>} tool name to letter
+ */
+export function buildTools(labelTools = {}, localLlm = []) {
+  /** @type {Record<string, any>} */
+  const models = {};
+  const add = (scheme, host, paths) => {
+    for (const p of paths) models[emptyMatcher.match('POST', `${scheme}://${host}${p}`).key] = 'r';
+  };
+  for (const [host, paths] of Object.entries(MODEL_PATHS)) add('https', host, paths);
+  for (const hp of localLlm) add('http', hp, LOCAL_LLM_PATHS);
+  return { ...TOOLS, ...models, ...labelTools };
+}
+
+/**
+ * The tool name for one request. A spec key (a label file documents it) is
+ * used as is, even if the gate file lacks it (then the gate denies it:
+ * fail closed). A request-only key is used only when it is a known model
+ * endpoint; everything else is `http.<METHOD>`. Never the matcher's letter.
+ *
+ * @param {{ match: (method: string, url: string) => { key: string, source: string } }} matcher
+ * @param {Record<string, any>} tools the runtime's tools table
+ * @param {string} method HTTP method
+ * @param {string} url full request URL
+ * @returns {string} the tool name
+ */
+export function toolFor(matcher, tools, method, url) {
+  try {
+    const r = matcher.match(method, url);
+    if (r.source === 'spec' || Object.hasOwn(tools, r.key)) return r.key;
+  } catch { /* not an http(s) URL: fall through */ }
+  return `http.${method}`;
+}
 
 /** @type {Record<string, Record<string, 'ask' | 'deny'>>} */
 const FLAGS = { cardLike: { true: 'ask' }, paymentPath: { true: 'ask' } };
@@ -61,17 +115,18 @@ export function paymentPath(url) {
  * @param {string} opts.agent agent name (the gate's rwx agent)
  * @param {string} opts.mode `ask` | `auto` | `trust`
  * @param {string} opts.auditPath bareguard audit file (shared by every gate of a runtime)
+ * @param {Record<string, any>} [opts.tools] the runtime's tools table (default: the `http.*` tools)
  * @param {(event: any) => Promise<{ decision: 'allow' | 'deny', reason?: string }>} opts.humanChannel resolves every ask
  * @returns {Promise<Gate>} an initialised gate
  */
-export async function gateFor({ agent, mode, auditPath, humanChannel }) {
+export async function gateFor({ agent, mode, auditPath, humanChannel, tools = TOOLS }) {
   if (!MODES.includes(mode)) {
     throw new Error(`policy: mode must be ${MODES.join('|')}, got ${JSON.stringify(mode)}`);
   }
   const { letters, askUnheld } = MODE_RULES[mode];
   const gate = new Gate({
     audit: { path: auditPath },
-    rwx: { agent, agents: { [agent]: letters }, tools: TOOLS, askUnheld },
+    rwx: { agent, agents: { [agent]: letters }, tools, askUnheld },
     // The mode letters plus the card/payment floor are the whole policy; bareguard's
     // default word patterns scan the URL and method and would fire before rwx.
     content: { askPatterns: [], denyPatterns: [] },

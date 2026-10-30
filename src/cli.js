@@ -31,6 +31,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { resolveConfig } from './config.js';
+import { loadLabels } from './labels.js';
 import { MODES } from './policy.js';
 import { writeFileAtomic } from './holds.js';
 import { run as sandboxRun } from './run.js';
@@ -163,7 +164,7 @@ async function run(args) {
     usage();
   }
   if (values.mode !== undefined && !MODES.includes(values.mode)) usage();
-  /** @type {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], heldBodyMaxMB?: number }} */
+  /** @type {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number }} */
   let cfg;
   try {
     cfg = resolveConfig({ mode: values.mode });
@@ -172,6 +173,14 @@ async function run(args) {
     process.exit(2);
   }
   const { mode } = cfg;
+  /** @type {ReturnType<typeof loadLabels>} */
+  let labels;
+  try {
+    labels = loadLabels(cfg);
+  } catch (e) {
+    err(e instanceof Error ? e.message : String(e));
+    process.exit(2);
+  }
   const timeoutMs = cfg.holdTimeoutSec === 'never' ? 'never' : Number(cfg.holdTimeoutSec) * 1000;
   if (!command.length) usage();
   const json = values.json ?? false;
@@ -202,7 +211,7 @@ async function run(args) {
       .map((s) => s.trim()).filter(Boolean);
     result = await sandboxRun({
       runtime, proj: process.cwd(), command, mode, timeoutMs,
-      allowLocal: cfg.localLlm,
+      allowLocal: cfg.localLlm, labels,
       ...(cfg.heldBodyMaxMB ? { heldBodyMaxBytes: cfg.heldBodyMaxMB * 1048576 } : {}),
       unsafeTestOnly: { allowLoopback: process.env.SBX_UNSAFE_TEST_ALLOW_LOOPBACK === '1' },
       overlay,
