@@ -36,6 +36,7 @@
     "poc:m0": "bash poc/m0/run-m0.sh",
     "redteam:m0": "bash poc/m0/redteam.sh",
     "bench": "node scripts/bench.mjs",
+    "bench:agents": "node scripts/bench-agents.mjs",
     "test": "env -u NODE_USE_ENV_PROXY -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u FTP_PROXY -u http_proxy -u https_proxy -u all_proxy -u ftp_proxy node --test --import ./test/setup-env.mjs \"test/*.test.mjs\"",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "build:types": "tsc",

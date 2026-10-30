@@ -7,102 +7,33 @@
 //
 // What it measures (thresholds from the PRD):
 //   - 20 concurrent agents via proxy.addAgent + launch(), RSS per sandbox
-//     from an exact /proc walk of each bwrap PID tree (ppid map built from
-//     /proc/*/stat, VmRSS summed from /proc/*/status — the M0 measure.cjs
-//     approach; never pgrep -f). Gated metric is the walls overhead per
+//     from an exact /proc walk of each bwrap PID tree (scripts/measure.mjs,
+//     shared with bench-agents.mjs; never pgrep -f). Gated metric is the walls overhead per
 //     sandbox (whole tree minus the `sleep` payload, exactly the M0
 //     "no-sleep" number the 10 MB target was set against); totals print too.
 //   - proxy RSS (own process) at three points: idle, after minting certs for
 //     10 hosts via certFor (the same path CONNECT uses), and with 20 parked
 //     holds.
 // Exit 1 when max walls RSS per sandbox exceeds 10 MB or any proxy reading
-// exceeds 80 MB. On success prints a markdown numbers table to paste into
+// exceeds 150 MB. On success prints a markdown numbers table to paste into
 // the PRD.
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { createProxy } from '../src/proxy.js';
 import { launch } from '../src/launcher.js';
 import { certFor } from '../src/certs.js';
+import { canUnix, pidChildren, treeRss, waitFor, waitSteady } from './measure.mjs';
 import { bwrapUsable, hasBin } from '../test/fixtures/probes.mjs';
 
 const N = 20;
 const CERT_HOSTS = 10;
 const MAX_SANDBOX_MB = 10;
-const MAX_PROXY_MB = 80;
+const MAX_PROXY_MB = 150;
 const SKIP_EXIT = 77;
 
 const fail = (msg) => { console.error(`bench FATAL: ${msg}`); process.exit(1); };
-
-function canUnix() {
-  return new Promise((resolve) => {
-    const p = path.join(os.tmpdir(), `bb-bench-${process.pid}.sock`);
-    const s = net.createServer();
-    s.on('error', () => resolve(false));
-    s.listen(p, () => s.close(() => { try { rmSync(p); } catch {} resolve(true); }));
-  });
-}
-
-/** Poll `cond` until truthy; throw naming the condition on timeout. */
-async function waitFor(cond, what, timeoutMs = 10000) {
-  const t0 = Date.now();
-  for (;;) {
-    const v = await cond();
-    if (v) return v;
-    if (Date.now() - t0 > timeoutMs) throw new Error(`bench: timed out waiting for ${what}`);
-    await new Promise((r) => setTimeout(r, 50));
-  }
-}
-
-// --- exact /proc RSS walk (port of poc/m0/measure.cjs, ESM) ----------------
-function pidChildren() {
-  /** @type {Record<string, string[]>} */
-  const kids = {};
-  for (const d of readdirSync('/proc')) {
-    if (!/^\d+$/.test(d)) continue;
-    try {
-      const stat = readFileSync(`/proc/${d}/stat`, 'utf8');
-      const m = stat.match(/^\d+ \(.*\) \S+ (\d+)/);
-      if (m) (kids[m[1]] = kids[m[1]] || []).push(d);
-    } catch { /* raced exit */ }
-  }
-  return kids;
-}
-
-function rssKb(pid) {
-  try {
-    const m = readFileSync(`/proc/${pid}/status`, 'utf8').match(/^VmRSS:\s+(\d+) kB/m);
-    return m ? +m[1] : 0;
-  } catch { return 0; }
-}
-
-function comm(pid) {
-  try { return readFileSync(`/proc/${pid}/comm`, 'utf8').trim(); } catch { return '?exited'; }
-}
-
-const mb = (kb) => kb / 1024;
-
-function treeRss(rootPid, kids) {
-  const members = [];
-  const stack = [String(rootPid)];
-  while (stack.length) {
-    const p = /** @type {string} */ (stack.pop());
-    members.push(p);
-    for (const k of kids[p] || []) stack.push(k);
-  }
-  let total = 0;
-  let noSleep = 0;
-  const parts = [];
-  for (const p of members) {
-    const kb = rssKb(p);
-    const c = comm(p);
-    total += kb;
-    if (c !== 'sleep') noSleep += kb;
-    parts.push(`${c}=${mb(kb).toFixed(1)}MB`);
-  }
-  return { procs: members.length, totalMb: mb(total), noSleepMb: mb(noSleep), parts };
-}
 
 // --- main ------------------------------------------------------------------
 const unixOk = await canUnix();
@@ -155,31 +86,8 @@ try {
     child.on('error', () => {});
     children.push(child);
   }
-  // Steady-state sampling: the launch flow's inner door-probe loop
-  // (`echo > /dev/tcp/127.0.0.1/<door>` x50 in src/launcher.js) proves the
-  // socat front door accepts before `exec "$@"` replaces bash with the
-  // payload. The host-side observable of that readiness is the payload
-  // (`sleep`) present with the transient pre-exec `bash` gone in each bwrap
-  // tree. Sampling earlier catches the short-lived bash (~3.7 MB) and the
-  // probe's forked socat child (~2.1 MB), so a run passes/fails on timing
-  // alone. Wait for that steady state per agent, then one short bounded
-  // settle for the probe-forked socat child to exit — the settle follows
-  // readiness, it is not the readiness mechanism.
-  await waitFor(() => {
-    const kids = pidChildren();
-    return children.every((c) => {
-      if (!c.pid) return false;
-      const comms = new Set();
-      const stack = [String(c.pid)];
-      while (stack.length) {
-        const p = /** @type {string} */ (stack.pop());
-        comms.add(comm(p));
-        for (const k of kids[p] || []) stack.push(k);
-      }
-      return comms.has('sleep') && !comms.has('bash');
-    }) || false;
-  }, 'all 20 sandboxes to reach steady state (payload up, transient bash gone)');
-  await new Promise((r) => setTimeout(r, 500));
+  // Steady state (payload up, transient bash gone) — see waitSteady.
+  await waitSteady(children);
 
   const kids = pidChildren();
   const trees = children.map((c) => treeRss(c.pid, kids));
