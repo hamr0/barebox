@@ -33,6 +33,9 @@ const HOP_REQ = new Set(['proxy-connection', 'proxy-authorization']);
 // Bodies up to this size are read whole (under the agent's working slot) so
 // the card floor can scan them; a bigger body streams on, unchecked.
 const WORK_BODY_LIMIT = 65536;
+// Small teams: one proxy serves at most this many agents (the TCP door's
+// 'tcp' agent is not counted); more agents means another proxy.
+const MAX_AGENTS = 40;
 const EMPTY = Buffer.alloc(0);
 const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
   'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
@@ -948,6 +951,9 @@ export function createProxy(opts) {
   function addAgent(name) {
     const sockPath = runtimePaths(runtime).socket(name);
     if (agentServers.has(name)) return sockPath;
+    if (agentServers.size >= MAX_AGENTS) {
+      throw new Error(`createProxy: agent limit reached (${MAX_AGENTS} agents per proxy); run another proxy for more`);
+    }
     try { fs.unlinkSync(sockPath); } catch {}
     ensurePrivateDir(path.dirname(sockPath));
     const srv = net.createServer((sock) => {

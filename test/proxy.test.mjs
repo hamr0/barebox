@@ -1091,6 +1091,32 @@ describe('holds', () => {
       } finally { await finish(); }
     });
 
+    it('the 41st agent is refused with the limit named; removeAgent frees a place', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy();
+      try {
+        for (let i = 0; i < 40; i++) hp.addAgent(`l${i}`);
+        assert.equal(hp.addAgent('l0'), join(HRT, 'socks', 'l0.sock'), 're-adding an existing agent is not a new place');
+        assert.throws(() => hp.addAgent('l40'),
+          { message: 'createProxy: agent limit reached (40 agents per proxy); run another proxy for more' });
+        hp.removeAgent('l7');
+        assert.ok(hp.addAgent('l40'), 'a freed place is reusable');
+        assert.throws(() => hp.addAgent('l41'), /agent limit reached \(40 agents/);
+      } finally { await finish(); }
+    });
+
+    it('the tcp door still works with 40 agents added', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      const P2 = await holdProxy();
+      try {
+        for (let i = 0; i < 40; i++) hp.addAgent(`l${i}`);
+        const p1 = execA('curl', ['-s', '--max-time', '8', '-x', P2,
+          '--cacert', HCA, '--data', 'm=LIM1', `${tlsUp.url}hold`], { encoding: 'latin1' });
+        const held = await waitFor(() => pendingWith('LIM1'), 'the tcp request to park');
+        assert.equal(held.agent, 'tcp');
+        answer(held.id, { decision: 'allow' });
+        assert.match((await p1).stdout, /LIM1/);
+      } finally { await finish(); }
+    });
+
     it('the 18th held request from one agent gets 429 fast', { skip: NEED_UNIX, timeout: 20000 }, async () => {
       await holdProxy({ timeoutMs: 15000 });
       try {
