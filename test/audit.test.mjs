@@ -47,7 +47,7 @@ const linesOf = (file) => {
  * One proxy on its own runtime, torn down after `fn`. `mode` builds the real
  * policy gates unless `gateFor` is given; `gateFor: null` is forward-all.
  */
-async function withProxy({ mode = 'auto', gateFor, hold = {}, unsafe = {} } = {}, fn) {
+async function withProxy({ mode = 'auto', gateFor, hold = {}, unsafe = {}, redact } = {}, fn) {
   const rt = mkdtempSync(join(tmpdir(), 'bb-audit-'));
   const paths = runtimePaths(rt);
   const proxy = createProxy({ port: 0, logFile: paths.audit, runtime: rt, clientIdleMs: 5000,
@@ -55,6 +55,7 @@ async function withProxy({ mode = 'auto', gateFor, hold = {}, unsafe = {} } = {}
     ...(gateFor === null ? {} : {
       gateFor: gateFor ?? ((agent, { humanChannel }) =>
         policyGate({ agent, mode, auditPath: paths.audit, humanChannel })) }),
+    ...(redact ? { redact } : {}),
     hold: { timeoutMs: 15000, pollMs: 25, ...hold } });
   const { port } = await proxy.ready;
   const t = {
@@ -153,6 +154,22 @@ describe('one audit file', () => {
       assert.equal(hold.meta.agent, 'tcp');
       assert.ok(!hold.meta._truncated, 'meta not replaced whole');
       assert.ok(hold.meta.url.length <= 400);
+    });
+  });
+
+  it('bounded meta: a hold still over 1000 bytes after barebox\'s own cuts keeps meta.id and meta.agent', { timeout: 20000 }, async () => {
+    // `redact` adds a 2 KB field: with the 400-char url the meta is far over bareguard's 1000-byte cap.
+    await withProxy({ redact: (e) => ({ ...e, extra: 'x'.repeat(2000) }) }, async (t) => {
+      const { done } = t.send(`plain?q=${'a'.repeat(5000)}`, Buffer.from('m=BIG'));
+      const [h] = await t.parked();
+      t.answer(h.id, { decision: 'deny' });
+      await done;
+      const hold = await waitFor(() => t.lines().find((l) => l.phase === 'annotate' && l.verdict === 'hold'), 'hold annotate');
+      assert.ok(hold.meta._truncated, 'the meta really was over the cap (else this test proves nothing)');
+      assert.ok(hold.meta.bytes > 1000, `original meta bytes ${hold.meta.bytes}`);
+      assert.ok(hold.meta._droppedKeys.includes('extra'), 'the largest key was dropped');
+      assert.equal(hold.meta.id, h.id);
+      assert.equal(hold.meta.agent, 'tcp');
     });
   });
 

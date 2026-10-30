@@ -199,8 +199,8 @@ export function createProxy(opts) {
   /** Cut a string field. @param {unknown} v @param {number} n */
   const cut = (v, n) => (typeof v === 'string' ? v.slice(0, n) : v);
   /**
-   * barebox's fact as the `meta` of an annotate. The bound is an adapter for
-   * bareguard (upstream ask pending).
+   * barebox's fact as the `meta` of an annotate. The per-field cuts keep audit
+   * lines short; bareguard 0.30.0 drops whole keys over its own cap.
    * @param {Record<string, unknown>} o
    * @returns {Record<string, unknown>}
    */
@@ -209,12 +209,7 @@ export function createProxy(opts) {
     meta['url'] = cut(meta['url'], 400);
     meta['note'] = cut(meta['note'], 200);
     meta['reason'] = cut(meta['reason'], 200);
-    if (Buffer.byteLength(JSON.stringify(meta)) <= 900) return meta;
-    /** @type {Record<string, unknown>} */
-    const small = {};
-    for (const k of ['id', 'agent', 'method', 'code', 'decision']) if (meta[k] !== undefined) small[k] = meta[k];
-    if (meta['url'] !== undefined) small['url'] = cut(meta['url'], 200);
-    return small;
+    return meta;
   };
   /** @param {Record<string, unknown>} o */
   async function writeLog(o) {
@@ -230,7 +225,8 @@ export function createProxy(opts) {
       await /** @type {NonNullable<GateLike['annotate']>} */ (g.annotate)({
         surface: false, verdict: String(o['ev']), where, meta: metaOf(o) });
     } finally {
-      // Adapter for bareguard (upstream ask pending): barebox has no turns, so nothing else drains the buffer.
+      // Normal use of bareguard's API for a process with no turns: it keeps memory at zero facts
+      // (0.30.0 caps the buffer at 256, which could reach about 350 KB per gate). No upstream ask is pending.
       g.drainAnnotations?.();
     }
   }
