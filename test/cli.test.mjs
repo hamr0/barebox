@@ -17,6 +17,7 @@ import { claimRuntime } from '../src/runtime.js';
 import { writeFileAtomic } from '../src/holds.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
+import { pathGate } from './fixtures/gates.mjs';
 import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
 
 // test/setup-env.mjs (via --import) already dropped the sandbox's egress proxy
@@ -217,7 +218,7 @@ describe('sbx cli over the file channel', () => {
     proxy = createProxy({ port: 0,
       logFile: join(RT, 'mitm.log'), upstreamCa: CA, runtime: RT,
       clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
-      hold: { match: '/hold', timeoutMs: 30000, pollMs: 25 } });
+      gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 30000, pollMs: 25 } });
     ({ port: PORT } = await proxy.ready);
   });
   after(async () => {
@@ -519,4 +520,38 @@ describe('sbx run sandboxed (needs bwrap+unix+socat+curl)', () => {
       await a.closed.catch(() => {});
     }
   });
+});
+
+const SOCKET_OK = await new Promise((resolve) => {
+  const p = join(tmpdir(), `bb-cprobe-${process.pid}.sock`);
+  const s = net.createServer();
+  s.on('error', () => resolve(false));
+  s.listen(p, () => s.close(() => { try { rmSync(p); } catch {} resolve(true); }));
+});
+
+describe('sbx run process flags (needs bwrap + socket)', () => {
+  const skip = !bwrapUsable() ? 'needs bwrap; run in a real shell or CI'
+    : (!SOCKET_OK ? 'unix socket bind blocked here; run in a real shell or CI' : false);
+
+  it('the shebang gives sbx --max-semi-space-size=1 (read from /proc cmdline while it runs)',
+    { skip, timeout: 60000 }, async () => {
+      const root = mkdtempSync(join(tmpdir(), 'bb-c-flag-'));
+      const home = join(root, 'h'); const proj = join(root, 'p');
+      mkdirSync(home); mkdirSync(proj);
+      // CLI is spawned directly: the kernel runs the shebang, `env -S` splits the flag.
+      const child = spawn(CLI, ['run', '--', 'sleep', '2'],
+        { cwd: proj, env: { ...process.env, HOME: home, SBX_RUNTIME: join(root, 'rt') } });
+      let err = '';
+      child.stderr.on('data', (c) => { err += c; });
+      const closed = new Promise((resolve) => child.on('close', resolve));
+      try {
+        await new Promise((r) => setTimeout(r, 700)); // sbx up, `sleep 2` still running
+        const argv = readFileSync(`/proc/${child.pid}/cmdline`, 'utf8').split('\0');
+        assert.ok(argv.includes('--max-semi-space-size=1'), `cmdline: ${JSON.stringify(argv)}`);
+        assert.equal(await closed, 0, err);
+      } finally {
+        child.kill('SIGKILL');
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
 });

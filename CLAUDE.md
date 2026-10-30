@@ -29,7 +29,7 @@ Search this corpus instead of reading it whole: `/docs-builder search <query wor
 
 **Responsive web UI is mandatory.** Any web UI must work on mobile by default — fluid layouts, viewport meta, breakpoints, no horizontal scroll. Verify in DevTools device emulation before claiming a UI task is done. POCs exempt; real projects are not.
 
-For full development and testing standards, see `.claude/remember/AGENT_RULES.md` (plus `LIBRARY_CONVENTIONS.md` — this is a zero-dependency library). Consult when building something new or adding a feature — a standards guide, not hot context.
+For full development and testing standards, see `.claude/remember/AGENT_RULES.md` (plus `LIBRARY_CONVENTIONS.md` — a small library; its runtime dependencies are only bareguard and rwxmap, pinned exactly). Consult when building something new or adding a feature — a standards guide, not hot context.
 
 <!-- AGENT_RULES:START -->
 **One writer per piece of state.** One function assigns each field; everything else

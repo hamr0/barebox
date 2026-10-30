@@ -117,3 +117,256 @@ blocks unix binds — M2 runs in a real terminal).
 - Branch protection: first dropped, then applied Oct 26 mirroring bareguard.
 - GitHub About description + topics: set Oct 26 via `gh`.
 - npm trusted-publisher: needed before the first Actions dispatch.
+
+## M3 — memory with bareguard (round 1, Oct 29)
+
+POC `poc/m3/rss.mjs`, run in a real shell with bwrap, socat and unix sockets, nothing
+skipped. Three runs by a worker and one by the orchestrator, matching within 1 MB. One
+process, GC forced from row 1d. Means:
+
+| Stage | RSS MB | Delta |
+|---|---|---|
+| baseline held (gc) | 78.0 | 0 |
+| + bareguard 0.28.0 import | 81.5 | +3.5 |
+| + 20 gates built + init (one per agent) | 82.6 | +1.1 |
+| + 360 gate.check() | 86.8 | +4.2 |
+| + rwxmap match.js import | 86.9 | +0.1 |
+| + 360 matchOperation() | 90.9 | +4.0 |
+| + 20 held 64 KB bodies | 91.6 | +0.7 |
+| + 100 held 64 KB bodies | 96.7 | +5.1 |
+| + 360 held 64 KB bodies | 112.9 | +16.2 |
+
+Sandbox walls unchanged: mean 7.8 MB, max 7.9–8.0 MB.
+
+Reading: as measured, bareguard alone takes the proxy over 80 MB. Bodies are the swing
+factor, and the global buffered-body limit bounds them (replaced in round 2 by two body slots per agent).
+
+Two known flaws in round 1, fixed in round 2 below:
+
+- The "proxy" RSS includes the client side (360 client sockets, child handles), which in
+  production live in the sandboxes.
+- Per-call deltas may be V8 heap high-water, not retained state.
+
+Lesson: measure the proxy in its own process before sizing a budget from it.
+
+## M3 — memory, round 2 (Oct 29)
+
+> Superseded Oct 30: this test had no real HTTP traffic; see "M3 — B2c memory bench (Oct 30)" below. Kept as history.
+
+POC `poc/m3/rss2.mjs` + `proxy-host.mjs`. The proxy runs in its own child process. The
+parent hosts the 20 sandboxes and the 360 hold sockets, and reads the child's VmRSS from
+/proc after the child forces GC. 2 variants x 3 runs, real shell, nothing skipped, all
+exit 0. The orchestrator reran variant B once, within 0.4 MB. Means, VmRSS MB:
+
+| Stage | default node | --max-semi-space-size=1 |
+|---|---|---|
+| idle | 60.6 | 58.9 |
+| 10 certs minted | 69.7 | 66.1 |
+| held: 20 agents x (1 parked + 16 waiting) | 74.7 | 71.2 |
+| + bareguard 0.28.0 import | 77.8 | 74.4 |
+| + 20 gates | 79.9 | 75.0 |
+| + 360 check() | 84.6 | 75.2 |
+| + 3600 check() total | 85.1 | 75.8 |
+| + rwxmap match import | 85.2 | 75.9 |
+| + 360 matches | 90.3 | 76.3 |
+| + 3600 matches total | 90.5 | 76.4 |
+| + 20 held 64 KB bodies | 91.6 | 77.3 |
+| + 100 bodies | 96.6 | 82.3 |
+| + 360 bodies | 112.9 | 98.6 |
+
+Readings:
+
+- Round 1's 78.0 baseline included the client side. The proxy alone is 74.7 (default) /
+  71.2 (flag).
+- The per-call growth is one-time V8 young-generation high-water, not retained state:
+  heapUsed after GC rose only ~0.2 MB over 3240 extra calls.
+- `--max-semi-space-size=1` caps the young generation at 1 MB and removes most of it
+  (first 360 checks +4.7 to +0.2 MB; first 360 matches +5.1 to +0.4 MB). Its CPU cost is
+  not measured yet.
+- Bodies live off-heap. The flag does not change them (64 KB each).
+- Split, with the flag: about 70 MB fixed (Node + proxy + certs ~66, bareguard + rwxmap
+  ~4) plus about 0.34 MB per agent in the worst case (gate ~0.03, 1 held + 16 waiting
+  ~0.25, one 64 KB body ~0.06). An estimate from the 20-agent point, assuming linear
+  growth; not measured at other counts.
+
+bareguard's answers (from the bareguard session):
+
+- One Gate per agent is deliberate: the grant comes from gate config, never from the
+  action. About 55 KB each.
+- A lighter bareguard entry would save ~0: gate.js imports every primitive.
+- Fileless audit mode keeps every line in memory, so always give the gate a file path.
+- Build all gates from ONE shared tools object.
+
+Lessons: measure the proxy in its own process; force GC and read heapUsed to tell retained
+state from high-water; repeat calls to see a plateau.
+
+## M3 — part A results (Oct 29)
+
+Built: card scanner (`src/cardscan.js`), the one config file, the semi-space flag in the
+CLI's first line, `scripts/latency.mjs`. Full suite 350/350 three times in a real shell,
+0 skip; typecheck clean.
+
+Latency with and without `--max-semi-space-size=1` (`scripts/latency.mjs`, 2000 requests,
+3 runs):
+
+- p50: the same (about 0.8–1.0 ms).
+- p95/p99: up to about 0.5 ms slower with the flag in 2 of 3 runs, the same in the third.
+
+Card scanner, found in review and fixed: a card followed by a CVV was missed. The greedy
+match ran into the CVV digits and Luhn failed on the longer run. Fixed so the scanner finds
+the card when a CVV follows.
+
+Why large bodies are not checked: random 16-digit numbers starting 2–6 pass Luhn about 1
+time in 10. Denying on a hit would break uploads full of ids. Bodies over 64 KB stream
+through unchecked for card numbers (known gap).
+
+## M3 — B1 gate wiring (Oct 29)
+
+Part B1 puts bareguard 0.29.0 in front of every request. Brief: `docs/logs/m3-b1-gate-brief.md`.
+
+Design as built:
+- One gate per agent (and one for the TCP door's `tcp` agent), built by `policy.gateFor` from one shared tools table (`src/policy.js`). The mode only picks the letters and `askUnheld`.
+- barebox's hold queue is each gate's `humanChannel`. A request gets a barebox id (`rid`) that goes in the gate action; the channel looks the request up by `event.action.rid` (`src/proxy.js` `askHuman`). Inside `check()` the channel reserves the agent's hold slot, spools the body to `held/<id>`, frees the working slot and parks. A full line answers 429 `hold queue full`.
+- Bodies of 64 KB or less are read in the agent's working slot before the gate decides, so the card scanner can set `cardLike`. The body never goes in the action, since bareguard writes the action to its audit file.
+- A plain object with `check()` can stand in for a Gate (tests do); `askHuman` from it goes to the same channel.
+
+Smoke test (orchestrator, real internet): `sbx run --mode auto --json -- bash -c 'curl https://example.com/; curl -X POST -d q=1 https://httpbin.org/post'`. The GET returned 200. The POST parked as ask h1 (rule `rwx.ask`, letter `x`, bodyPreview `q=1`). `sbx deny h1` gave 403 on the POST. Events were ask, decided, done, exit 0. `gate.jsonl` held 1 `rwx.allow` and 2 `rwx.ask` lines (the gate phase and the approval phase of the one ask). Suite 398/398 three times in a real shell; typecheck clean.
+
+Concurrent audit writes (20 gates, one `gate.jsonl`): safe by reading, not stress-tested. bareguard's audit writer appends each line with one `appendFile` in append mode on Linux (`node_modules/bareguard/src/primitives/audit.js:575`) and caps a line at 3500 bytes (`MAX_LINE_BYTES`, `audit.js:11`), under the 4096-byte PIPE_BUF its comment cites. The code comment relies on the kernel keeping such appends whole. One file per agent was not needed on that reading; a concurrent stress test is in the fix ledger.
+
+Still separate: barebox's `audit.jsonl` and bareguard's `gate.jsonl`. They merge in B2.
+
+## M3 — B2a labels (Oct 30)
+
+Part B2a adds rwxmap labels, model endpoints (`r`) and the `labels` / `tenants` config keys. Brief: `docs/logs/m3-b2a-labels-brief.md`. Verified in a real shell: full suite 421/421 three times, 0 skip, typecheck clean.
+
+Finding: bareguard's zero-config content patterns scanned the URL and method before the mode letters (B1, `c09283e`). In every mode, `trust` included:
+- PUT, PATCH and DELETE asked;
+- a GET with a word like "remove" or "drop" in its URL asked;
+- a URL containing "TRUNCATE TABLE" was denied.
+
+So the B1 modes table was not what happened. How it was found: the B2a worker's tests 4, 6 and 7 (labelled PUT in `auto`, deleted gate row in `trust`, matched PUT through the proxy) failed for reasons that were not the labels. The orchestrator reproduced it against `c09283e` with the proxy's action shape. Fix: `gateFor` passes `content: { askPatterns: [], denyPatterns: [] }`; the keyword patterns are gone and only mode letters, labels and the floor decide.
+
+Smoke (`sbx run`, httpbin label folder): `auto` labelled PUT (`w`) 200 with no ask; unlabelled PUT asked (`rwx.ask`), denied by the user, 403; `trust` both PUTs 200; `GET /anything/remove-item` 200 in both modes; `POST api.anthropic.com/v1/messages` allowed as tool `api.anthropic.com.POST /v1/messages`; the label folder was not visible inside the sandbox.
+
+## M3 — B2b one audit file (Oct 30)
+
+Part B2b makes `<runtime>/gate.jsonl` the only audit file. Brief: `docs/logs/m3-b2b-audit-brief.md`. Verified in a real shell: full suite 432/432 three times, 0 skip, typecheck clean, `primitives.json` current. Live smoke in `auto` mode: a labelled PUT and an asked-then-approved POST, each with a body. One file, no `audit.jsonl`; each request's gate and record lines share an `aid`; hold and decide join on id `h1`; the `body` line's SHA-256 is the correct hash of "hello"; a fake bearer token and the body text appear 0 times in `gate.jsonl`.
+
+Measured facts about bareguard 0.29.0:
+- `annotate` keeps every fact in memory until `drainAnnotations()`: 1000 calls left 1000 buffered, kept in full. barebox drains after every annotate.
+- A `meta` over 1000 bytes is replaced whole by `{ _truncated: true, bytes }`, so every key in it is lost. barebox cuts `url` to 400 characters and `note`/`reason` to 200, with a 900-byte fallback that keeps the join ids.
+- A 6 KB URL in `action` is clipped to 211 characters in the gate line; `rid` and `aid` survive.
+
+Decision (user, Oct 30): the audit file holds a body's length and SHA-256 only, with no preview and no request headers. The 4 KB masked preview lives in the ask file only. This replaces the PRD's earlier "each request line carries a 4 KB preview".
+
+Upstream: shape agreed with the guard session for bareguard 0.30.0 (not built; needs the user's approval there; no date): a 256-fact cap (`surface:false` evicted first, `annotate_dropped` phase); oversize `meta` drops whole keys, largest first, with `_droppedKeys`, also at the 3500-byte line cap; docs only for the content defaults. barebox keeps the drain on 0.30.0 (256 facts could reach about 350 KB per gate against a budget of about 0.34 MB per agent).
+
+## M3 — B2c memory bench (Oct 30)
+
+Part B2c measures the proxy at 10 / 20 / 30 / 40 agents in the full worst case. Brief: `docs/logs/m3-b2c-bench-brief.md`. Script: `npm run bench:agents`. All numbers measured by the orchestrator in a real shell on Oct 30.
+
+Method: the proxy in its own process with forced GC, real gates, a 170-operation label tools table. Every agent at the worst case at once: 1 parked + 16 waiting + 1 turned away with 429 + the working slot filled, all with 64 KB bodies.
+
+First run (bareguard 0.29.0). Proxy RSS:
+
+| Agents | RSS MB |
+|---|---|
+| 10 | 141.9 |
+| 20 | 318.3 (374 on a quiet machine) |
+| 30 | 290.1 |
+| 40 | 383.6 |
+
+Gate asks ran at about 3.5 per second.
+
+**Cause 1, upstream.** bareguard `gate.haltContext()` (gate.js:2163, called while building every ask event) called `audit.readAll()`: it read and parsed the whole shared audit file once per ask.
+- At 20 agents that was 380 full reads, 3.68 GB in total, with JS heap peaking at 776 MB against 16 MB live.
+- Each ask cost O(file size), so asks over a run cost O(n²), and one agent's traffic slowed every agent's asks.
+- It also explains why `--max-old-space-size=48` crashed with "heap out of memory".
+- Proof: a temp patch that skipped the read gave 96 / 118 / 124 / 146 MB.
+- Fix: bareguard ruling #72 (each gate keeps a running tally and reads only the bytes added since its last read), built at 943732e on feat/annotate-bounds for 0.30.0, together with ruling #71 (annotate buffer cap, key-drop meta bound).
+- On 943732e: 99.5 / 114.4 / 124.3 / 143.6 MB, peak heap 24-31 MB, drift +0.8 MB over 7200 more requests.
+- Not verified by barebox: guard's claim of about 20 file walks instead of 380. The read counter could not see the new chunked reads; the low peak heap is the evidence.
+- 0.30.0 was not on npm at the time of writing, so it is not pinned.
+
+**Cause 2, barebox.** Held bodies stayed in memory after being spooled to disk, because the `readBounded` result object kept a reference to the chunk array in the awaiting frame. Fixed with a `readWorkBody(ctx)` helper. Test: 68 held bodies, `arrayBuffers` growth fell from 4.6 MB (106% of the bodies) to 0.28 MB. At 360 bodies it was 29 MB before and 1.4 MB after.
+
+**Ruled out, with numbers:**
+- glibc arenas: `MALLOC_ARENA_MAX=1` gave 109-114 MB, no real change
+- malloc trim settings
+- tools table size: 170 vs 2000 ops gave the same RSS
+- plain Node sockets and file streams
+- `--optimize-for-size`, which saves about 3-6 MB once the upstream bug is fixed
+
+**Where 117 MB goes at 20 agents** (with the read skipped):
+
+| Part | MB |
+|---|---|
+| shared Node runtime code (libnode) | 52.7 |
+| native C heap (sockets, parsers, per-connection state) | about 32 |
+| V8 heap pages | about 25 |
+| other | about 7 |
+
+So 80 MB is not reachable on Node.
+
+**Normal use** (agents joined, 3600 allowed requests, no holds): 83-87 MB. The PRD's earlier 76.4 MB "round 2" figure (above, "M3 — memory, round 2") came from a test with no real HTTP, so it is superseded.
+
+**Scaling.** About 1.4 MB per agent at the proxy (a straight-line estimate over 4 points), plus about 8 MB per sandbox for walls (max 8.0, mean 7.8; limit 10). With bareguard's bug the growth was superlinear (quadratic in asks over a run). With the fix it is linear.
+
+**Comparison with srt** (sandbox-runtime 0.0.81, measured earlier in the PRD: about 100 MB per sandbox because each runs its own proxy):
+
+| Agents | barebox worst case (proxy + 8 MB per sandbox) | srt |
+|---|---|---|
+| 10 | ~180 MB | ~1 GB |
+| 20 | ~274 MB | ~2 GB |
+| 40 | ~464 MB | not measured |
+
+**Decision (user, Oct 30).** Proxy budget 150 MB in the full worst case at 40 agents; 80 MB retired. barebox targets small teams. 40 agents per proxy is the maximum, enforced: `addAgent` refuses the 41st with an error saying to run another proxy; the `tcp` door does not count; `removeAgent` frees a place. Above 40, an orchestrator runs more proxies. Walls stay at 10 MB per sandbox.
+
+### Final numbers on published bareguard 0.30.0 (Oct 30)
+
+Suite 436/436, 3 runs, 0 skip. The published release has two changes after the tested commit 943732e, so the bench was rerun.
+
+| Agents | Clean run 1 | Clean run 2 |
+|---|---|---|
+| 10 | 99.0 | 100.2 |
+| 20 | 112.7 | 116.0 |
+| 30 | 126.8 | 133.4 |
+| 40 | 145.0 | 147.7 |
+
+Both clean runs pass at 150 MB, with 2–5 MB to spare at 40 agents. A run at load average 38–54 read 154.0 MB at 40 agents and is discarded as load noise, but it shows how thin the margin is.
+
+Drift over 7200 requests read +0.8, +3.5, +2.4, +1.1 and +4.8 MB across five runs. A long run settled it: 20 agents, 61,200 allowed requests, RSS 98.7 to 99.0 MB over the first 54,000, heap flat at about 12 MB, so no steady leak. RSS then stepped to 114.0 MB with the heap still flat, on a busy machine (load about 30); that step is unexplained.
+
+Open (closed below): the same long run read 144.8 MB in the 20-agent worst case with a 51.6 MB audit file, against 113–116 MB after a short run.
+
+### Long audit file (Oct 30)
+
+**Result: audit file size does not move the worst case.** The memory budget does not depend on rotation, and no fix is needed for it.
+
+Method: a throwaway copy of the bench seeded `gate.jsonl` with real lines (439 bytes each) from a short run, either after the gates were built (a long run) or before the proxy started (a restart on an old file). The seed was appended from outside the proxy. The bench itself was not changed. Worst case at load 2-3 (the last 20-agent runs ran at load 7-12):
+
+| Agents | Audit file | Worst MB, run 1 | Worst MB, run 2 | Peak (VmHWM) MB | Read by the proxy |
+|---|---|---|---|---|---|
+| 40 | 3 MB | 146.7 | 145.2 | 146.9–149.1 | 196 MB |
+| 40 | 54 MB, after | 145.4 | 143.4 | 145.5–147.3 | 2248 MB |
+| 40 | 205 MB, after | 150.1 | 143.2 | 145.0–153.3 | 8281 MB |
+| 40 | 205 MB, before | 145.3 | 143.9 | 146.8–147.8 | 8281 MB |
+| 20 | 3 MB | 119.6 | 116.7 | 117.5–120.3 | 91 MB |
+| 20 | 54 MB, after | 118.2 | 114.5 | 115.6–119.2 | 1117 MB |
+
+The check can fail: the read counter shows every gate really walked the file (8281 MB is about 40 × 205 MB). An earlier matrix's 290-300 MB peaks are a harness artefact, not a proxy cost: the seed step read the file into the proxy process. They are discarded.
+
+Ruled out: `readAll()` at gate build. The restart case's peak stays at 147-148 MB with a 205 MB file.
+
+**What moves the worst case is the RSS the proxy already holds before the holds.** Worst case is that baseline (`after 3600 allows`) plus a steady 50-60 MB at 40 agents, or about 30 MB at 20. The baseline ranged from 84.6 to 121.1 MB between identical runs and is usually higher under load. This explains the 144.8 MB reading: that run's RSS had stepped to 114.0 MB, and 114.0 + about 30 = 144. The cause of the step itself is still unexplained.
+
+**Load does move it.** 15 runs at 40 agents at load 4-35 read 144.2–172.2 MB, 8 of them over 150, including all 3 runs with no seed. Quiet runs read 143.2–150.1 MB. These readings are post-GC, and peak VmHWM is 1-3 MB higher.
+
+**Decision (user, Oct 30): the budget is a range, about 145-175 MB at 40 agents, quiet to busy machine,** not a flat 150 MB. barebox is for small teams: free, local and lightweight, built to assist and to connect to many tools, not for swarms or thousands of agents. `bench:agents` now fails above 175 MB.
+
+Not measured: the time cost of a first ask's walk. Each gate parses the whole file once, so 40 gates on a 205 MB file read 8.3 GB in total.
+
+### Smoke on bareguard 0.30.0 (Oct 30)
+
+A real `sbx run --mode auto --json` with real internet, after the 0.30.0 pin: GET example.com 200; POST httpbin asked as `rwx.ask`, approved, 200; a second POST asked, denied, 403; exit 0. One audit file, `gate.jsonl`, 16 lines, no `audit.jsonl`; `aid` joins each request's lines; two `body` lines; the body text appears 0 times. socat logged one "Connection reset by peer" as the run ended (not looked into).

@@ -1,13 +1,16 @@
 // Proxy: the front door. Terminates agent TLS with per-host certificates
 // minted on demand, sees every request through a private stdlib http.Server
 // (so HEAD, 204/304, chunked, keep-alive and slow upstreams just work),
-// forwards with https/http.request, and optionally parks matching requests
-// for a human decision. Identity = socket: each agent has its own unix
-// listener, and every log line and hold names the agent, never `c<n>`.
+// forwards with https/http.request, and asks a gate about every request
+// (bareguard, one gate per agent; see `gateFor`). When the gate asks, the
+// hold queue is its human channel: the request parks for a human decision.
+// Identity = socket: each agent has its own unix listener, and every log
+// line and hold names the agent, never `c<n>`.
 //
 // Timeout shape: the client idle clock is the server's keep-alive timeout —
 // by construction it only ticks when no request is in flight. The upstream
 // response gets its own much longer clock.
+import crypto from 'node:crypto';
 import net from 'node:net';
 import tls from 'node:tls';
 import http from 'node:http';
@@ -15,55 +18,40 @@ import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ensureCA, certFor, HOST_RE } from './certs.js';
-import { createHolds } from './holds.js';
+import { createCardScanner } from './cardscan.js';
+import { ASK_BODY_LIMIT, DEFAULT_HOLD_MAX_BODY, bodyPreview, createHolds } from './holds.js';
 import { claimRuntime, ensurePrivateDir, runtimePaths } from './runtime.js';
+import { paymentPath, toolFor, buildTools, emptyMatcher } from './policy.js';
 import { checkUpstream } from './wall.js';
+import { Gate } from 'bareguard';
 
 const AGENT = Symbol('agent');
 const SECURE = Symbol('secure');
 const IP_RE = /^\d+\.\d+\.\d+\.\d+$/;
 // Hop-by-hop headers must not be forwarded: node's HTTP stack re-frames.
 const HOP_REQ = new Set(['proxy-connection', 'proxy-authorization']);
+// Bodies up to this size are read whole (under the agent's working slot) so
+// the card floor can scan them; a bigger body streams on, unchecked.
+const WORK_BODY_LIMIT = 65536;
+// Small teams: one proxy serves at most this many agents (the TCP door's
+// 'tcp' agent is not counted); more agents means another proxy.
+const MAX_AGENTS = 40;
+const EMPTY = Buffer.alloc(0);
 const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
   'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
-
-// Secrets never land in the audit log verbatim: Authorization-style header
-// values are replaced with a fixed marker before an entry is written. The
-// user's `redact` hook runs after this scrubbing, so it sees (and further
-// shapes) an already-safe entry. Bodies stay logged as-is.
-const REDACTED = '[redacted]';
-// Interim set (M3 replaces this with bareguard's `secrets` redaction): header names whose values never land verbatim.
-const SENSITIVE_HEADERS = new Set(['authorization', 'proxy-authorization',
-  'cookie', 'set-cookie', 'x-api-key', 'x-auth-token', 'api-key']);
-
-/**
- * Copy a log entry with sensitive header values replaced by `[redacted]`.
- * The caller's headers object is never mutated.
- *
- * @param {Record<string, unknown>} entry log entry about to be written
- * @returns {Record<string, unknown>} entry with secrets scrubbed
- */
-function scrubSecrets(entry) {
-  const h = entry['headers'];
-  if (!h || typeof h !== 'object') return entry;
-  const src = /** @type {Record<string, unknown>} */ (h);
-  if (!Object.keys(src).some((k) => SENSITIVE_HEADERS.has(k.toLowerCase()))) return entry;
-  const headers = { ...src };
-  for (const k of Object.keys(headers)) {
-    if (SENSITIVE_HEADERS.has(k.toLowerCase())) headers[k] = REDACTED;
-  }
-  return { ...entry, headers };
-}
 
 /**
  * Options for {@link createProxy}.
  *
  * @typedef {object} ProxyOptions
- * @property {string} logFile JSON-lines log path (`req`, `resp`, `deny`, `hold`, `decide`, `hold-abandoned`)
+ * @property {string} logFile the runtime's one audit file (`runtimePaths(runtime).audit`), in bareguard's JSON-lines shape: every agent's gate and the runtime's own `sbx` gate append to it. barebox's own facts are `annotate` lines (`verdict` = `resp`, `deny`, `hold`, `decide`, `hold-abandoned`, ...); a response status is a `record` line joined to its request's `check` by `aid`.
  * @property {string} runtime runtime dir; required. Holds the CA + minted host certs (`certs/`, see `runtime.js`), the agent sockets, and the hold queue files.
  * @property {number} [port] opt-in TCP listener for tests, bound to 127.0.0.1 only (default: none)
  * @property {string} [upstreamCa] extra PEM the proxy trusts for upstream TLS, on top of system roots
- * @property {HoldOptions} [hold] hold queue config, or omit to forward everything
+ * @property {(agent: string, ctx: { humanChannel: (event: any) => Promise<{ decision: 'allow' | 'deny', reason?: string }>, tools: Record<string, any> }) => GateLike | Promise<GateLike>} [gateFor] builds the gate that decides one agent's requests (called once per agent, and once for the TCP door's `tcp` agent); `ctx.humanChannel` is the hold queue and `ctx.tools` the runtime's one tools table, both to hand to a bareguard `Gate`. Omit it to forward everything.
+ * @property {{ matcher: { match: (method: string, url: string) => { key: string, source: string } }, tools: Record<string, any> }} [labels] the loaded label files (see `loadLabels`); omitted means no labels, only the built-in model endpoints
+ * @property {string[]} [allowLocal] exact `host:port` pairs (the `localLlm` setting) that may pass the wall's private/loopback check; any other local destination is still denied
+ * @property {HoldOptions} [hold] hold queue config (deadline, caps, ask seam)
  * @property {number} [upstreamTimeoutMs] give up on an upstream response after this (default 120000)
  * @property {object} [unsafeTestOnly] TEST-ONLY escape hatch: everything under
  *   it weakens the sandbox wall, so production omits it and tests name it loudly.
@@ -73,18 +61,22 @@ function scrubSecrets(entry) {
  * @property {(host: string) => Promise<string[] | string | null>} [unsafeTestOnly.resolveUpstream]
  *   DNS stub: replaces the wall's resolver so rebinding is testable. Production omits it.
  * @property {number} [clientIdleMs] kill a client tunnel idle this long; never fires mid-request (default 60000)
- * @property {number} [maxLogBody] log at most this many request-body bytes, then `truncated: true` (default 1048576)
- * @property {(entry: Record<string, unknown>) => Record<string, unknown>} [redact] log redaction hook, applied after built-in secret scrubbing (default: identity)
+ * @property {(entry: Record<string, unknown>) => Record<string, unknown>} [redact] log redaction hook, applied after built-in secret scrubbing; its result becomes the `meta` of an `annotate` line (default: identity)
  */
 
 /**
- * Hold queue options (the decision seam lives in holds.js).
+ * Anything with bareguard's `check`: a `Gate`, or a plain object for tests. An
+ * `askHuman` outcome from a plain object goes to the same human channel.
+ *
+ * @typedef {{ check: (action: Record<string, unknown>) => Promise<{ outcome: string, rule?: string, reason?: string | null, aid?: string }>, record?: (action: Record<string, unknown>, result: Record<string, unknown>, opts?: { aid?: string }) => Promise<void>, annotate?: (fact: Record<string, unknown>) => Promise<void>, drainAnnotations?: () => unknown[] }} GateLike
+ */
+
+/**
+ * Hold queue options (the queue lives in holds.js).
  *
  * @typedef {object} HoldOptions
- * @property {string} [match] path substring that parks a request (default decision)
- * @property {import('./holds.js').ShouldHold} [shouldHold] decision function; overrides `match`
  * @property {number|string} [timeoutMs] hold deadline in ms, or `'never'` (default 120000)
- * @property {number} [maxBody] bodies over this are denied at the door, never queued (default 1048576)
+ * @property {number} [maxBody] bodies over this are denied at the door, never queued; held bodies spool to `<runtime>/held` (default 52428800)
  * @property {import('./holds.js').OnAsk|null} [onAsk] ask seam (bareguard `humanChannel` shape).
  *   When present no files are involved; omit it for the default file checkpoint
  *   (`<runtime>/asks` + `<runtime>/answers`, `sbx pending/approve/deny`).
@@ -100,9 +92,11 @@ function scrubSecrets(entry) {
  * @property {string} method HTTP method
  * @property {string} url full URL
  * @property {Record<string, string | string[] | undefined>} headers
- * @property {Buffer} [body] buffered body (approve path)
- * @property {import('node:http').IncomingMessage} [stream] live body (direct path)
+ * @property {Buffer} [body] buffered body
+ * @property {Buffer} [prefix] bytes already read from `stream`, written upstream before it
+ * @property {import('node:stream').Readable} [stream] live body: the request itself, or a held body's file
  * @property {import('node:http').ServerResponse} cres parked or live client response
+ * @property {{ gate: GateLike, action: Record<string, unknown>, aid: string }} [rec] the deciding gate, the request's action and the decision's aid: the response status is recorded there (absent: it is logged as a `resp` fact)
  */
 
 /**
@@ -112,8 +106,7 @@ function scrubSecrets(entry) {
  */
 
 /**
- * Start the front-door proxy. Every request is logged with its method, URL,
- * headers and body; bytes go upstream untouched. Requests the hold rule
+ * Start the front-door proxy. Every request is audited with its method and URL, and a request with a body also with its byte count and SHA-256 (never headers or body text); bytes go upstream untouched. Requests the hold rule
  * flags park for a human decision instead of forwarding.
  *
  * @param {ProxyOptions} opts
@@ -128,12 +121,20 @@ function scrubSecrets(entry) {
  */
 export function createProxy(opts) {
   const { logFile, runtime, port = null,
-    upstreamCa = null, hold = null,
+    upstreamCa = null, hold = null, gateFor = null, allowLocal = [], labels = null,
     upstreamTimeoutMs = 120000, clientIdleMs = 60000,
     unsafeTestOnly = null,
-    maxLogBody = 1048576, redact = (e) => e } = opts ?? {};
+    redact = (e) => e } = opts ?? {};
   const { allowLoopback = false, resolveUpstream = null } = unsafeTestOnly ?? {};
-  const gate = { allowLoopback, resolveUpstream: resolveUpstream ?? undefined };
+  const gate = {
+    allowLoopback, resolveUpstream: resolveUpstream ?? undefined,
+    allowLocal: new Set(allowLocal.map((e) => String(e).toLowerCase())),
+  };
+  /** @param {URL} u @returns {number} */
+  const portOf = (u) => (u.port ? parseInt(u.port, 10) : (u.protocol === 'https:' ? 443 : 80));
+  // One tools table and one matcher per runtime, shared by every gate.
+  const matcher = labels?.matcher ?? emptyMatcher;
+  const tools = buildTools(labels?.tools, [...allowLocal]);
   if (!logFile) throw new Error('createProxy: logFile is required');
   if (typeof runtime !== 'string' || !runtime) throw new Error('createProxy: runtime is required');
   // One live proxy per runtime, enforced here: claimed before the hold
@@ -143,36 +144,95 @@ export function createProxy(opts) {
   // Always `<runtime>/certs`: one layout, owned by runtime.js, so there is
   // nothing to contain and no check to fail.
   const certDir = runtimePaths(runtime).certsDir;
-  const holdMaxBody = hold?.maxBody ?? 1048576;
+  const holdMaxBody = hold?.maxBody ?? DEFAULT_HOLD_MAX_BODY;
+  const heldFile = runtimePaths(runtime).heldFile;
 
-  // Open the audit log synchronously: a bad `logFile` (a directory, a
+  // Open the audit file synchronously: a bad `logFile` (a directory, a
   // missing parent, no permission) throws here, where the claim can still
-  // be released — not later as an uncaught stream error.
-  let logFd;
+  // be released — not later as an uncaught error. bareguard appends to it.
   try {
-    logFd = fs.openSync(logFile, 'a', 0o600);
+    fs.closeSync(fs.openSync(logFile, 'a', 0o600));
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     releaseClaim();
     throw new Error(`createProxy: cannot open logFile ${logFile}: ${msg}`);
   }
-  const logStream = fs.createWriteStream(logFile, { fd: logFd });
   // `openSync`'s mode is masked by the umask and doesn't apply to an
   // existing file: a 0644 log from an older run would stay world-readable
   // while new lines append, so fix it up on every start.
   try { fs.chmodSync(logFile, 0o600); } catch {}
+
+  // The audit file has one shape: bareguard's. A response status is a
+  // `gate.record` joined to its request's `check` by aid; every other fact is
+  // an `annotate({ surface: false })` on the agent's gate when it is built, else
+  // on the runtime's own `sbx` gate (which never runs `check()`).
+  /** @type {GateLike} */
+  let sbxGate;
+  try {
+    sbxGate = /** @type {GateLike} */ (/** @type {unknown} */ (new Gate({ audit: { path: logFile } })));
+  } catch (e) {
+    releaseClaim();
+    throw e;
+  }
+  const sbxInit = /** @type {{ init: () => Promise<void> }} */ (/** @type {unknown} */ (sbxGate)).init();
+  sbxInit.catch(() => {}); // reported by the first line that awaits it
+  /** Gates by agent: the only place a gate is kept (see `gateOf`). @type {Map<string, { p: Promise<GateLike>, gate: GateLike|null }>} */
+  const gates = new Map();
+  /** @type {Set<Promise<void>>} */
+  const pendingLog = new Set();
+  let logClosing = false;
   let logFailed = false;
-  logStream.on('error', (e) => {
+  /** @param {unknown} e */
+  const logFail = (e) => {
     if (logFailed) return;
     logFailed = true;
     console.error(`sbx: audit log ${logFile} write failed: ${e instanceof Error ? e.message : String(e)}`);
-  });
-  // After close() ends the stream a late line (a socket torn down by close)
-  // is dropped on purpose: a write after end() would destroy the stream.
-  const log = (o) => {
-    if (logStream.writableEnded) return;
-    logStream.write(JSON.stringify(redact(scrubSecrets(o))) + '\n');
   };
+  /** Track one audit write; a failure is reported once, never thrown. @param {() => Promise<unknown>} fn */
+  const track = (fn) => {
+    // After close() ends the flush a late line (a socket torn down by close)
+    // is dropped on purpose: a write nobody waits for would wedge close().
+    if (logClosing) return;
+    const p = fn().then(() => {}, logFail).then(() => { pendingLog.delete(p); });
+    pendingLog.add(p);
+  };
+  /** Cut a string field. @param {unknown} v @param {number} n */
+  const cut = (v, n) => (typeof v === 'string' ? v.slice(0, n) : v);
+  /**
+   * barebox's fact as the `meta` of an annotate. The per-field cuts keep audit
+   * lines short; bareguard 0.30.0 drops whole keys over its own cap.
+   * @param {Record<string, unknown>} o
+   * @returns {Record<string, unknown>}
+   */
+  const metaOf = (o) => {
+    const { ev: _ev, ...meta } = redact(o);
+    meta['url'] = cut(meta['url'], 400);
+    meta['note'] = cut(meta['note'], 200);
+    meta['reason'] = cut(meta['reason'], 200);
+    return meta;
+  };
+  /** @param {Record<string, unknown>} o */
+  async function writeLog(o) {
+    const agent = typeof o['agent'] === 'string' ? o['agent'] : null;
+    // Never build a gate from here: a built one, else the sbx gate.
+    const entry = agent ? gates.get(agent) : undefined;
+    const cand = entry?.gate ?? null;
+    const g = cand && typeof cand.annotate === 'function' ? cand : sbxGate;
+    if (g === sbxGate) await sbxInit;
+    const where = [o['id'], o['agent'], o['code'], o['method'], o['url'] ?? o['note']]
+      .filter((x) => x !== undefined && x !== null).join(' ');
+    try {
+      await /** @type {NonNullable<GateLike['annotate']>} */ (g.annotate)({
+        surface: false, verdict: String(o['ev']), where, meta: metaOf(o) });
+    } finally {
+      // Normal use of bareguard's API for a process with no turns: it keeps memory at zero facts
+      // (0.30.0 caps the buffer at 256, which could reach about 350 KB per gate). No upstream ask is pending.
+      g.drainAnnotations?.();
+    }
+  }
+  // Synchronous for callers (holds.js shares it); the write is tracked.
+  /** @param {Record<string, unknown>} o */
+  const log = (o) => { track(() => writeLog(o)); };
   let trust = null;
   if (upstreamCa) {
     let extra;
@@ -218,18 +278,29 @@ export function createProxy(opts) {
   // Enforcement sits here (every forward, incl. the approve path) AND at
   // the door (request handler + CONNECT): a parked hold is re-checked on
   // approve, so a DNS change while parked cannot slip through.
+  // A body stream nobody will pipe: a held file is closed (its owner then
+  // deletes it); a live request is drained so its response can go out.
+  /** @param {import('node:stream').Readable|undefined} stream */
+  function discard(stream) {
+    try {
+      if (stream instanceof fs.ReadStream) stream.destroy();
+      else stream?.resume();
+    } catch {}
+  }
+
   /** @param {ForwardArgs} args */
-  async function forward({ agent, method, url, headers, body, stream, cres }) {
+  async function forward({ agent, method, url, headers, body, prefix, stream, cres, rec }) {
     let u;
     try {
       u = new URL(url);
     } catch {
+      discard(stream);
       denyRes(cres, 400, 'bad request target');
       return;
     }
-    const verdict = await checkUpstream(u.hostname, gate);
+    const verdict = await checkUpstream(u.hostname, gate, portOf(u));
     if (!verdict.ok) {
-      try { stream?.resume(); } catch {}
+      discard(stream);
       denyRes(cres, 403, verdict.reason);
       return;
     }
@@ -237,19 +308,19 @@ export function createProxy(opts) {
     // throw before it can answer must still be loud, never a floating reject.
     // The dial is pinned to the checked IPs: no second DNS resolution.
     try {
-      forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIps: verdict.ips });
+      forwardInner({ agent, method, url, headers, body, prefix, stream, cres, rec, u, upstreamIps: verdict.ips });
     } catch (e) {
       // The live stream arrives paused (see handleRequest): unpause so no
       // paused stream leaks on this path.
-      try { stream?.resume(); } catch {}
+      discard(stream);
       denyRes(cres, 502, `upstream failed: ${e.message}`);
     }
   }
 
   /** @param {ForwardArgs & { u: URL, upstreamIps: string[] }} args */
-  function forwardInner({ agent, method, url, headers, body, stream, cres, u, upstreamIps }) {
+  function forwardInner({ agent, method, url, headers, body, prefix, stream, cres, rec, u, upstreamIps }) {
     const sock = cres.socket;
-    if (!sock) return; // no transport left to answer on
+    if (!sock) { discard(stream); return; } // no transport left to answer on
     const secure = u.protocol === 'https:';
     /** @type {Record<string, string | string[] | undefined>} */
     const fwdHeaders = {};
@@ -302,7 +373,11 @@ export function createProxy(opts) {
         if (!HOP_RESP.has(k.toLowerCase()) && v !== undefined) respHeaders[k] = v;
       }
       if (ures.statusCode === undefined) { fail('upstream sent no status'); up.destroy(); return; }
-      log({ ev: 'resp', agent, url, status: ures.statusCode });
+      const status = ures.statusCode;
+      if (rec && typeof rec.gate.record === 'function') {
+        const { gate: g, action, aid } = rec;
+        track(() => /** @type {NonNullable<GateLike['record']>} */ (g.record)(action, { status }, { aid }));
+      } else log({ ev: 'resp', agent, url, status });
       try {
         cres.writeHead(ures.statusCode, respHeaders);
       } catch (e) { fail(`cannot frame upstream response: ${e.message}`); up.destroy(); return; }
@@ -320,28 +395,36 @@ export function createProxy(opts) {
       if (!done && !cres.writableEnded) { done = true; upstreams.delete(up); up.destroy(); }
     });
     if (body) up.end(body);
-    else if (stream) stream.pipe(up);
-    else up.end();
+    else if (stream) {
+      // A held body's file: closed when the request is done with it, and a
+      // read failure (the file vanished) fails the request, never crashes.
+      if (stream instanceof fs.ReadStream) {
+        up.once('close', () => stream.destroy());
+        stream.once('error', (e) => up.destroy(e));
+      }
+      if (prefix?.length) up.write(prefix);
+      stream.pipe(up);
+    } else up.end();
   }
 
   // The rest of setup is infallible synchronously except this call, so a
   // throw here releases the claim before it propagates (like upstreamCa
   // above); async failures release through `ready` and `close()` below.
+  // The queue is the gate's human channel, so a gate means a queue.
   let holds = null;
   try {
-    holds = hold ? createHolds({
+    holds = (hold || gateFor) ? createHolds({
       log,
-      shouldHold: hold.shouldHold,
-      match: hold.match,
-      timeoutMs: hold.timeoutMs,
+      timeoutMs: hold?.timeoutMs,
       maxBody: holdMaxBody,
       runtime,
-      onAsk: hold.onAsk,
-      pollMs: hold.pollMs,
-      onEvent: hold.onEvent,
-      onApprove: (h) => forward({ agent: h.agent, method: h.method, url: h.url,
-        headers: h.headers, body: h.body, cres: h.cres }),
-      onDeny: (h, reason) => denyRes(h.cres, 403, `denied: ${reason}`),
+      onAsk: hold?.onAsk,
+      pollMs: hold?.pollMs,
+      onEvent: hold?.onEvent,
+      // A parked request's pending ask ends here: handleRequest, awaiting
+      // its gate, then forwards or refuses.
+      onApprove: (h) => h.finish({ decision: 'allow' }),
+      onDeny: (h, reason) => h.finish({ decision: 'deny', reason }),
     }) : null;
   } catch (e) {
     releaseClaim();
@@ -351,8 +434,207 @@ export function createProxy(opts) {
   const server = http.createServer((creq, cres) => {
     // Async only for the wall's DNS lookup; no body listener is attached
     // before the check, so nothing is lost while it resolves.
-    handleRequest(creq, cres).catch((e) => denyRes(cres, 500, `proxy failed: ${e.message}`));
+    reqDone.set(creq, handleRequest(creq, cres)
+      .catch((e) => denyRes(cres, 500, `proxy failed: ${e.message}`)));
   });
+
+  /** Each request's handler promise, so `close()` can wait for those inside a gate check. @type {WeakMap<object, Promise<void>>} */
+  const reqDone = new WeakMap();
+
+  /**
+   * Gates by agent, built lazily (and at `addAgent`): one per agent, so the
+   * grant is the agent's own. `gates` (declared with the log) is the only
+   * place a gate is kept; `entry.gate` is set once the build settled.
+   *
+   * @param {string} agent
+   * @returns {Promise<GateLike>}
+   */
+  function gateOf(agent) {
+    let e = gates.get(agent);
+    if (!e) {
+      if (!gateFor) throw new Error('createProxy: no gateFor');
+      const p = Promise.resolve().then(() => gateFor(agent, { humanChannel: askHuman, tools }));
+      const entry = { p, gate: /** @type {GateLike|null} */ (null) };
+      e = entry;
+      gates.set(agent, entry);
+      p.then((g) => { entry.gate = g; },
+        // A failed build must not stick: the next request tries again, loudly.
+        () => { if (gates.get(agent) === entry) gates.delete(agent); });
+    }
+    return e.p;
+  }
+
+  /**
+   * Requests inside `gate.check()`, by `rid`: how the human channel finds
+   * the request an ask is about. handleRequest sets and deletes each entry
+   * (the one writer); the channel only reads it and sets the fields it owns
+   * (`asked`, `status`, `heldId`, `endAsk`).
+   *
+   * @type {Map<string, RequestCtx>}
+   */
+  const inflightCtx = new Map();
+  let ridN = 0;
+
+  /**
+   * @typedef {object} RequestCtx
+   * @property {string} agent agent name
+   * @property {string} method HTTP method
+   * @property {string} url full URL
+   * @property {Record<string, string | string[] | undefined>} headers request headers
+   * @property {import('node:http').IncomingMessage} creq the request (paused)
+   * @property {import('node:http').ServerResponse} cres the response
+   * @property {ReturnType<typeof makeTee>} tee the body tee (masked preview, byte count)
+   * @property {boolean} hasBody the request carries a body
+   * @property {Buffer[]} chunks the body bytes read so far (up to ~64 KB)
+   * @property {boolean} over more body follows `chunks`, unread in `creq`
+   * @property {() => void} freeWork release the agent's working slot (idempotent)
+   * @property {boolean} asked the human channel took this request
+   * @property {number|null} status HTTP status the channel wants for a denial (null: 403)
+   * @property {string|null} heldId id of the held body file, once spooled
+   * @property {((reason: string) => void)|null} endAsk end a not-yet-parked ask as a denial
+   */
+
+  /**
+   * The human channel (bareguard `humanChannel` shape): every gate's asks
+   * come here. Finds the request by `event.action.rid`, then holds it.
+   *
+   * @param {{ action?: { rid?: unknown }, rule?: string, rwxLetter?: string }} event
+   * @returns {Promise<{ decision: 'allow' | 'deny', reason?: string }>}
+   */
+  async function askHuman(event) {
+    const ctx = inflightCtx.get(String(event?.action?.rid));
+    if (!ctx) return { decision: 'deny', reason: 'request gone' };
+    ctx.asked = true;
+    return holdRequest(ctx, event);
+  }
+
+  /**
+   * Hold one request for the human: reserve the agent's hold slot, spool the
+   * body to `<runtime>/held/<id>` (the bytes already read plus the rest of
+   * the stream, capped at `holdMaxBody`), free the working slot, park, and
+   * wait. The promise settles once: on the queue's decision, on expiry, or
+   * when the client or the proxy goes away first.
+   *
+   * @param {RequestCtx} ctx the request
+   * @param {{ rule?: string, rwxLetter?: string }} event the gate's ask
+   * @returns {Promise<{ decision: 'allow' | 'deny', reason?: string }>}
+   */
+  function holdRequest(ctx, event) {
+    return new Promise((resolve) => {
+      const queue = /** @type {NonNullable<typeof holds>} */ (holds);
+      const { agent, cres, creq } = ctx;
+      const sock = cres.socket;
+      let settled = false;
+      let parked = false;
+      let dead = false;
+      /** @type {import('node:fs').WriteStream|null} */
+      let ws = null;
+      /** @param {{ decision: 'allow' | 'deny', reason?: string }} d */
+      const finish = (d) => {
+        if (settled) return;
+        settled = true;
+        ctx.endAsk = null;
+        resolve(d);
+      };
+      /** @param {string} reason @param {number} [status] */
+      const refuse = (reason, status) => {
+        if (status) ctx.status = status;
+        finish({ decision: 'deny', reason });
+      };
+      const abort = () => {
+        if (dead) return;
+        dead = true;
+        ws?.destroy();
+        queue.dropBody(slot.id);
+      };
+      /** @param {string} why @param {number} [status] */
+      const fail = (why, status) => {
+        if (parked) return; // parked: the queue owns the end
+        abort();
+        slot.cancel();
+        refuse(why, status);
+      };
+      if (closed) { refuse('proxy closing'); return; }
+      if (!sock || sock.destroyed) { refuse('client gone'); return; }
+      const slot = queue.reserve(agent, {
+        onReady: () => stream(),
+        onExpire: (why) => { abort(); refuse(why); },
+      });
+      if (slot.state === 'full') { ctx.freeWork(); refuse('hold queue full', 429); return; }
+      ctx.endAsk = (why) => fail(why);
+      cres.on('close', () => ctx.endAsk?.('client gone'));
+      let size = 0;
+      if (ctx.hasBody) {
+        // The bytes already read go to the body file at once, so a request
+        // waiting in line holds no body in memory.
+        try {
+          // Open synchronously: a later unlink can then never race the create.
+          ws = fs.createWriteStream('', { fd: fs.openSync(heldFile(slot.id), 'wx', 0o600) });
+        } catch (e) {
+          fail(`cannot hold body: ${e instanceof Error ? e.message : String(e)}`, 500);
+          ctx.freeWork();
+          return;
+        }
+        ws.on('error', (e) => fail(`cannot hold body: ${e.message}`, 500));
+        for (const c of ctx.chunks) {
+          size += c.length;
+          ws.write(c);
+        }
+        ctx.chunks = [];
+        ctx.heldId = slot.id;
+        if (size > holdMaxBody) fail('body too large to hold');
+      }
+      // The working slot is released: a queued hold must not stop the
+      // agent's next body from being read.
+      ctx.freeWork();
+      if (slot.state === 'now') stream();
+
+      // At the front of the line: take the rest of the body, then park.
+      function stream() {
+        if (settled || dead) return;
+        const parkIt = () => {
+          if (dead || settled) return;
+          // Parked: the tunnel stays open until the ask channel decides.
+          // null: the reservation already expired and onExpire refused.
+          parked = queue.add({ agent, method: ctx.method, url: ctx.url,
+            preview: bodyPreview(ctx.tee.head), bodyBytes: ctx.tee.bytes,
+            sock, note: event.rule ?? 'ask', letter: event.rwxLetter, finish,
+            slot, arrivedAt: slot.arrivedAt }) !== null;
+        };
+        const done = () => { if (ws) { ws.once('finish', parkIt); ws.end(); } else parkIt(); };
+        if (!ctx.over) { done(); return; }
+        creq.on('data', (c) => {
+          if (dead) return;
+          size += c.length;
+          if (size > holdMaxBody) { fail('body too large to hold'); return; }
+          if (ws && !ws.write(c)) {
+            creq.pause();
+            ws.once('drain', () => creq.resume());
+          }
+        });
+        creq.on('error', () => { fail('client body failed', 502); });
+        creq.on('end', () => { if (!dead) done(); });
+        creq.resume();
+      }
+    });
+  }
+
+  /**
+   * The one decision for a request: the gate's `check`, and, for a plain
+   * check object that answers `askHuman`, the same human channel.
+   *
+   * @param {GateLike} g the agent's gate
+   * @param {Record<string, unknown>} action the request as an action
+   * @returns {Promise<{ outcome: string, rule?: string, reason?: string | null, aid?: string }>} terminal allow or deny
+   */
+  async function decideAction(g, action) {
+    const d = await g.check(action);
+    if (d.outcome !== 'askHuman') return d;
+    const h = await askHuman({ action, rule: d.rule });
+    return h.decision === 'allow'
+      ? { outcome: 'allow', rule: 'humanChannel.allow', aid: d.aid }
+      : { outcome: 'deny', rule: d.rule, reason: h.reason ?? 'denied', aid: d.aid };
+  }
 
   async function handleRequest(creq, cres) {
     const sock = creq.socket;
@@ -371,84 +653,187 @@ export function createProxy(opts) {
     const method = creq.method;
     if (!method) { denyRes(cres, 400, 'bad request method'); return; }
     const urlStr = url.toString();
-    const verdict = await checkUpstream(url.hostname, gate);
+    const verdict = await checkUpstream(url.hostname, gate, portOf(url));
     if (!verdict.ok) {
       try { creq.resume(); } catch {}
       denyRes(cres, 403, verdict.reason);
       return;
     }
-    const queue = holds;
-    const reason = queue ? queue.decide({ agent, method, url: urlStr, headers: creq.headers }) : null;
+    const cl = Number(creq.headers['content-length'] ?? 0);
+    const hasBody = creq.headers['transfer-encoding'] !== undefined || cl > 0;
 
-    // Tee the body for the log (capped). A held request buffers it whole —
-    // bounded by maxBody — so approve can forward it after the human decides.
-    // Anything else streams straight through; the tee only feeds the log.
-    const chunks = [];
-    let size = 0;
-    let over = false;
-    const finishLog = () => {
-      const body = Buffer.concat(chunks);
-      log({ ev: 'req', agent, method: creq.method, url: urlStr,
-        headers: creq.headers, body: body.toString('utf8'),
-        ...(over ? { truncated: true, bodyBytes: size } : {}) });
-      return body;
-    };
-    if (!reason || !queue) {
-      // Pause before any body listener: the tee below would otherwise put
-      // the stream in flowing mode, and forward() awaits a second wall
-      // check before forwardInner pipes to upstream — body bytes arriving
-      // during that wait would go to the tee only, starving upstream
-      // against Content-Length. Buffered here, pipe() resumes the flow,
-      // so both the tee and upstream see the whole body.
-      creq.pause();
-      creq.on('data', (c) => {
-        size += c.length;
-        if (size > maxLogBody || over) { over = true; return; }
-        chunks.push(c);
-      });
-      creq.on('end', finishLog);
-      creq.on('error', () => {});
-      forward({ agent, method, url: urlStr,
-        headers: { ...creq.headers }, stream: creq, cres });
-      return;
-    }
-    // One held request per agent reads its body at a time; the rest wait
-    // unread in line. No body listener (it would resume the stream) until
-    // `onReady`. A request that never parks frees its slot when `cres` closes.
+    // Pause before any body listener: a listener would put the stream in
+    // flowing mode and starve whoever reads it next. The tee sees every body
+    // byte once, whatever path reads it, and feeds the ask (a masked
+    // 4 KB preview) and the audit's `body` fact (byte count and SHA-256).
     creq.pause();
-    const readHeld = () => {
-      creq.on('data', (c) => {
-        size += c.length;
-        if (size > holdMaxBody) { over = true; return; }
-        chunks.push(c);
-      });
-      creq.on('error', () => { denyRes(cres, 502, 'client body failed'); });
-      creq.on('end', () => {
-        if (over) { denyRes(cres, 403, 'body too large to hold'); return; }
-        const body = finishLog();
-        // Parked: the tunnel stays open until the ask channel decides. The
-        // hold reason travels as `note` so the ask file carries its `rule`.
-        // null: the reservation already expired and onExpire answered 403.
-        queue.add({ agent, method, url: urlStr,
-          headers: { ...creq.headers }, body, sock, cres, note: reason,
-          slot, arrivedAt: slot.arrivedAt });
-      });
-      creq.resume();
-    };
-    const slot = queue.reserve(agent, {
-      onReady: readHeld,
-      onExpire: (why) => { denyRes(cres, 403, `denied: ${why}`); creq.resume(); },
-    });
-    if (slot.state === 'full') {
-      denyRes(cres, 429, 'hold queue full');
-      creq.resume();
+    const tee = makeTee();
+    creq.on('data', (c) => tee.push(c));
+    // `end` fires once the whole body was read, whichever path read it (also
+    // a streamed body past 64 KB), so the values cover all of it. A client
+    // that aborts mid-body never reaches `end`: no line, as before.
+    const rid = `r${++ridN}`;
+    if (hasBody) {
+      creq.on('end', () => log({ ev: 'body', agent, rid, bodyBytes: tee.bytes, bodySha256: tee.digest() }));
+    }
+    creq.on('error', () => {});
+
+    // No gate: straight through. pipe() resumes the flow.
+    if (!gateFor) {
+      forward({ agent, method, url: urlStr, headers: { ...creq.headers }, stream: creq, cres });
       return;
     }
-    // The client may have died during the wall's DNS await, before this
-    // listener existed: its 'close' is already past, so release here.
-    if (sock.destroyed) { slot.cancel(); return; }
-    cres.on('close', () => slot.cancel());
-    if (slot.state === 'now') readHeld();
+
+    // One decision path. A body is read first (one body at a time per agent,
+    // up to 64 KB, so the card floor can scan it); then the agent's gate
+    // decides; a gate that asks runs the human channel inside `check()`.
+    let freed = false;
+    /** @type {() => void} */
+    let free = () => {};
+    const freeWork = () => { if (!freed) { freed = true; free(); } };
+    try {
+      if (hasBody) {
+        free = await takeWorkSlot(agent, cres);
+      } else creq.resume();
+      if (sock.destroyed) return;
+      /** @type {RequestCtx} */
+      const ctx = { agent, method, url: urlStr, headers: { ...creq.headers }, creq, cres, tee,
+        hasBody, chunks: [], over: false, freeWork, asked: false, status: null, heldId: null,
+        endAsk: null };
+      let cardLike = false;
+      if (hasBody) {
+        if (await readWorkBody(ctx)) return;
+        // Past 64 KB the body streams on unscanned (known gap).
+        if (!ctx.over) cardLike = createCardScanner().push(Buffer.concat(ctx.chunks));
+      }
+      // The body never goes in the action: bareguard writes the action to its audit file.
+      const action = { type: 'net', tool: toolFor(matcher, tools, method, urlStr), url: urlStr, method, agent,
+        cardLike, paymentPath: paymentPath(urlStr), rid };
+      inflightCtx.set(rid, ctx);
+      const g = await gateOf(agent);
+      const d = await decideAction(g, action);
+      if (d.outcome === 'allow') {
+        const common = { agent, method, url: urlStr, headers: ctx.headers, cres,
+          ...(d.aid ? { rec: { gate: g, action, aid: d.aid } } : {}) };
+        if (ctx.heldId) {
+          // The file is the exact body; the client's own framing (length or
+          // chunked) still describes it. It is deleted once the upstream is done.
+          const id = ctx.heldId;
+          const rs = fs.createReadStream(heldFile(id));
+          rs.on('close', () => holds?.dropBody(id));
+          await forward({ ...common, stream: rs });
+        } else if (!hasBody) {
+          await forward({ ...common, body: EMPTY });
+        } else if (ctx.over) {
+          // Past 64 KB: send what was read, pipe the rest.
+          await forward({ ...common, prefix: Buffer.concat(ctx.chunks), stream: creq });
+        } else {
+          await forward({ ...common, body: Buffer.concat(ctx.chunks) });
+        }
+      } else {
+        discard(creq);
+        const why = ctx.asked
+          ? `denied: ${d.reason ?? 'denied'}`
+          : `denied: ${d.rule ?? 'gate'}${d.reason ? `: ${d.reason}` : ''}`;
+        denyRes(cres, ctx.status ?? 403, why);
+      }
+    } finally {
+      inflightCtx.delete(rid);
+      freeWork();
+    }
+  }
+
+  /**
+   * Constant-memory tee of a request body: the first ASK_BODY_LIMIT bytes,
+   * the byte count and a running SHA-256.
+   */
+  function makeTee() {
+    const hash = crypto.createHash('sha256');
+    let head = EMPTY;
+    let bytes = 0;
+    return {
+      push(/** @type {Buffer} */ c) {
+        hash.update(c);
+        bytes += c.length;
+        if (head.length < ASK_BODY_LIMIT) head = Buffer.concat([head, c.subarray(0, ASK_BODY_LIMIT - head.length)]);
+      },
+      get head() { return head; },
+      get bytes() { return bytes; },
+      digest: () => hash.copy().digest('hex'),
+    };
+  }
+
+  // One working slot per agent: a FIFO of body reads. A slot frees when its
+  // holder calls the returned function, or when its response closes (a dead
+  // client never wedges the line). Waiters stay paused and unread.
+  /** @type {Map<string, Promise<void>>} */
+  const workTail = new Map();
+  /**
+   * @param {string} agent agent name
+   * @param {import('node:http').ServerResponse} cres the request's response
+   * @returns {Promise<() => void>} resolves with `free` once the slot is ours
+   */
+  function takeWorkSlot(agent, cres) {
+    const prev = workTail.get(agent) ?? Promise.resolve();
+    /** @type {() => void} */
+    let free = () => {};
+    const mine = new Promise((resolve) => { free = () => resolve(undefined); });
+    const tail = prev.then(() => mine);
+    workTail.set(agent, tail);
+    void tail.then(() => { if (workTail.get(agent) === tail) workTail.delete(agent); });
+    cres.once('close', free);
+    return prev.then(() => free);
+  }
+
+  /**
+   * Read the working slice of the body into `ctx.chunks` and `ctx.over`. Its
+   * own frame, so no reference to the chunks outlives a later spool to disk.
+   *
+   * @param {RequestCtx} ctx request context
+   * @returns {Promise<boolean>} true when the client went away
+   */
+  async function readWorkBody(ctx) {
+    const r = await readBounded(ctx.creq, WORK_BODY_LIMIT);
+    if (r.aborted) return true;
+    ctx.chunks = r.chunks;
+    ctx.over = r.over;
+    return false;
+  }
+
+  /**
+   * Read a paused request's body until it ends or passes `limit` bytes
+   * (then pause again, keeping everything read so far in `chunks`).
+   *
+   * @param {import('node:http').IncomingMessage} creq paused request
+   * @param {number} limit byte limit
+   * @returns {Promise<{ chunks: Buffer[], over: boolean, aborted: boolean }>}
+   */
+  function readBounded(creq, limit) {
+    return new Promise((resolve) => {
+      /** @type {Buffer[]} */
+      const chunks = [];
+      let size = 0;
+      /** @param {boolean} over @param {boolean} aborted */
+      const done = (over, aborted) => {
+        creq.off('data', onData);
+        creq.off('end', onEnd);
+        creq.off('close', onGone);
+        creq.off('error', onGone);
+        resolve({ chunks, over, aborted });
+      };
+      const onData = (/** @type {Buffer} */ c) => {
+        chunks.push(c);
+        size += c.length;
+        if (size > limit) { creq.pause(); done(true, false); }
+      };
+      const onEnd = () => done(false, false);
+      const onGone = () => done(false, true);
+      creq.on('data', onData);
+      creq.on('end', onEnd);
+      creq.on('close', onGone);
+      creq.on('error', onGone);
+      creq.resume();
+    });
   }
   // Idle tunnels die here; a request in flight is never idle by definition.
   server.keepAliveTimeout = clientIdleMs;
@@ -503,7 +888,7 @@ export function createProxy(opts) {
     }
     // Deny the tunnel itself: no cert is minted for a walled destination,
     // and the inner request is checked again on arrival anyway.
-    const verdict = await checkUpstream(host, gate);
+    const verdict = await checkUpstream(host, gate, portNum);
     if (!verdict.ok) {
       denyRaw(sock, 403, verdict.reason);
       return;
@@ -550,6 +935,7 @@ export function createProxy(opts) {
         });
       });
       bound = await boundP;
+      if (gateFor) void gateOf('tcp').catch(() => {});
     }
     return { port: bound };
   })();
@@ -561,6 +947,9 @@ export function createProxy(opts) {
   function addAgent(name) {
     const sockPath = runtimePaths(runtime).socket(name);
     if (agentServers.has(name)) return sockPath;
+    if (agentServers.size >= MAX_AGENTS) {
+      throw new Error(`createProxy: agent limit reached (${MAX_AGENTS} agents per proxy); run another proxy for more`);
+    }
     try { fs.unlinkSync(sockPath); } catch {}
     ensurePrivateDir(path.dirname(sockPath));
     const srv = net.createServer((sock) => {
@@ -572,6 +961,7 @@ export function createProxy(opts) {
       try { fs.chmodSync(sockPath, 0o600); } catch {}
     });
     agentServers.set(name, srv);
+    if (gateFor) void gateOf(name).catch(() => {});
     return sockPath;
   }
 
@@ -582,12 +972,15 @@ export function createProxy(opts) {
     const srv = agentServers.get(name);
     if (!srv) return;
     agentServers.delete(name);
+    gates.delete(name);
     srv.close();
     for (const s of [...clients]) {
       if (s[AGENT] !== name) continue;
       holds?.abandonSocket(s);
       s.destroy();
     }
+    // Asks still waiting in line (not parked) end now, as client gone, too.
+    for (const c of inflightCtx.values()) if (c.agent === name) c.endAsk?.('client gone');
     try { fs.unlinkSync(runtimePaths(runtime).socket(name)); } catch {}
   }
 
@@ -599,22 +992,36 @@ export function createProxy(opts) {
     // Parked holds settle as denied (guarded writes), timers cleared,
     // ask files removed, sweeper stopped — all inside holds.close().
     holds?.close();
+    // Requests inside a gate check now end on their own (holds.close() refused
+    // their asks, parked or waiting): wait for their 403 and last log lines BEFORE the
+    // sockets go, but never forever (a wedged gate must not wedge close).
+    const checking = [...inflightCtx.values()].map((c) => reqDone.get(c.creq)).filter(Boolean);
+    if (checking.length) {
+      /** @type {ReturnType<typeof setTimeout>|undefined} */
+      let cap;
+      await Promise.race([
+        Promise.allSettled(checking),
+        new Promise((resolve) => { cap = setTimeout(resolve, 3000); }),
+      ]);
+      clearTimeout(cap);
+    }
     for (const up of upstreams) { try { up.destroy(); } catch {} }
     upstreams.clear();
     for (const s of clients) { try { s.destroy(); } catch {} }
     clients.clear();
     server.close();
-    logStream.end();
-    /** @type {Promise<void>} */
-    const flushed = new Promise((resolve) => {
-      if (logStream.writableFinished || logStream.destroyed) resolve();
-      else {
-        // A destroyed stream emits 'close', never 'finish'.
-        logStream.once('finish', () => resolve());
-        logStream.once('close', () => resolve());
-      }
-    });
-    await flushed;
+    // Lines logged from here on are dropped; the ones in flight are awaited,
+    // but never forever (a wedged disk must not wedge close).
+    logClosing = true;
+    if (pendingLog.size) {
+      /** @type {ReturnType<typeof setTimeout>|undefined} */
+      let cap;
+      await Promise.race([
+        Promise.allSettled([...pendingLog]),
+        new Promise((resolve) => { cap = setTimeout(resolve, 3000); }),
+      ]);
+      clearTimeout(cap);
+    }
     releaseClaim();
   }
 

@@ -26,6 +26,7 @@ import { createProxy } from '../src/proxy.js';
 import { denyReasonForIp } from '../src/wall.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
+import { pathGate } from './fixtures/gates.mjs';
 
 const execA = promisify(execFileCb);
 
@@ -342,7 +343,7 @@ describe('negatives', () => {
     await new Promise((r) => srv.close(r));
     const code = await curl('-o', '/dev/null', '-w', '%{http_code}', `http://127.0.0.1:${dead}/one-deny`);
     assert.equal(code.stdout, '502');
-    const denyLines = () => log().split('\n').filter((l) => l.includes('"ev":"deny"') && l.includes(`:${dead}`));
+    const denyLines = () => log().split('\n').filter((l) => l.includes('"verdict":"deny"') && l.includes(`:${dead}`));
     await waitFor(() => denyLines().length > 0, 'a deny line for the dead upstream');
     const denies = denyLines();
     assert.equal(denies.length, 1, denies.join('\n'));
@@ -641,13 +642,15 @@ describe('holds', () => {
   afterEach(() => { for (const s of socks.splice(0)) { try { s.destroy(); } catch {} } });
   // Raw held POST over an agent's unix socket; `res` resolves with the
   // first response, `closed` when the proxy or client drops the socket.
-  async function post(sockPath, marker) {
+  // `pad` extra body bytes: past 64 KB the rest of the body stays unread
+  // until the request reaches the front of its line.
+  async function post(sockPath, marker, pad = 0) {
     const s = net.connect(sockPath);
     socks.push(s);
     s.on('error', () => {});
     await once(s, 'connect');
     const up = `127.0.0.1:${plainUp.port}`;
-    const body = `m=${marker}`;
+    const body = `m=${marker}${'x'.repeat(pad)}`;
     s.write(`POST http://${up}/hold HTTP/1.1\r\nHost: ${up}\r\nContent-Length: ${body.length}\r\nConnection: close\r\n\r\n${body}`);
     const res = readOneResponse(s);
     res.catch(() => {});
@@ -668,7 +671,7 @@ describe('holds', () => {
     hp = createProxy({ port: 0,
       logFile: join(HRT, 'mitm.log'), upstreamCa: CA, runtime: HRT,
       clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
-      hold: { match: '/hold', timeoutMs: 1500, pollMs: 25, ...holdExtra } });
+      gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 1500, pollMs: 25, ...holdExtra } });
     ({ port: hport } = await hp.ready);
     return `http://127.0.0.1:${hport}`;
   }
@@ -866,7 +869,7 @@ describe('holds', () => {
     const op = createProxy({ port: 0,
       logFile: join(HRT, 'mitm.log'), upstreamCa: CA, runtime: HRT,
       clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
-      hold: { match: '/hold', timeoutMs: 5000,
+      gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 5000,
         onAsk: async (ask) => {
           assert.equal(ask.letter, 'x');
           assert.equal(ask.rule, 'path matches /hold');
@@ -1037,10 +1040,10 @@ describe('holds', () => {
         const fa = hp.addAgent('fa');
         const r1 = await post(fa, 'ONE1');
         const held1 = await waitFor(() => pendingWith('ONE1'), 'first hold to park');
-        const r2 = await post(fa, 'TWO2');
+        const r2 = await post(fa, 'TWO2', 70000);
         await nap(400);
         assert.equal(hp.pending().length, 1, 'only one parked');
-        assert.ok(!/m=TWO2/.test(hlog()), 'queued body must not have been read');
+        assert.ok(!/m=TWO2/.test(hlog()), 'queued body past 64 KB must not have been read');
         answer(held1.id, { decision: 'allow' });
         const a = await r1.res;
         assert.equal(a.status, 200);
@@ -1088,6 +1091,32 @@ describe('holds', () => {
       } finally { await finish(); }
     });
 
+    it('the 41st agent is refused with the limit named; removeAgent frees a place', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      await holdProxy();
+      try {
+        for (let i = 0; i < 40; i++) hp.addAgent(`l${i}`);
+        assert.equal(hp.addAgent('l0'), join(HRT, 'socks', 'l0.sock'), 're-adding an existing agent is not a new place');
+        assert.throws(() => hp.addAgent('l40'),
+          { message: 'createProxy: agent limit reached (40 agents per proxy); run another proxy for more' });
+        hp.removeAgent('l7');
+        assert.ok(hp.addAgent('l40'), 'a freed place is reusable');
+        assert.throws(() => hp.addAgent('l41'), /agent limit reached \(40 agents/);
+      } finally { await finish(); }
+    });
+
+    it('the tcp door still works with 40 agents added', { skip: NEED_UNIX, timeout: 20000 }, async () => {
+      const P2 = await holdProxy();
+      try {
+        for (let i = 0; i < 40; i++) hp.addAgent(`l${i}`);
+        const p1 = execA('curl', ['-s', '--max-time', '8', '-x', P2,
+          '--cacert', HCA, '--data', 'm=LIM1', `${tlsUp.url}hold`], { encoding: 'latin1' });
+        const held = await waitFor(() => pendingWith('LIM1'), 'the tcp request to park');
+        assert.equal(held.agent, 'tcp');
+        answer(held.id, { decision: 'allow' });
+        assert.match((await p1).stdout, /LIM1/);
+      } finally { await finish(); }
+    });
+
     it('the 18th held request from one agent gets 429 fast', { skip: NEED_UNIX, timeout: 20000 }, async () => {
       await holdProxy({ timeoutMs: 15000 });
       try {
@@ -1111,7 +1140,7 @@ describe('holds', () => {
         const fa = hp.addAgent('fa');
         const r1 = await post(fa, 'LINE1');
         const held1 = await waitFor(() => pendingWith('LINE1'), 'first hold to park');
-        const dead = await post(fa, 'DEAD2');
+        const dead = await post(fa, 'DEAD2', 70000);
         await post(fa, 'LIVE3');
         await nap(300);
         dead.s.destroy();
@@ -1204,7 +1233,7 @@ describe('holds', () => {
         await post(fa, 'DL0');
         await waitFor(() => pendingWith('DL0'), 'first hold to park');
         await nap(100);
-        const w = await post(fa, 'DL1');
+        const w = await post(fa, 'DL1', 70000);
         await nap(100);
         assert.equal(hp.pending().length, 1, 'waiter is queued, not parked');
         assert.ok(!/m=DL1/.test(hlog()), 'waiter body unread');
@@ -1237,8 +1266,9 @@ describe('holds', () => {
         const fa = hp.addAgent('fa');
         const logFrom = hlog().length; // earlier tests already logged this note; the deny logs before the reply, so 1 s is ample
         const t0 = Date.now();
-        const holder = await partialPost(fa, 'DRIP0', 100, 'd');
-        let sent = 1;
+        // Past 64 KB the body is spooled under the hold's deadline; the drip is the rest.
+        const holder = await partialPost(fa, 'DRIP0', 65700, 'd'.repeat(65600));
+        let sent = 0;
         drip = setInterval(() => { if (sent < 100) { sent++; holder.rest('d'); } }, 100);
         // The client is still dripping when the proxy answers and closes, so
         // under load the kernel may deliver an RST before curl-like reads the 403.
@@ -1267,7 +1297,7 @@ describe('holds', () => {
         logFile: join(HRT, 'mitm.log'), upstreamCa: CA, runtime: HRT,
         clientIdleMs: 500,
         unsafeTestOnly: { allowLoopback: true, resolveUpstream: slow },
-        hold: { match: '/hold', timeoutMs: 'never', pollMs: 25 } });
+        gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 'never', pollMs: 25 } });
       await hp.ready;
       try {
         const fa = hp.addAgent('fa');
@@ -1334,7 +1364,7 @@ describe('one proxy owns a runtime (claim)', () => {
     const p1 = createProxy({ port: 0,
       logFile: join(rt, 'mitm.log'), upstreamCa: CA, runtime: rt,
       clientIdleMs: 500, unsafeTestOnly: { allowLoopback: true },
-      hold: { match: '/hold', timeoutMs: 5000, pollMs: 25 } });
+      gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 5000, pollMs: 25 } });
     try {
       const { port } = await p1.ready;
       const p = execA('curl', ['-s', '--max-time', '5', '-x', `http://127.0.0.1:${port}`,
@@ -1411,7 +1441,7 @@ describe('two agents keep identity under interleave', () => {
       const tp = createProxy({ port: 0,
         logFile: join(TRT, 'mitm.log'), upstreamCa: CA, runtime: TRT,
         clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true },
-        hold: { match: '/hold', timeoutMs: 15000, pollMs: 25 } });
+        gateFor: pathGate('/hold', 'path matches /hold'), hold: { timeoutMs: 15000, pollMs: 25 } });
       await tp.ready;
       const sa = [];
       try {
@@ -1456,9 +1486,12 @@ describe('two agents keep identity under interleave', () => {
         assert.match(rA.body, /FA1/);
         assert.equal(rB.status, 200);
         assert.match(rB.body, /FB1/);
-        await waitFor(() => /"agent":"fb"/.test(tlog()) && /m=FB1/.test(tlog()),
-          'log to name fb');
-        assert.match(tlog(), /"agent":"fa"/);
+        // The audit file names each hold's own agent (annotate meta carries id + agent).
+        const holdAgent = (id) => tlog().split('\n').filter(Boolean).map((l) => JSON.parse(l))
+          .find((l) => l.phase === 'annotate' && l.verdict === 'hold' && l.meta?.id === id)?.meta.agent;
+        await waitFor(() => holdAgent(gotB.id) && holdAgent(gotA.id), 'hold lines to name both agents');
+        assert.equal(holdAgent(gotA.id), 'fa');
+        assert.equal(holdAgent(gotB.id), 'fb');
       } finally {
         for (const s of sa) { try { s.destroy(); } catch {} }
         try { tp.removeAgent('fa'); } catch {}
@@ -1475,7 +1508,7 @@ describe('audit log secrets', () => {
     assert.equal(st.mode & 0o777, 0o600);
   });
 
-  it('authorization headers leave no secret in logged req lines', async () => {
+  it('authorization headers leave no secret in the audit file', async () => {
     const bearer = `Bearer probe-bearer-${process.pid}`;
     const proxyCreds = 'Basic cHJvYmU6c2VjcmV0';
     const r = await curl('-H', `Authorization: ${bearer}`,
@@ -1486,12 +1519,10 @@ describe('audit log secrets', () => {
     const text = log();
     assert.ok(!text.includes(bearer), 'bearer secret must not appear in the log');
     assert.ok(!text.includes(proxyCreds), 'proxy credentials must not appear in the log');
-    const line = text.split('\n').find((l) => l.includes('m=authz'));
-    assert.ok(line, 'authz req line is logged');
-    assert.match(line, /\[redacted\]/);
+    assert.ok(text.split('\n').some((l) => l.includes('m=authz')), 'the request is logged');
   });
 
-  it('user redact hook runs after built-in scrubbing', async () => {
+  it('user redact hook shapes the annotate meta and no secret survives', async () => {
     // Own runtime: the shared RT is claimed by the module proxy.
     const trt = mkdtempSync(join(tmpdir(), 'bb-hook-'));
     const hookLogPath = join(trt, 'mitm-hook.log');
@@ -1512,8 +1543,7 @@ describe('audit log secrets', () => {
       await waitFor(() => /m=hookredact/.test(hookLog()), 'hook log line');
       assert.equal(statSync(hookLogPath).mode & 0o777, 0o600);
       const text = hookLog();
-      assert.match(text, /"hookRan":"req"/);
-      assert.match(text, /\[redacted\]/);
+      assert.match(text, /"hookRan":"resp"/);
       assert.ok(!text.includes(secret), 'secret must not survive the hook either');
     } finally {
       await tp.close();
@@ -1534,7 +1564,7 @@ describe('upstream fallback (2.1 item 1)', () => {
 });
 
 describe('audit log secrets, continued (2.1 items 3-4)', () => {
-  it('cookie and api-key headers leave no secret in logged req lines', async () => {
+  it('cookie and api-key headers leave no secret in the audit file', async () => {
     const session = `session=${process.pid}-secret`;
     const apiKey = `key-${process.pid}-secret`;
     const r = await curl('-H', `Cookie: ${session}`,
@@ -1545,9 +1575,7 @@ describe('audit log secrets, continued (2.1 items 3-4)', () => {
     const text = log();
     assert.ok(!text.includes(session), 'cookie must not appear in the log');
     assert.ok(!text.includes(apiKey), 'api key must not appear in the log');
-    const line = text.split('\n').find((l) => l.includes('m=cookiekey'));
-    assert.ok(line, 'cookiekey req line is logged');
-    assert.match(line, /\[redacted\]/);
+    assert.ok(text.split('\n').some((l) => l.includes('m=cookiekey')), 'the request is logged');
   });
 
   it('an existing 0644 log is tightened to 0600 on start', async () => {

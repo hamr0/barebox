@@ -107,3 +107,31 @@ describe("host-local: every spelling of the host's own address", () => {
     }
   });
 });
+
+describe('checkUpstream: allowLocal names exact host:port pairs', () => {
+  const lo = { allowLoopback: false, allowLocal: new Set(['127.0.0.1:11434', 'llm.test:8080']) };
+  const stub = { ...lo, resolveUpstream: async (h) => (h === 'llm.test' ? '127.0.0.1' : '169.254.169.254') };
+
+  it('the listed pair passes; another port on the same host is denied', async () => {
+    assert.equal((await checkUpstream('127.0.0.1', lo, 11434)).ok, true);
+    const v = await checkUpstream('127.0.0.1', lo, 11435);
+    assert.equal(v.ok, false);
+    assert.match(v.reason, /loopback upstream denied/);
+  });
+
+  it('a hostname resolving to loopback passes only on its listed port', async () => {
+    assert.equal((await checkUpstream('llm.test', stub, 8080)).ok, true);
+    assert.equal((await checkUpstream('llm.test', stub, 8081)).ok, false);
+  });
+
+  it('link-local (cloud metadata) is never waived, even for a listed pair', async () => {
+    const meta = { ...lo, allowLocal: new Set(['169.254.169.254:80']) };
+    const v = await checkUpstream('169.254.169.254', meta, 80);
+    assert.equal(v.ok, false);
+    assert.match(v.reason, /link-local/);
+  });
+
+  it('without allowLocal nothing changes', async () => {
+    assert.equal((await checkUpstream('127.0.0.1', { allowLoopback: false }, 11434)).ok, false);
+  });
+});

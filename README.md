@@ -15,10 +15,7 @@
   <img src="https://img.shields.io/github/package-json/v/hamr0/barebox?label=version&color=2a4f8c" alt="version (auto from package.json)">
   <img src="https://img.shields.io/badge/license-Apache%202.0-2a4f8c" alt="license: Apache 2.0">
   <img src="https://img.shields.io/badge/platform-Linux-2a4f8c" alt="platform: Linux">
-  <img src="https://img.shields.io/badge/status-POC-c0841a" alt="status: POC">
 </p>
-
-> **Status:** early. The walls (M0), HTTPS inspection (M1), hold-and-ask (M2), the one-call `run()` and file ask channel (M2.5) and the undo layer (M4) are built and measured; the decision rules (M3), key custody (M5) and the rest are not. Today's hold rule is interim: payment destinations, plus every non-GET/HEAD request in `ask` and `auto` modes. Linux only.
 
 ## Why
 
@@ -75,7 +72,7 @@ The agent works in your house:
 - **Walls** are [bubblewrap](https://github.com/containers/bubblewrap), unprivileged: separate net/pid/ipc/uts namespaces, read-only binds, tmpfs over locked paths.
 - **Identity** is the socket, not a header the agent could fake. One socket per agent, all into one proxy.
 - **HTTPS inspection** uses a local CA that exists only inside the sandbox; the proxy reads method, URL, headers and body, then forwards.
-- **The doorman's x-rules**, strongest first: card numbers in the body (Luhn) → payment domains and paths (`/checkout`, `/payment`, …) → rwxmap labels for known APIs → unknown `POST` by mode (strict: ask once per domain; normal: allow and log).
+- **The doorman's x-rules**, strongest first: card numbers in the body (Luhn) → payment paths (`/checkout`, `/payment`, `/orders`, `/purchase`; a list of payment domains is not built) → rwxmap labels for known APIs → every other request by its letter and the mode (`ask`, `auto`, `trust`; see `barebox.context.md`). The card and payment floor asks in every mode, `trust` included; card numbers are checked in bodies of 64 KB or less.
 - **Approvals** come from a second terminal (`sbx pending`, `sbx approve <id>`, `sbx deny <id>`). Timeout means deny, with a clear `403` reason. One held request per agent at a time: later ones wait in line (16 at most, then `429 hold queue full`), and the deadline counts from arrival.
 
 ## Numbers
@@ -84,25 +81,27 @@ Measured, not estimated. Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22.
 
 | | barebox (measured) | [srt](https://github.com/anthropic-experimental/sandbox-runtime) 0.0.81 (measured) |
 |---|---|---|
-| Memory per sandbox | **7.8 MB** mean, 7.9 MB max (20 concurrent) | ~100 MB |
-| Proxy | one shared, **~60 MB idle, ~78 MB loaded** (20 agents, each with 1 parked + 16 waiting; within the ≤ 80 MB budget) | one per sandbox |
-| Start + exit | **10 ms** (M0 POC; unmeasured on the rewrite — TODO re-measure) | 1.87–2.05 s |
-| 20 agents | ~234 MB (rough sum: ~78 MB proxy + 20 × 7.8 MB) | ~2 GB |
+| Memory per sandbox | **7.8 MB** mean, 8.0 MB max | ~100 MB (each sandbox runs its own proxy) |
+| Proxy | one shared: **about 85-120 MB** in normal use; **about 100 / 113-120 / 127-133 / 145-175 MB** at 10 / 20 / 30 / 40 agents in the full worst case (each agent with 1 parked + 16 waiting + a filled body slot). The low end is a quiet machine, the high end a busy one | one per sandbox |
+| Start + exit | **10 ms** (M0 POC; unmeasured on the rewrite, TODO re-measure) | 1.87-2.05 s |
+| 10 agents | ~180 MB worst case (proxy + 10 x 8 MB) | ~1 GB |
+| 20 agents | ~275-280 MB worst case | ~2 GB |
+| 40 agents | ~465-495 MB worst case | not measured |
 
-Targets: shared proxy ≤ 80 MB, each extra sandbox ≤ 10 MB, 20 agents on a 2 GB VPS. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/logs/findings.md).
+barebox is for small teams: free, local and lightweight, built to assist and to connect to many tools, not to run swarms or thousands of agents. Budget: shared proxy about 145-175 MB in the full worst case at 40 agents, each extra sandbox 10 MB or less. 40 agents per proxy is the maximum and it is enforced: `addAgent` refuses the 41st with an error telling you to run another proxy. Above 40, run more proxies. Machine load moves the number. A long audit file does not: 205 MB of audit measured the same as 3 MB. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/logs/findings.md).
 
 ## Roadmap
 
-| Module | What | Status |
-|---|---|---|
-| M0 | Walls + front door | **PASS** — 14/14, red-team 8/8 |
-| M1 | Proxy sees inside HTTPS (curl, node, python requests, git) | **PASS** — real-internet matrix + negatives, peak 63 MB |
-| M2 | Hold one `x` request, ask, keep everything else running | **PASS** — 9-scenario hold matrix, 120 s + never timeouts |
-| M3 | Decide r/w/x deterministically (rwxmap + bareguard), audit log | |
-| M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging | **PASS** — paper + review flow implemented, full bwrap+unix proof in a real shell |
-| M5 | Keys the agent never holds | |
-| M6 | Scale run: 20 agents + shared proxy | |
-| M7 | Demos: payment held for approval; prompt-injected `~/.ssh` exfil blocked | |
+| Module | What |
+|---|---|
+| M0 | Walls + front door |
+| M1 | Proxy sees inside HTTPS (curl, node, python requests, git) |
+| M2 | Hold one `x` request, ask, keep everything else running |
+| M3 | Decide r/w/x deterministically (rwxmap + bareguard), audit log |
+| M4 | Undo layer: `diff`, `commit`, `rollback`, conflict flagging |
+| M5 | Keys the agent never holds |
+| M6 | Scale run: 20 agents + shared proxy |
+| M7 | Demos: payment held for approval; prompt-injected `~/.ssh` exfil blocked |
 
 M0–M2 are the go/no-go. Later: macOS (`sandbox-exec` + APFS clones), Windows via WSL2, Landlock/seccomp hardening. Full spec: [the PRD](docs/product/agent-sandbox-prd.md).
 
@@ -112,11 +111,11 @@ M0–M2 are the go/no-go. Later: macOS (`sandbox-exec` + APFS clones), Windows v
 npm install barebox
 ```
 
-Requires Node.js >= 22. Zero production dependencies. Needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap. CI builds bubblewrap 0.12.0 from a checksum-pinned source tarball and fails if any test is skipped. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
+Requires Node.js >= 22. Two production dependencies, [bareguard](https://npmjs.com/package/bareguard) (the gate) and [rwxmap](https://npmjs.com/package/rwxmap) (the labels), pinned exactly. Needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap. CI builds bubblewrap 0.12.0 from a checksum-pinned source tarball and fails if any test is skipped. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
 
 ## Try the POCs
 
-Linux with `bwrap` (>= 0.11.0 only for the overlay), `socat`, `openssl`, Node >= 22 and Python 3. Needs a normal shell (namespaces + listening sockets), not a tool sandbox. The POCs are throwaway proofs, not the product.
+Linux only, with `bwrap` (>= 0.11.0 only for the overlay), `socat`, `openssl`, Node >= 22 and Python 3. Needs a normal shell (namespaces + listening sockets), not a tool sandbox. The POCs are throwaway proofs, not the product.
 
 ```
 git clone https://github.com/hamr0/barebox && cd barebox

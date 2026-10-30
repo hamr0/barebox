@@ -333,6 +333,8 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     // credential-store fixtures: a dir, a file, a symlinked file, a control
     mkdirSync(join(home, '.aws'));
     writeFileSync(join(home, '.aws', 'credentials'), 'aws-secret\n');
+    mkdirSync(join(home, '.config', 'barebox'), { recursive: true });
+    writeFileSync(join(home, '.config', 'barebox', 'config.json'), '{"mode":"trust"}\n');
     writeFileSync(join(home, '.netrc'), 'machine x password netrc-secret\n');
     mkdirSync(join(home, 'dotfiles'));
     writeFileSync(join(home, 'dotfiles', 'npmrc'), '_authToken=npm-secret\n');
@@ -417,6 +419,78 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     const c = launch({ runtime: rt, agent: 't1b', proj, command: ['bash', '-c', script] });
     const r = await run(c);
     assert.equal(r.code, 0, `exit ${r.code} (11 .aws, 12 .netrc, 13 .npmrc, 14 dotfiles/npmrc, 15 notes): ${r.err}`);
+  });
+
+  it('masks barebox\'s own config: the file reads empty and the drawer lists empty', async () => {
+    await listenSock('t1c');
+    const script = [
+      '[ -z "$(cat "$HOME/.config/barebox/config.json" 2>/dev/null)" ] || exit 11',
+      '[ -z "$(ls -A "$HOME/.config/barebox")" ] || exit 12',
+    ].join('\n');
+    // The fake home only holds if XDG_CONFIG_HOME is unset: configPath() prefers it over $HOME/.config.
+    const prev = process.env.XDG_CONFIG_HOME;
+    delete process.env.XDG_CONFIG_HOME;
+    let c;
+    try {
+      c = launch({ runtime: rt, agent: 't1c', proj, command: ['bash', '-c', script] });
+    } finally {
+      if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prev;
+    }
+    const r = await run(c);
+    assert.equal(r.code, 0, `exit ${r.code} (11 config.json readable, 12 drawer not empty): ${r.err}`);
+  });
+
+  it('masks a maskDirs folder (the labels folders): files and the drawer read empty', async () => {
+    await listenSock('t1e');
+    mkdirSync(join(home, 'rwx-labels'), { recursive: true });
+    writeFileSync(join(home, 'rwx-labels', 'jira.rwxmap.json'), '{"bareguard":{"tools":{}}}\n');
+    const script = [
+      '[ -z "$(cat "$HOME/rwx-labels/jira.rwxmap.json" 2>/dev/null)" ] || exit 11',
+      '[ -z "$(ls -A "$HOME/rwx-labels")" ] || exit 12',
+    ].join('\n');
+    const c = launch({ runtime: rt, agent: 't1e', proj, command: ['bash', '-c', script],
+      maskDirs: [join(home, 'rwx-labels')] });
+    const r = await run(c);
+    assert.equal(r.code, 0, `exit ${r.code} (11 gate file readable, 12 drawer not empty): ${r.err}`);
+  });
+
+  it('masks the config where XDG_CONFIG_HOME puts it', async () => {
+    await listenSock('t1d');
+    mkdirSync(join(home, 'altcfg', 'barebox'), { recursive: true });
+    writeFileSync(join(home, 'altcfg', 'barebox', 'config.json'), '{"mode":"trust"}\n');
+    const script = [
+      '[ -z "$(cat "$HOME/altcfg/barebox/config.json" 2>/dev/null)" ] || exit 11',
+      '[ -z "$(ls -A "$HOME/altcfg/barebox")" ] || exit 12',
+    ].join('\n');
+    const prev = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = join(home, 'altcfg');
+    let c;
+    try {
+      c = launch({ runtime: rt, agent: 't1d', proj, command: ['bash', '-c', script] });
+    } finally {
+      if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prev;
+    }
+    const r = await run(c);
+    assert.equal(r.code, 0, `exit ${r.code} (11 altcfg config readable, 12 drawer not empty): ${r.err}`);
+  });
+
+  it('held bodies fall under the runtime mask: invisible inside', async () => {
+    const rtHome = join(home, 'rt-held');
+    mkdirSync(join(rtHome, 'held'), { recursive: true });
+    mkdirSync(join(rtHome, 'socks'), { recursive: true });
+    writeFileSync(join(rtHome, 'held', 'h1'), 'held-body-secret');
+    const srv = net.createServer((s) => s.resume());
+    await new Promise((resolve, reject) => {
+      srv.on('error', reject);
+      srv.listen(join(rtHome, 'socks', 'th.sock'), resolve);
+    });
+    servers.push(srv);
+    const c = launch({ runtime: rtHome, agent: 'th', proj,
+      command: ['bash', '-c', 'test ! -e "$HOME/rt-held/held" && test ! -e "$HOME/rt-held/held/h1" && ! cat "$HOME/rt-held/held/h1" 2>/dev/null'] });
+    const r = await run(c);
+    assert.equal(r.code, 0, `held/ must not show through: ${r.err}`);
   });
 
   it('binds project read-only', async () => {

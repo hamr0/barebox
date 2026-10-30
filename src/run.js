@@ -4,19 +4,18 @@
 // which stay public): one agent, one sandbox, one audit log, exit code out.
 // The caller never touches sockets, ask files, or the hold queue.
 //
-// What `mode` does TODAY (letters are M3's job): the proxy sees requests,
-// not intent, so until the rwxmap + bareguard letter pipeline lands there is
-// no per-letter policy — only this interim hold rule:
-//   - the card/payment FLOOR holds in every mode, including `trust`: a
-//     request whose path names a payment destination (`/checkout`,
-//     `/payment`, `/orders`, `/purchase`). The card-in-body half of the
-//     floor is NOT enforced here: the decide seam sees method/URL/headers
-//     but never the body, so body inspection waits for M3's in-proxy rules.
-//     Known payment DOMAINS are likewise M3 (they need rwxmap).
-//   - `ask`/`auto` additionally park every non-GET/HEAD request (the PRD's
-//     "unsure? tag it x" default: GET/HEAD = r, anything else = x). The two
-//     modes behave identically until M3's `askOn` letters separate them.
-//   - `trust` forwards everything else, logged.
+// What `mode` does: it picks the agent's bareguard letters (see policy.js).
+// Every request is one `gate.check()`; the hold queue is the gate's human
+// channel. Until rwxmap lands, each HTTP method is one tool: GET/HEAD are `r`,
+// POST/PUT/PATCH/DELETE are `x`, any other method is denied in every mode.
+//   - `ask`   holds r only; w and x ask.
+//   - `auto`  holds r and w; x asks.
+//   - `trust` holds r, w and x; nothing asks.
+//   - the card/payment FLOOR asks in every mode, trust included: a body of
+//     <= 64 KB holding a card number (`flags.cardLike`), or a path naming a
+//     payment destination (`flags.paymentPath`: /checkout, /payment,
+//     /orders, /purchase). Bodies over 64 KB stream through unchecked for
+//     cards (known gap). Known payment DOMAINS are B2 (they need rwxmap).
 //
 // A passed `onAsk` answers parked requests with no files involved; when it is
 // absent the file checkpoint runs (`<runtime>/asks` + `<runtime>/answers`,
@@ -31,55 +30,7 @@ import { createProxy } from './proxy.js';
 import { createRuntime, runtimePaths } from './runtime.js';
 import { launch } from './launcher.js';
 import { diffOverlay } from './overlay.js';
-
-/** Payment-destination path fragments: the URL-visible half of the floor (PRD section 2). */
-const FLOOR_PATHS = ['/checkout', '/payment', '/orders', '/purchase'];
-
-/**
- * The card/payment floor, URL-visible half: park payment destinations in
- * every mode. Returns the hold reason, or null to leave the mode rule alone.
- *
- * @param {{ url: string }} req request, as seen by the decide seam
- * @returns {string|null} hold reason, or null
- */
-function floorReason(req) {
-  let pathname;
-  try {
-    pathname = new URL(req.url).pathname.toLowerCase();
-  } catch {
-    return null;
-  }
-  for (const fp of FLOOR_PATHS) {
-    if (pathname.includes(fp)) return `payment destination (floor): ${fp}`;
-  }
-  return null;
-}
-
-/**
- * The interim x-rule (PRD "everything else"): GET/HEAD forward, any other
- * method parks. Stands in for M3's letters.
- *
- * @param {{ method: string }} req request, as seen by the decide seam
- * @returns {string|null} hold reason, or null
- */
-function methodReason(req) {
-  const m = String(req.method || '').toUpperCase();
-  return (m === 'GET' || m === 'HEAD') ? null : `method ${m || '?'} is not GET/HEAD (interim x-rule)`;
-}
-
-/**
- * Build the hold decision for a mode. Pure: unit-testable without a sandbox.
- *
- * @param {string} mode `ask` | `auto` | `trust`
- * @returns {import('./holds.js').ShouldHold} decision function for the hold queue
- */
-export function shouldHoldForMode(mode) {
-  if (mode !== 'ask' && mode !== 'auto' && mode !== 'trust') {
-    throw new Error(`run: mode must be ask|auto|trust, got ${JSON.stringify(mode)}`);
-  }
-  return (req) => floorReason(req)
-    ?? (mode === 'trust' ? null : methodReason(req));
-}
+import { MODES, gateFor } from './policy.js';
 
 /**
  * A collected ask record: the parked ask plus how it was decided.
@@ -90,7 +41,7 @@ export function shouldHoldForMode(mode) {
  * @property {string} method HTTP method
  * @property {string} url full URL
  * @property {string} rule hold-reason string
- * @property {string} letter always `'x'` until M3 owns letters
+ * @property {string} letter the matched rwx letter, `'x'` when the ask names none
  * @property {string} [bodyPreview] request body preview
  * @property {boolean} [truncated] body preview truncation flag
  * @property {string|null} [expiresAt] ISO-8601 UTC deadline, or null
@@ -110,6 +61,9 @@ export function shouldHoldForMode(mode) {
  * @property {string} [runtime] runtime dir (created when absent: a short `sbx-*` temp dir, keeping unix socket paths under the ~108-char limit)
  * @property {string} [agent] agent name (default `'agent'`)
  * @property {number|string} [timeoutMs] hold deadline in ms, or `'never'` (default 120000)
+ * @property {number} [heldBodyMaxBytes] cap on a held request's body, in bytes (default 52428800); over it the request is denied
+ * @property {{ matcher: any, tools: Record<string, any>, dirs?: string[] }} [labels] the loaded label files (`loadLabels`); their folders are masked from the sandbox
+ * @property {string[]} [allowLocal] exact `host:port` pairs (for example a local model server) that may pass the wall's private/loopback check (the `localLlm` setting)
  * @property {object} [unsafeTestOnly] TEST-ONLY escape hatch, forwarded to the proxy (see `createProxy`): everything under it weakens the sandbox wall
  * @property {NodeJS.WritableStream} [stdout] where the agent's stdout goes (default process.stdout)
  * @property {NodeJS.WritableStream} [stderr] where the agent's stderr goes (default process.stderr)
@@ -129,6 +83,9 @@ export function shouldHoldForMode(mode) {
  * @param {string|null} [opts.runtime] runtime dir (created when absent: a short `sbx-*` temp dir, keeping unix socket paths under the ~108-char limit)
  * @param {string} [opts.agent] agent name (default `'agent'`)
  * @param {number|string} [opts.timeoutMs] hold deadline in ms, or `'never'` (default 120000)
+ * @param {number} [opts.heldBodyMaxBytes] cap on a held request's body, in bytes (default 52428800); over it the request is denied
+ * @param {{ matcher: any, tools: Record<string, any>, dirs?: string[] }|null} [opts.labels] the loaded label files (`loadLabels`); their folders are masked from the sandbox
+ * @param {string[]} [opts.allowLocal] exact `host:port` pairs (for example a local model server) that may pass the wall's private/loopback check (the `localLlm` setting)
  * @param {object|null} [opts.unsafeTestOnly] TEST-ONLY escape hatch, forwarded to the proxy (see `createProxy`)
  * @param {NodeJS.WritableStream|null} [opts.stdout] where the agent's stdout goes (default process.stdout)
  * @param {NodeJS.WritableStream|null} [opts.stderr] where the agent's stderr goes (default process.stderr)
@@ -142,8 +99,8 @@ export function shouldHoldForMode(mode) {
  * const { exit, asks, audit } = await run({ proj: "/tmp/proj", command: ["bash", "-c", "echo hi"] });
  */
 export async function run({ proj, command, mode = 'auto', onAsk = null,
-  onEvent = null, runtime = null, agent = 'agent', timeoutMs,
-  unsafeTestOnly = null, stdout = null, stderr = null,
+  onEvent = null, runtime = null, agent = 'agent', timeoutMs, heldBodyMaxBytes,
+  allowLocal = [], labels = null, unsafeTestOnly = null, stdout = null, stderr = null,
   overlay = false, overlayIgnore }) {
   if (typeof proj !== 'string' || !proj) throw new Error('run: proj must be a non-empty string');
   if (!fs.existsSync(proj)) throw new Error(`run: proj does not exist: ${proj}`);
@@ -154,7 +111,9 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
     throw new Error('run: onAsk must be a function');
   }
   // Mode first: bad input throws before any runtime dir is created.
-  const decide = shouldHoldForMode(mode);
+  if (!MODES.includes(mode)) {
+    throw new Error(`run: mode must be ${MODES.join('|')}, got ${JSON.stringify(mode)}`);
+  }
   // Short temp dir: agent socket paths inherit it and cap at ~108 chars.
   const rt = runtime ?? createRuntime();
   const audit = runtimePaths(rt).audit;
@@ -177,8 +136,10 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
     : recordEvent;
 
   const proxy = createProxy({
-    runtime: rt, logFile: audit, unsafeTestOnly,
-    hold: { shouldHold: decide, onAsk, timeoutMs, onEvent: holdOnEvent },
+    runtime: rt, logFile: audit, allowLocal, unsafeTestOnly,
+    ...(labels ? { labels } : {}),
+    gateFor: (name, { humanChannel, tools }) => gateFor({ agent: name, mode, auditPath: audit, humanChannel, tools }),
+    hold: { onAsk, timeoutMs, maxBody: heldBodyMaxBytes, onEvent: holdOnEvent },
   });
   try {
     await proxy.ready;
@@ -199,7 +160,7 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
     const child = launch({
       runtime: rt, agent, proj, command,
       socket: sock, caFile: proxy.caFile,
-      overlay, overlayIgnore,
+      overlay, overlayIgnore, maskDirs: labels?.dirs ?? [],
     });
     const out = stdout ?? process.stdout;
     const err = stderr ?? process.stderr;
