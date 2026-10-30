@@ -703,12 +703,9 @@ export function createProxy(opts) {
         endAsk: null };
       let cardLike = false;
       if (hasBody) {
-        const r = await readBounded(creq, WORK_BODY_LIMIT);
-        if (r.aborted) return;
-        ctx.chunks = r.chunks;
-        ctx.over = r.over;
+        if (await readWorkBody(ctx)) return;
         // Past 64 KB the body streams on unscanned (known gap).
-        if (!r.over) cardLike = createCardScanner().push(Buffer.concat(r.chunks));
+        if (!ctx.over) cardLike = createCardScanner().push(Buffer.concat(ctx.chunks));
       }
       // The body never goes in the action: bareguard writes the action to its audit file.
       const action = { type: 'net', tool: toolFor(matcher, tools, method, urlStr), url: urlStr, method, agent,
@@ -787,6 +784,21 @@ export function createProxy(opts) {
     void tail.then(() => { if (workTail.get(agent) === tail) workTail.delete(agent); });
     cres.once('close', free);
     return prev.then(() => free);
+  }
+
+  /**
+   * Read the working slice of the body into `ctx.chunks` and `ctx.over`. Its
+   * own frame, so no reference to the chunks outlives a later spool to disk.
+   *
+   * @param {RequestCtx} ctx request context
+   * @returns {Promise<boolean>} true when the client went away
+   */
+  async function readWorkBody(ctx) {
+    const r = await readBounded(ctx.creq, WORK_BODY_LIMIT);
+    if (r.aborted) return true;
+    ctx.chunks = r.chunks;
+    ctx.over = r.over;
+    return false;
   }
 
   /**

@@ -16,6 +16,8 @@ import net from 'node:net';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import v8 from 'node:v8';
+import vm from 'node:vm';
 import { createProxy } from '../src/proxy.js';
 import { startHttp } from './fixtures/upstream.mjs';
 import { pathGate } from './fixtures/gates.mjs';
@@ -102,6 +104,16 @@ async function withProxy(holdExtra, fn) {
     await Promise.race([proxy.close(), nap(5000)]);
     rmSync(rt, { recursive: true, force: true });
   }
+}
+
+/** Can this box bind a unix socket? (Some sandboxes block it.) */
+async function unixSocketsOk() {
+  const probe = join(tmpdir(), `bb-bodies-probe-${process.pid}.sock`);
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.on('error', () => resolve(false));
+    s.listen(probe, () => s.close(() => { try { rmSync(probe); } catch {} resolve(true); }));
+  });
 }
 
 describe('card floor on small allowed bodies', () => {
@@ -267,12 +279,7 @@ describe('held bodies live on disk', () => {
   });
 
   it('removeAgent with a parked hold: file gone', { timeout: 30000 }, async (tc) => {
-    const probe = join(tmpdir(), `bb-bodies-probe-${process.pid}.sock`);
-    const ok = await new Promise((resolve) => {
-      const s = net.createServer();
-      s.on('error', () => resolve(false));
-      s.listen(probe, () => s.close(() => { try { rmSync(probe); } catch {} resolve(true); }));
-    });
+    const ok = await unixSocketsOk();
     if (!ok) { tc.skip('unix socket bind blocked here'); return; }
     await withProxy({}, async (t) => {
       const sockPath = t.proxy.addAgent('ba');
@@ -370,6 +377,41 @@ describe('one preview for the ask; the audit file carries no body', () => {
       assert.match(ask.bodyPreview, /^\*{4} \*{4} \*{4} 4242 /);
       t.answer(h.id, { decision: 'deny' });
       await done;
+    });
+  });
+});
+
+describe('held bodies are not kept in memory', () => {
+  it('68 held 64 KB bodies (4 agents x 1 parked + 16 waiting) add no body memory after gc', { timeout: 60000 }, async (tc) => {
+    if (!(await unixSocketsOk())) { tc.skip('unix socket bind blocked here'); return; }
+    v8.setFlagsFromString('--expose-gc');
+    const gc = vm.runInNewContext('gc');
+    const settle = async () => { for (let i = 0; i < 3; i++) { gc(); await nap(50); } };
+    const AGENTS = 4;
+    const PER = 17; // one parked + MAX_WAITING_PER_AGENT (16)
+    const SIZE = 64000;
+    await withProxy({}, async (t) => {
+      await settle();
+      const before = process.memoryUsage().arrayBuffers;
+      const socks = [];
+      for (let a = 0; a < AGENTS; a++) {
+        const sockPath = t.proxy.addAgent(`mem${a}`);
+        for (let i = 0; i < PER; i++) {
+          const s = net.connect(sockPath);
+          s.on('error', () => {});
+          await once(s, 'connect');
+          s.write(`POST http://127.0.0.1:${up.port}/hold HTTP/1.1\r\nHost: 127.0.0.1:${up.port}\r\nContent-Length: ${SIZE}\r\n\r\n`);
+          s.write(filler(SIZE, a * PER + i + 1));
+          socks.push(s);
+        }
+      }
+      await waitFor(() => t.heldFiles().length === AGENTS * PER, 'all 68 bodies spooled', 30000);
+      await settle();
+      const grew = process.memoryUsage().arrayBuffers - before;
+      const total = AGENTS * PER * SIZE;
+      console.log(`held-body memory: arrayBuffers grew ${grew} B of ${total} B body total`);
+      assert.ok(grew < total / 10, `arrayBuffers grew ${grew} B; bodies total ${total} B`);
+      for (const s of socks) s.destroy();
     });
   });
 });
