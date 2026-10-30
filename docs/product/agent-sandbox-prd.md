@@ -489,7 +489,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 
 - Bodies up to 64 KB are read whole into the agent's working slot (one per agent, 64 KB, in memory), checked for card numbers, then decided. A card number turns the request into a floor ask (asks in every mode, `trust` included). Nothing is ever denied because of a card.
 - Bodies over 64 KB stream through unchecked for card numbers. They still get the normal letter and mode decision from URL and headers. Why: random 16-digit numbers starting 2–6 pass Luhn about 1 time in 10, so checking and denying large uploads would break uploads full of ids.
-- Bodies are read only when the URL and headers alone would allow the request. If they already mean ask, the body stays unread, as today.
+- A body of 64 KB or less is read in the working slot for every request, before the gate decides, whatever the URL and headers would decide alone (corrected Oct 30: the built proxy does not leave a body unread when the URL already means ask).
 - The scanner (`src/cardscan.js`, built and tested Oct 29): 13–19 digits, optional single space or dash separators, touching no other digit, first digit 2–6 (excludes millisecond timestamps), then Luhn. It keeps a 40-byte tail between chunks and finds a card followed by a CVV. Card detection gets no more rounds: further wrinkles go to the fix ledger.
 - Held bodies (any request waiting for the human, card asks and x asks) are written to a file in the owner-only runtime folder, never kept in memory. Cap 50 MB (config key `heldBodyMaxMB`, in the one config file). Over the cap: 403 "body too large to hold". The file is deleted once the ask is decided or abandoned. Why: a held body kept in memory up to 1 MB (today) is 20 MB at 20 agents, over budget, and a 64 KB cap would make `git push` impossible to approve.
 - A card ask waits in the agent's line like any other ask (1 held, up to 16 waiting).
@@ -512,7 +512,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 2. **The rwx file generator**: per mode, from rwxmap labels plus the default model-endpoint list.
 3. **`ask` / `auto` / `trust` as bareguard config** (rwx letters + `askUnheld` + the flags for the floor).
 4. **The body checker**, the 64 KB working slot per agent, held bodies in files, and the masked 4 KB preview (see "The body check").
-4a. **The config file**: `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, read by the CLI only. Keys today `mode`, `holdTimeoutSec`, and (coming) `heldBodyMaxMB`; later modules add keys to the same file, no second user config file. A flag beats the file, the file beats the default. An unknown key, bad value or bad JSON makes `sbx run` exit 2 naming the file and key. It is hidden inside the sandbox (it reads empty); the mask must follow the resolved path, so a custom `XDG_CONFIG_HOME` under `$HOME` is hidden too (fixed in the body brief). Built Oct 29 (part A).
+4a. **The config file**: `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, read by the CLI only. Keys today `mode`, `holdTimeoutSec`, `heldBodyMaxMB`, `localLlm`, `labels` and `tenants`; later modules add keys to the same file, no second user config file. A flag beats the file, the file beats the default. An unknown key, bad value or bad JSON makes `sbx run` exit 2 naming the file and key. It is hidden inside the sandbox (it reads empty); the mask must follow the resolved path, so a custom `XDG_CONFIG_HOME` under `$HOME` is hidden too (fixed in the body brief). Built Oct 29 (part A).
 5. **The `gate` option**: none means a preset; otherwise a passed bareguard `Gate` or any object with the same `check(action)` contract. Matched by shape.
 6. **Audit** through `gate.record` and `gate.annotate`.
 7. **Reuse instead of barebox's own copies**:
@@ -629,6 +629,8 @@ Not sorted into the 10 days.
 - **Held requests can time out on the server side.** Holding happens before forwarding, so only the agent's client waits.
 - **Card numbers in bodies over 64 KB are not checked.** Such bodies stream through with the normal letter and mode decision. Checking and denying them would break large uploads, because random 16-digit ids pass Luhn about 1 time in 10.
 - **API keys or passwords inside a body still appear in the 4 KB preview** (ask file only; the audit file holds no preview). Card numbers are masked. bareguard's redaction covers common token shapes once it lands. barebox builds no scrubber of its own.
+- **Payment domains are not built.** Only the four path fragments (`/checkout`, `/payment`, `/orders`, `/purchase`) ask as the payment floor; a request to a known payment domain on any other path is decided by its letter and the mode.
+- **Held bodies add up on disk.** Each agent has one parked body of up to 50 MB (`heldBodyMaxMB`) in `<runtime>/held`, so 40 agents can hold 2 GB; the runtime defaults to a temp dir, which is often a RAM-backed tmpfs. There is no total cap, and the 145-175 MB budget does not count it.
 - **Certificate pinning breaks inspection.** Out of scope.
 - **The proxy sees traffic, not intent.** Every API needs a mapping. File edits and local stdio MCP servers never touch the network. The undo layer and locked paths cover files. An MCP server running outside the sandbox with its own credentials is a hole.
 

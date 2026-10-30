@@ -140,7 +140,7 @@ with a body of 64 KB or less is read in the agent's working slot before the
 gate decides. Denials read `403 denied: <rule>[: reason]` (a human or timeout
 denial reads `denied: <reason>`).
 
-`createProxy` takes `gateFor(agent, { humanChannel })`, called once per agent,
+`createProxy` takes `gateFor(agent, { humanChannel, tools })`, called once per agent,
 returning a bareguard `Gate` or any object with `async check(action)` that
 resolves `{ outcome: "allow" | "deny" | "askHuman", rule?, reason? }`;
 `askHuman` from a plain object goes to the same queue. Without `gateFor`
@@ -257,8 +257,8 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
 
 ## What this package does not do
 
-Per-API labels (rwxmap) arrive in a later release; until then every request
-is `http.<METHOD>`. The card-in-body floor checks bodies of 64 KB or less;
+Per-API labels cover only the vendors whose rwxmap folders you list in
+`labels`; every other request is `http.<METHOD>`. The card-in-body floor checks bodies of 64 KB or less;
 larger bodies stream through unchecked for cards. The removed `hold.shouldHold`
 and `hold.match` are gone: pass `gateFor` instead. No Docker, no MCP server, no macOS/Windows —
 Linux only. POC harnesses live in `poc/` in the repo and never ship.

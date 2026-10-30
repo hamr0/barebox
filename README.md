@@ -72,7 +72,7 @@ The agent works in your house:
 - **Walls** are [bubblewrap](https://github.com/containers/bubblewrap), unprivileged: separate net/pid/ipc/uts namespaces, read-only binds, tmpfs over locked paths.
 - **Identity** is the socket, not a header the agent could fake. One socket per agent, all into one proxy.
 - **HTTPS inspection** uses a local CA that exists only inside the sandbox; the proxy reads method, URL, headers and body, then forwards.
-- **The doorman's x-rules**, strongest first: card numbers in the body (Luhn) → payment domains and paths (`/checkout`, `/payment`, …) → rwxmap labels for known APIs → unknown `POST` by mode (strict: ask once per domain; normal: allow and log).
+- **The doorman's x-rules**, strongest first: card numbers in the body (Luhn) → payment paths (`/checkout`, `/payment`, `/orders`, `/purchase`; a list of payment domains is not built) → rwxmap labels for known APIs → every other request by its letter and the mode (`ask`, `auto`, `trust`; see `barebox.context.md`). The card and payment floor asks in every mode, `trust` included; card numbers are checked in bodies of 64 KB or less.
 - **Approvals** come from a second terminal (`sbx pending`, `sbx approve <id>`, `sbx deny <id>`). Timeout means deny, with a clear `403` reason. One held request per agent at a time: later ones wait in line (16 at most, then `429 hold queue full`), and the deadline counts from arrival.
 
 ## Numbers
@@ -111,7 +111,7 @@ M0–M2 are the go/no-go. Later: macOS (`sandbox-exec` + APFS clones), Windows v
 npm install barebox
 ```
 
-Requires Node.js >= 22. Zero production dependencies. Needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap. CI builds bubblewrap 0.12.0 from a checksum-pinned source tarball and fails if any test is skipped. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
+Requires Node.js >= 22. Two production dependencies, [bareguard](https://npmjs.com/package/bareguard) (the gate) and [rwxmap](https://npmjs.com/package/rwxmap) (the labels), pinned exactly. Needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap. CI builds bubblewrap 0.12.0 from a checksum-pinned source tarball and fails if any test is skipped. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
 
 ## Try the POCs
 
