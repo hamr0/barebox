@@ -559,6 +559,35 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Done when | An approved request reaches an API with the real header value. A denied one carries only the placeholder. A search of the sandbox for the real value finds nothing. |
 | Estimate | 0.5 day. |
 
+**M5 interview, round 1 (user, Oct 31; all recommendations accepted).**
+
+- *Scope:* M5 protects API keys sent in a request header to a service (Stripe, GitHub, Jira, Anthropic or OpenAI API keys). The agent's own sign-in (Claude Code's subscription login in `~/.claude`) is out of 0.6.0: those tokens refresh themselves; `~/.claude` stays readable and is a known gap.
+- *Host environment:* cleared. Measured Oct 31: today all 115 host variables reach the sandbox (`FAKE_API_KEY=sk-test-123 sbx run -- env` shows it), including `CLAUDE_CODE_MESSAGING_TOKEN` and `SBX_RUNTIME`; the ssh-agent and D-Bus sockets do not (`/run/user/<uid>` is not mounted). The inside gets barebox's own variables (`HOME`, `PATH`, the proxy and CA variables), a short default pass list (`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `EDITOR`, `PAGER`), config `env.pass` names, config `env.set` values, and one placeholder per configured secret. Proposed guard (not yet decided): `env.pass` refuses secret-looking names (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`) with "use `secrets` for this".
+- *Where keys live:* config `secrets`, each entry naming a host environment variable (`fromEnv`) by default, or holding the value inline (the config file is 0600 and masked). No OS keyring.
+- *When the real value goes in:* on any request the gate allows (by mode or by your approval), and only to the hosts that secret is bound to. A denied request, or one to any other host, carries the placeholder.
+
+**M5 interview, round 2 (user, Oct 31).**
+
+- *Placeholder:* random, made fresh per run, one per configured secret, under the secret's usual variable name. It lets tools start and send their auth header; the proxy finds it in a header and swaps in the real value only for an allowed request to a bound host. Seen headed anywhere else, it is a tripwire.
+- *Keys per agent:* one shared `secrets` set for every agent on the proxy for now; per-agent keys later, when needed, without changing this design.
+- *Audit:* no new file. Swap facts go into `<runtime>/gate.jsonl`, the one bareguard-shape file the suite shares, as `annotate` lines (`verdict: "secret"`, `meta: { agent, rid, name, host, swapped }`), joined to the gate line by `rid`. Never the value.
+
+**M5 interview, round 3 (user, Oct 31).** `env.pass` refuses secret-looking names (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, case-insensitive) at startup with "use `secrets` for this"; no override (`env.set` covers a harmless match). A placeholder headed for a host its secret is not bound to is blocked: `403 denied: secret.host`, plus the audit line, in every mode.
+
+**M5 spec (decided Oct 31).**
+
+| | |
+|---|---|
+| Problem | Every host environment variable reaches the sandbox today (115 measured), so any exported API key is readable by the agent. |
+| Goal | The agent holds only placeholders. The proxy, outside the sandbox's pid namespace, adds the real value to request headers on allowed requests to bound hosts. |
+| Go/no-go (POC) | With a secret configured: the real value appears 0 times inside the sandbox (environment of every process, `/proc/*/environ`, `/proc/*/cmdline`, every readable file under `/` except `/proc` and `/sys`, the CA bundle); an allowed request to the bound host arrives upstream with the real value; a denied one, and one to an unbound host, never carry it; the unbound one is blocked `403 secret.host`. Each check must be shown able to fail. |
+| Config | `env: { pass: [names], set: { name: value } }` and `secrets: { NAME: { fromEnv: "HOSTVAR" \| value: "...", hosts: ["api.stripe.com"] } }` in the one config file; unknown keys and a missing `fromEnv` variable fail at startup (exit 2). |
+| Environment inside | barebox's own variables, the default pass list, `env.pass`, `env.set`, one random per-run placeholder per secret under its own name. Nothing else. |
+| Swap | Every request header value is searched for each placeholder (substring, so `Bearer <ph>` works). Gate allows and the host is bound: replace with the real value. Denied: the placeholder never leaves (the request does not go upstream). Unbound host: `403 secret.host`. Never in the audit, the ask file or an error body. |
+| Audit | `annotate` lines in `gate.jsonl`, `verdict: "secret"`, `meta: { agent, rid, name, host, swapped }`. |
+| Out of scope to Nov 4 | Swaps in bodies, URLs or query strings; OAuth, refresh tokens and the agent's own sign-in (`~/.claude` stays readable, a known gap); macOS; a web UI; per-agent keys. |
+| Open | Whether `run()` / `createProxy()` take `secrets` directly (library callers) or only the CLI reads them; decided in the build brief. |
+
 ### M6. Scale run
 
 | | |
