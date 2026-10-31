@@ -370,3 +370,27 @@ Not measured: the time cost of a first ask's walk. Each gate parses the whole fi
 ### Smoke on bareguard 0.30.0 (Oct 30)
 
 A real `sbx run --mode auto --json` with real internet, after the 0.30.0 pin: GET example.com 200; POST httpbin asked as `rwx.ask`, approved, 200; a second POST asked, denied, 403; exit 0. One audit file, `gate.jsonl`, 16 lines, no `audit.jsonl`; `aid` joins each request's lines; two `body` lines; the body text appears 0 times. socat logged one "Connection reset by peer" as the run ended (not looked into).
+
+## M5 — POC: keys the agent never holds (Oct 31)
+
+Brief: `docs/logs/m5-poc-brief.md`. Code in `poc/m5/` (never shipped). Real shell, bwrap 0.12.0, Node 22.22.2, no skips. Fake real values `sk_test_REAL_<hex>` and `ghp_REAL_<hex>` held only in the host process; searched as fixed strings and as base64 at three alignments, fed to the sandbox on stdin so no needle sits inside. Orchestrator reran A, B, D, E, F, G and every mutation: each check passes, each mutation turns it red.
+
+| Check | Pass | Mutation, red |
+|---|---|---|
+| A. `/proc/*/environ` inside | 0 of 6 files | host env reaches bwrap: 6 of 6; `--clearenv` only: 1 of 6 |
+| B. `/proc/*/cmdline` | 0 of 6 | value passed as an argument: 3 of 6 |
+| C. files inside (all but `/proc`, `/sys`) | 0 files | value written under `$HOME`: 1 |
+| D. allowed, bound host | upstream gets `Bearer <real>` | swap off: upstream gets the placeholder |
+| E. unbound host | `403 denied: secret.host`, 0 upstream requests, one `swapped:false` audit line | host check off: upstream gets the real value |
+| F. denied (`rwx.unlisted`, and an ask answered deny) | 0 upstream requests; real value in no runtime file; no `swapped:true` line | swap before the gate: 2 `swapped:true` lines for denied requests |
+| G. real tools | curl `-H`, node `fetch` (https) get the real value upstream; also `x-api-key`, `curl -u KEY:`, `wget --header`, python urllib, `--oauth2-bearer`, `token $GITHUB_TOKEN` | swap off: all see the placeholder |
+
+**Finding: `--clearenv` is not enough.** bwrap's own process is pid 1 inside, and `/proc/1/environ` shows the environment bwrap was started with: the whole host environment. `--clearenv` only cleans what bwrap runs. The fix is to spawn bwrap with a clean environment (`env: { PATH: '/usr/bin:/bin' }`); with that alone, A passes, so `--clearenv` is redundant.
+
+**Finding: Basic auth.** `curl -u KEY:` (Stripe's documented style) sends `Authorization: Basic base64(KEY:)`, so a plain substring swap misses it. The POC's `swap()` decodes `Basic` values, swaps and re-encodes.
+
+**Finding (existing, not M5):** node `fetch` with `NODE_USE_ENV_PROXY=1` to a plain `http://` URL fails ("other side closed"): undici tunnels with CONNECT even for http, and the proxy treats every CONNECT as TLS. https works.
+
+F's mutation shows no leak channel, because nothing writes request headers to the audit, the ask file or an error body; the observable is the audit lying (`swapped:true` on a denied request) and the real value held in memory while the request waits.
+
+**Cost.** The swap function alone: 3.9 µs per request with 1 secret, 10.7 µs with 10 (200,000 calls). End to end (2000 requests, local upstream, load about 5-6): p50 0.43-0.66 ms off, 0.65-0.68 ms with 1 secret, 0.64-0.66 ms with 10; the 1- and 10-secret runs overlap. Proxy idle RSS 72.1-72.5 MB off, 72.4-72.6 MB with 10 secrets. Worst case at 20 agents is load noise (off 112.2-149.9, on 111.6-147.1, load 5-19); the minima agree within 1 MB. A quiet-machine A/B is still owed before claiming "under 1 MB".
