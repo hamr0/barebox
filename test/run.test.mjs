@@ -10,6 +10,8 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
 import http from 'node:http';
+import https from 'node:https';
+import tls from 'node:tls';
 import { Writable } from 'node:stream';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync,
   existsSync, renameSync, rmSync } from 'node:fs';
@@ -18,6 +20,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { run } from '../src/run.js';
+import { ensureCA, certFor } from '../src/certs.js';
 import { claimRuntime, runtimePaths } from '../src/runtime.js';
 import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
 import { setupOverlay } from '../src/overlay.js';
@@ -285,15 +288,29 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
   // M5: keys the agent never holds. The upstream records the headers it gets.
   describe('secrets (M5)', () => {
     const REAL = `sk_test_REAL_${Math.random().toString(36).slice(2)}${Date.now()}`;
-    let recUp, seen;
+    // A real value is swapped only over TLS: the recording upstream is https
+    // with a cert from a fixture CA. The proxy under test trusts that CA
+    // through the host process (run() in-process: the default CA list; the CLI
+    // child: NODE_EXTRA_CA_CERTS); the sandbox trusts the proxy's own CA as always.
+    let recUp, seen, fixtureCa, certDir, savedCas;
     before(async () => {
       seen = [];
-      recUp = http.createServer((req, res) => { seen.push({ url: req.url, headers: req.headers }); req.resume(); res.end('upstream-ok'); });
+      certDir = mkdtempSync(join(tmpdir(), 'bb-m5r-'));
+      await ensureCA(certDir);
+      fixtureCa = join(certDir, 'ca.pem');
+      const { key, cert } = await certFor(certDir, '127.0.0.1');
+      recUp = https.createServer({ key, cert }, (req, res) => { seen.push({ url: req.url, headers: req.headers }); req.resume(); res.end('upstream-ok'); });
       await new Promise((r) => recUp.listen(0, '127.0.0.1', r));
+      savedCas = tls.getCACertificates('default');
+      tls.setDefaultCACertificates([...savedCas, readFileSync(fixtureCa, 'utf8')]);
     });
-    after(async () => { recUp.closeAllConnections?.(); await new Promise((r) => recUp.close(r)); });
+    after(async () => {
+      tls.setDefaultCACertificates(savedCas);
+      recUp.closeAllConnections?.(); await new Promise((r) => recUp.close(r));
+      rmSync(certDir, { recursive: true, force: true });
+    });
     const upPort = () => recUp.address().port;
-    const curlBearer = (p) => `curl -s --max-time 10 -H "Authorization: Bearer $STRIPE_API_KEY" http://127.0.0.1:${upPort()}${p}`;
+    const curlBearer = (p) => `curl -s --max-time 10 -H "Authorization: Bearer $STRIPE_API_KEY" https://127.0.0.1:${upPort()}${p}`;
 
     it('run({ secrets, env }): the upstream gets the real value; the inside holds a placeholder and no host variable', async () => {
       seen.length = 0;
@@ -342,7 +359,7 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
           `${curlBearer('/cli')}; echo; echo "key=$STRIPE_API_KEY from=\${BB_M5_FROM-unset} passed=$BB_M5_PASSED"`],
         { cwd: proj, encoding: 'utf8', timeout: 50000,
           env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: xdg, BB_M5_FROM: REAL, BB_M5_PASSED: 'pass-v',
-            SBX_UNSAFE_TEST_ALLOW_LOOPBACK: '1' } },
+            SBX_UNSAFE_TEST_ALLOW_LOOPBACK: '1', NODE_EXTRA_CA_CERTS: fixtureCa } },
         (error, stdout, stderr) => resolve({ code: error ? error.code : 0, stdout, stderr }));
       });
       assert.equal(r.code, 0, r.stderr);

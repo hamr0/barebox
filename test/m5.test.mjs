@@ -187,12 +187,12 @@ async function assertNoLeak(t) {
 const auth = (ph) => ({ authorization: `Bearer ${ph}` });
 
 describe('allowed to the bound host: the real value goes in', () => {
-  it('TCP door, auto mode: a GET arrives with the real value, one swapped line, joined by rid', { timeout: 20000 }, async () => {
+  it('TCP door, auto mode, over TLS: a GET arrives with the real value, one swapped line, joined by rid', { timeout: 20000 }, async () => {
     await withProxy({}, async (t) => {
-      const r = await t.send('127.0.0.1', up.bound.port, '/ok', { headers: auth(t.ph) });
+      const r = await t.sendTls('127.0.0.1', up.tlsBound.port, '/ok', { headers: auth(t.ph) });
       assert.equal(r.status, 200);
-      assert.equal(up.bound.seen.length, 1);
-      assert.equal(up.bound.seen[0].headers.authorization, `Bearer ${REAL}`);
+      assert.equal(up.tlsBound.seen.length, 1);
+      assert.equal(up.tlsBound.seen[0].headers.authorization, `Bearer ${REAL}`);
       const { secretLines, lines } = await t.end();
       assert.equal(secretLines.length, 1);
       assert.deepEqual({ ...secretLines[0], rid: undefined }, { agent: 'tcp', rid: undefined, name: 'STRIPE_API_KEY', host: '127.0.0.1', swapped: true });
@@ -204,12 +204,12 @@ describe('allowed to the bound host: the real value goes in', () => {
     });
   });
 
-  it('x-api-key and Basic base64(<ph>:) arrive swapped too', { timeout: 20000 }, async () => {
+  it('x-api-key and Basic base64(<ph>:) arrive swapped too, over TLS', { timeout: 20000 }, async () => {
     await withProxy({}, async (t) => {
-      await t.send('127.0.0.1', up.bound.port, '/k', { headers: { 'x-api-key': t.ph } });
-      await t.send('127.0.0.1', up.bound.port, '/b', { headers: { authorization: `Basic ${Buffer.from(`${t.ph}:`).toString('base64')}` } });
-      assert.equal(up.bound.seen[0].headers['x-api-key'], REAL);
-      assert.equal(Buffer.from(up.bound.seen[1].headers.authorization.slice(6), 'base64').toString(), `${REAL}:`);
+      await t.sendTls('127.0.0.1', up.tlsBound.port, '/k', { headers: { 'x-api-key': t.ph } });
+      await t.sendTls('127.0.0.1', up.tlsBound.port, '/b', { headers: { authorization: `Basic ${Buffer.from(`${t.ph}:`).toString('base64')}` } });
+      assert.equal(up.tlsBound.seen[0].headers['x-api-key'], REAL);
+      assert.equal(Buffer.from(up.tlsBound.seen[1].headers.authorization.slice(6), 'base64').toString(), `${REAL}:`);
       await assertNoLeak(t);
     });
   });
@@ -226,30 +226,30 @@ describe('allowed to the bound host: the real value goes in', () => {
     });
   });
 
-  it('a proxy with no gate swaps too', { timeout: 20000 }, async () => {
+  it('a proxy with no gate swaps too, over TLS', { timeout: 20000 }, async () => {
     await withProxy({ gated: false }, async (t) => {
-      const r = await t.send('127.0.0.1', up.bound.port, '/nogate', { headers: auth(t.ph) });
+      const r = await t.sendTls('127.0.0.1', up.tlsBound.port, '/nogate', { headers: auth(t.ph) });
       assert.equal(r.status, 200);
-      assert.equal(up.bound.seen[0].headers.authorization, `Bearer ${REAL}`);
+      assert.equal(up.tlsBound.seen[0].headers.authorization, `Bearer ${REAL}`);
       const { secretLines } = await t.end();
       assert.deepEqual(secretLines.map((l) => l.swapped), [true]);
       await assertNoLeak(t);
     });
   });
 
-  it('held, then approved: arrives with the real value; the ask and the held request never show it', { timeout: 20000 }, async () => {
+  it('held, then approved, over TLS: arrives with the real value; the ask and the held request never show it', { timeout: 20000 }, async () => {
     await withProxy({}, async (t) => {
-      const sent = t.send('127.0.0.1', up.bound.port, '/held', { method: 'POST', body: 'm=1', headers: auth(t.ph) });
+      const sent = t.sendTls('127.0.0.1', up.tlsBound.port, '/held', { method: 'POST', body: 'm=1', headers: auth(t.ph) });
       const [h] = await t.parked();
       assert.equal(h.rule, 'rwx.ask');
-      assert.equal(up.bound.seen.length, 0, 'nothing upstream while parked');
+      assert.equal(up.tlsBound.seen.length, 0, 'nothing upstream while parked');
       assert.ok(!hasReal(t.askText(h.id)) && !hasReal(JSON.stringify(t.proxy.pending())), 'the real value is in the ask');
       t.answer(h.id, { decision: 'allow' });
       const r = await sent;
       assert.equal(r.status, 200);
-      assert.equal(up.bound.seen.length, 1);
-      assert.equal(up.bound.seen[0].headers.authorization, `Bearer ${REAL}`);
-      assert.equal(up.bound.seen[0].body, 'm=1');
+      assert.equal(up.tlsBound.seen.length, 1);
+      assert.equal(up.tlsBound.seen[0].headers.authorization, `Bearer ${REAL}`);
+      assert.equal(up.tlsBound.seen[0].body, 'm=1');
       await assertNoLeak(t);
     });
   });
@@ -264,6 +264,40 @@ describe('allowed to the bound host: the real value goes in', () => {
       assert.equal(up.tlsBound.seen[0].headers.authorization, `Bearer ${REAL}`);
       await assertNoLeak(t);
     });
+  });
+});
+
+describe('the bound host over plain http: 403 denied: secret.scheme, nothing sent', () => {
+  for (const mode of ['ask', 'auto', 'trust']) {
+    it(`${mode}: a placeholder to the bound host over http is refused before the gate`, { timeout: 20000 }, async () => {
+      await withProxy({ mode }, async (t) => {
+        const r = await t.send('127.0.0.1', up.bound.port, '/cleartext', { headers: auth(t.ph) });
+        assert.equal(r.status, 403);
+        assert.equal(r.body.trim(), 'denied: secret.scheme');
+        assert.equal(up.bound.seen.length, 0, 'the upstream saw a request');
+        assert.equal(t.proxy.pending().length, 0, 'never asks');
+        const { secretLines } = await t.end();
+        assert.deepEqual(secretLines.map((l) => [l.name, l.host, l.swapped]), [['STRIPE_API_KEY', '127.0.0.1', false]]);
+        assert.match(secretLines[0].rid, /^r\d+$/);
+        assert.deepEqual(secretLines.filter((l) => l.swapped), [], 'a swapped:true line');
+        await assertNoLeak(t);
+      });
+    });
+  }
+
+  it('a POST with a body is refused at once and a proxy with no gate refuses it too', { timeout: 20000 }, async () => {
+    for (const gated of [true, false]) {
+      await withProxy({ gated }, async (t) => {
+        const t0 = Date.now();
+        const r = await t.send('127.0.0.1', up.bound.port, '/cleartext', { method: 'POST', body: 'x'.repeat(5000), headers: auth(t.ph) });
+        assert.equal(r.status, 403);
+        assert.equal(r.body.trim(), 'denied: secret.scheme');
+        assert.ok(Date.now() - t0 < 3000, 'must be refused at once');
+        assert.equal(t.proxy.pending().length, 0);
+        assert.equal(up.bound.seen.length, 0);
+        await assertNoLeak(t);
+      });
+    }
   });
 });
 
@@ -319,26 +353,26 @@ describe('an unbound host: 403 denied: secret.host, nothing sent', () => {
 });
 
 describe('denied by the gate: only the placeholder ever existed, nothing sent, no swapped line', () => {
-  it('rwx.unlisted (OPTIONS) to the bound host', { timeout: 20000 }, async () => {
+  it('rwx.unlisted (OPTIONS) to the bound host, over TLS', { timeout: 20000 }, async () => {
     await withProxy({}, async (t) => {
-      const r = await t.send('127.0.0.1', up.bound.port, '/d', { method: 'OPTIONS', headers: auth(t.ph) });
+      const r = await t.sendTls('127.0.0.1', up.tlsBound.port, '/d', { method: 'OPTIONS', headers: auth(t.ph) });
       assert.equal(r.status, 403);
       assert.match(r.body, /rwx\.unlisted/);
-      assert.equal(up.bound.seen.length, 0);
+      assert.equal(up.tlsBound.seen.length, 0);
       const { secretLines } = await t.end();
       assert.deepEqual(secretLines.filter((l) => l.swapped), [], 'a swapped:true line for a denied request');
       await assertNoLeak(t);
     });
   });
 
-  it('an ask answered deny', { timeout: 20000 }, async () => {
+  it('an ask answered deny, over TLS', { timeout: 20000 }, async () => {
     await withProxy({}, async (t) => {
-      const sent = t.send('127.0.0.1', up.bound.port, '/d2', { method: 'POST', body: 'm=3', headers: auth(t.ph) });
+      const sent = t.sendTls('127.0.0.1', up.tlsBound.port, '/d2', { method: 'POST', body: 'm=3', headers: auth(t.ph) });
       const [h] = await t.parked();
       t.answer(h.id, { decision: 'deny', reason: 'no' });
       const r = await sent;
       assert.equal(r.status, 403);
-      assert.equal(up.bound.seen.length, 0);
+      assert.equal(up.tlsBound.seen.length, 0);
       const { secretLines } = await t.end();
       assert.deepEqual(secretLines.filter((l) => l.swapped), [], 'a swapped:true line for a denied request');
       await assertNoLeak(t);

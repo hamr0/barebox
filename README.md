@@ -88,7 +88,7 @@ Put the key in `~/.config/barebox/config.json`, bound to its hosts:
 }
 ```
 
-Inside the sandbox `$STRIPE_API_KEY` is a random placeholder, new each run. The agent sends it as it would the key (`curl -H "Authorization: Bearer $STRIPE_API_KEY"`, `curl -u "$STRIPE_API_KEY:"`). The proxy swaps the real value into the request headers only after the request is allowed, and only for `api.stripe.com`. A denied request never leaves. The same placeholder sent to any other host is refused: `403 denied: secret.host`. The rest of your environment stays out too, except a short default list (`TERM`, `LANG`, `LC_*`, `TZ`, ...) and the names in `env.pass`; `env.pass` refuses names like `*_TOKEN` and `*_KEY` (use `secrets`). Headers only. Details: `barebox.context.md`.
+Inside the sandbox `$STRIPE_API_KEY` is a random placeholder, new each run. The agent sends it as it would the key (`curl -H "Authorization: Bearer $STRIPE_API_KEY"`, `curl -u "$STRIPE_API_KEY:"`). The proxy swaps the real value into the request headers only after the request is allowed, and only for `api.stripe.com`. A denied request never leaves. The same placeholder sent to any other host is refused: `403 denied: secret.host`. A real value is swapped only into a request that goes upstream over TLS: a placeholder to a bound host over plain `http://` is refused `403 denied: secret.scheme`. The rest of your environment stays out too, except a short default list (`TERM`, `LANG`, `LC_*`, `TZ`, ...) and the names in `env.pass`; `env.pass` refuses names like `*_TOKEN` and `*_KEY` (use `secrets`). Headers only. Details: `barebox.context.md`.
 
 ## Numbers
 

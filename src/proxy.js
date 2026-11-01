@@ -677,6 +677,14 @@ export function createProxy(opts) {
       denyRes(cres, 403, 'denied: secret.host');
       return;
     }
+    // A real value only ever goes upstream over TLS: forwardInner picks
+    // https from this same `url.protocol`, so a cleartext hop is refused here.
+    if (found.length && url.protocol !== 'https:') {
+      for (const f of found) log({ ev: 'secret', agent, rid, name: f.name, host: url.hostname, swapped: false });
+      try { creq.resume(); } catch {}
+      denyRes(cres, 403, 'denied: secret.scheme');
+      return;
+    }
     /** The headers to forward: the real values in, one audit line per swap. @param {Record<string, string | string[] | undefined>} headers */
     const withSecrets = (headers) => {
       if (!found.length) return headers;
