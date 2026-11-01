@@ -145,7 +145,8 @@ returning a bareguard `Gate` or any object with `async check(action)` that
 resolves `{ outcome: "allow" | "deny" | "askHuman", rule?, reason? }`;
 `askHuman` from a plain object goes to the same queue. Without `gateFor`
 nothing is checked and everything forwards. `policy.js` exports `MODES` and
-`gateFor({ agent, mode, auditPath, humanChannel })`. bareguard writes its
+`gateFor({ agent, mode, auditPath, humanChannel })`; the mode is the whole policy, so
+`BAREGUARD_RWX_LETTERS` and `BAREGUARD_BUDGET_FILE` in the calling shell do not change it. bareguard writes its
 decisions to `<runtime>/gate.jsonl`, the one audit file (see "The audit file"
 below). `close()` waits up to 3 s for requests
 still inside a `check()`.
