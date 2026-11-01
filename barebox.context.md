@@ -5,7 +5,7 @@ nothing leaves the machine without passing the doorman.
 
 ## Install
 
-Requires Node >= 22.19 and Linux with unprivileged user namespaces (bwrap)
+Requires Node >= 22.21 and Linux with unprivileged user namespaces (bwrap)
 for sandboxes; the proxy and CLI run anywhere Node runs.
 
 ```bash
