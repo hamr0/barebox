@@ -1,7 +1,7 @@
 // Secrets (M5): detect and apply, pure. No sandbox, no proxy.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadSecrets, findPlaceholders, applySecrets } from '../src/secrets.js';
+import { loadSecrets, findPlaceholders, urlPlaceholders, applySecrets } from '../src/secrets.js';
 
 const REAL_A = 'sk_test_REAL_aaaaaaaaaaaaaaaa';
 const REAL_B = 'ghp_REAL_bbbbbbbbbbbbbbbb';
@@ -94,5 +94,14 @@ describe('findPlaceholders and applySecrets', () => {
     const s = loadSecrets({ U: { value: 'ключ-é', hosts: ['x.test'] } });
     const out = applySecrets({ authorization: `Basic ${b64(`${s[0].placeholder}:`)}` }, 'x.test', s);
     assert.equal(Buffer.from(out.authorization.slice(6), 'base64').toString('utf8'), 'ключ-é:');
+  });
+});
+
+describe('urlPlaceholders', () => {
+  it('finds a placeholder in the query, in the path, and none', () => {
+    assert.deepEqual(urlPlaceholders(`/api?key=${A.placeholder}`, secrets), ['STRIPE_API_KEY']);
+    assert.deepEqual(urlPlaceholders(`/v1/${B.placeholder}/x?a=1`, secrets), ['GITHUB_TOKEN']);
+    assert.deepEqual(urlPlaceholders(`/${A.placeholder}?k=${B.placeholder}`, secrets), ['STRIPE_API_KEY', 'GITHUB_TOKEN']);
+    assert.deepEqual(urlPlaceholders('/api?key=sbx-ph-0000000000000000', secrets), []);
   });
 });

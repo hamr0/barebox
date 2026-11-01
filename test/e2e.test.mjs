@@ -9,6 +9,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import http from 'node:http';
 import net from 'node:net';
 import { launch } from '../src/launcher.js';
 import { createProxy } from '../src/proxy.js';
@@ -108,6 +109,21 @@ describe(`end-to-end (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}` : 
     assert.equal(r.code, 0, r.err);
     assert.equal(r.out.trim(), 'local-ok');
     await waitFor(() => /nodefetch/.test(log()), 'log line for the node fetch');
+  });
+
+  it("node's fetch of a plain http:// URL inside works (a CONNECT tunnel carrying clear HTTP)", async () => {
+    const plain = http.createServer((q, res) => res.end('plain-ok'));
+    await new Promise((r) => plain.listen(0, '127.0.0.1', r));
+    try {
+      const c = launch({ runtime: rt, agent: 'e2e', proj, socket: sock,
+        caFile: proxy.caFile,
+        command: ['node', '-e',
+          `fetch('http://127.0.0.1:${plain.address().port}/?m=nodeplain').then((r) => r.text()).then((t) => console.log(t), (e) => { console.error(String(e.cause || e)); process.exit(1); })`] });
+      const r = await run(c);
+      assert.equal(r.code, 0, r.err);
+      assert.equal(r.out.trim(), 'plain-ok');
+      await waitFor(() => /nodeplain/.test(log()), 'log line for the plain node fetch');
+    } finally { plain.closeAllConnections?.(); await new Promise((r) => plain.close(r)); }
   });
 
   it('agent curls the fixture through the proxy, logged under its name', async () => {

@@ -67,6 +67,14 @@ function swapIn(v, s) {
 }
 
 /**
+ * Which secrets' placeholders sit in a request URL (path and query). Keys are swapped in headers only.
+ * @param {string} pathAndQuery @param {Secret[]} secrets @returns {string[]} the secrets' names
+ */
+export function urlPlaceholders(pathAndQuery, secrets) {
+  return secrets.filter((s) => pathAndQuery.includes(s.placeholder)).map((s) => s.name);
+}
+
+/**
  * Which placeholders a request carries, and whether each is headed for a host its secret is bound to.
  * Each header value is searched as a substring and, for `Basic <base64>`, decoded.
  *

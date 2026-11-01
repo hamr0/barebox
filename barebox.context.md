@@ -195,7 +195,9 @@ values in `env.set`, and one placeholder per secret. Nothing else reaches it,
 - A real value is swapped only into a request that goes upstream over TLS. A
   placeholder to a bound host over plain http is refused in every mode, before
   the gate: `403 denied: secret.scheme`. Nothing goes upstream.
-- Headers only. A key in a body, URL or query string is not swapped.
+- Headers only. A key in a body is not swapped. A placeholder in the URL (path
+  or query string) is refused in every mode, before the gate: `403 denied:
+  secret.url`. Nothing goes upstream.
 - Audit: one `annotate` line per hit, `verdict: "secret"`,
   `meta: { agent, rid, name, host, swapped }`, joined to the gate line by
   `rid`. The value is never written to the audit, an ask file or an error body.

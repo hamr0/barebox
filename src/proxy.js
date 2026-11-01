@@ -23,7 +23,7 @@ import { ASK_BODY_LIMIT, DEFAULT_HOLD_MAX_BODY, bodyPreview, createHolds } from 
 import { claimRuntime, ensurePrivateDir, runtimePaths } from './runtime.js';
 import { paymentPath, toolFor, buildTools, emptyMatcher } from './policy.js';
 import { checkUpstream } from './wall.js';
-import { findPlaceholders, applySecrets } from './secrets.js';
+import { findPlaceholders, urlPlaceholders, applySecrets } from './secrets.js';
 import { Gate } from 'bareguard';
 
 const AGENT = Symbol('agent');
@@ -685,6 +685,15 @@ export function createProxy(opts) {
       denyRes(cres, 403, 'denied: secret.scheme');
       return;
     }
+    // Keys are swapped in headers only: a placeholder in the URL is refused,
+    // not sent as a literal that the API would answer 401 for no visible reason.
+    const inUrl = secrets.length ? urlPlaceholders(url.pathname + url.search, secrets) : [];
+    if (inUrl.length) {
+      for (const name of inUrl) log({ ev: 'secret', agent, rid, name, host: url.hostname, swapped: false });
+      try { creq.resume(); } catch {}
+      denyRes(cres, 403, 'denied: secret.url');
+      return;
+    }
     /** The headers to forward: the real values in, one audit line per swap. @param {Record<string, string | string[] | undefined>} headers */
     const withSecrets = (headers) => {
       if (!found.length) return headers;
@@ -934,7 +943,27 @@ export function createProxy(opts) {
     if (closed || sock.destroyed) return;
     try { sock.write('HTTP/1.1 200 Connection established\r\n\r\n'); }
     catch { return; }
-    if (rest.length) sock.unshift(rest);
+    // One reader of the first byte: 0x16 is a TLS handshake (decrypt it);
+    // anything else is plain HTTP inside the tunnel (Node's fetch tunnels
+    // http:// URLs too) and goes to the server as it is, as `admit` does.
+    let first = rest;
+    if (!first.length) {
+      sock.setTimeout(clientIdleMs, () => sock.destroy());
+      first = await new Promise((resolve) => {
+        const done = (c) => { sock.off('data', done); sock.off('close', gone); sock.pause(); resolve(c); };
+        const gone = () => done(Buffer.alloc(0));
+        sock.on('data', done);
+        sock.on('close', gone);
+      });
+      sock.setTimeout(0);
+      if (!first.length || closed || sock.destroyed) return;
+    }
+    sock.unshift(first);
+    if (first[0] !== 0x16) {
+      sock.resume(); // paused above; the http server only adds a data listener
+      server.emit('connection', sock);
+      return;
+    }
     const st = new tls.TLSSocket(sock, { isServer: true, key: creds.key, cert: creds.cert });
     st[AGENT] = agent;
     st[SECURE] = true;

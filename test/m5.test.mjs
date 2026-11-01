@@ -149,6 +149,23 @@ async function withProxy({ mode = 'auto', gated = true }, fn) {
           headers: { host: `${host}:${port2}`, ...headers } }, body);
       } finally { ts.destroy(); }
     },
+    /** A clear-text request inside a CONNECT tunnel (what Node's fetch sends for http://). */
+    async sendPlainTunnel(host, port2, path, { method = 'GET', headers = {}, body } = {}) {
+      const sock = net.connect(port, '127.0.0.1');
+      await once(sock, 'connect');
+      sock.write(`CONNECT ${host}:${port2} HTTP/1.1\r\nHost: ${host}:${port2}\r\n\r\n`);
+      let head = '';
+      await new Promise((resolve, reject) => {
+        const onData = (c) => { head += c.toString('latin1'); if (head.includes('\r\n\r\n')) { sock.off('data', onData); resolve(); } };
+        sock.on('data', onData);
+        sock.on('error', reject);
+      });
+      assert.match(head, /200 Connection established/);
+      try {
+        return await request({ host, port: port2, method, path, createConnection: () => sock,
+          headers: { host: `${host}:${port2}`, ...headers } }, body);
+      } finally { sock.destroy(); }
+    },
     parked: (n = 1) => waitFor(() => (proxy.pending().length >= n ? proxy.pending() : null), `${n} hold(s) to park`),
     askText: (id) => readFileSync(paths.askFile(id), 'utf8'),
     answer(id, obj) {
@@ -401,4 +418,47 @@ describe('a request without a placeholder is untouched', () => {
       assert.deepEqual((await t.end()).secretLines, []);
     });
   });
+});
+
+describe('plain http inside a CONNECT tunnel (what Node fetch sends for http://)', () => {
+  it('is forwarded in clear: the upstream answers and saw the path', { timeout: 20000 }, async () => {
+    await withProxy({}, async (t) => {
+      const r = await t.sendPlainTunnel('127.0.0.1', up.bound.port, '/x');
+      assert.equal(r.status, 200);
+      assert.equal(r.body, 'upstream-ok');
+      assert.deepEqual(up.bound.seen.map((q) => q.url), ['/x']);
+    });
+  });
+
+  it('a placeholder inside it is refused 403 denied: secret.scheme, nothing sent', { timeout: 20000 }, async () => {
+    await withProxy({}, async (t) => {
+      const r = await t.sendPlainTunnel('127.0.0.1', up.bound.port, '/x', { headers: auth(t.ph) });
+      assert.equal(r.status, 403);
+      assert.equal(r.body.trim(), 'denied: secret.scheme');
+      assert.equal(up.bound.seen.length, 0, 'the upstream saw a request');
+      const { secretLines } = await t.end();
+      assert.deepEqual(secretLines.map((l) => [l.name, l.host, l.swapped]), [['STRIPE_API_KEY', '127.0.0.1', false]]);
+      await assertNoLeak(t);
+    });
+  });
+});
+
+describe('a placeholder in the URL: 403 denied: secret.url, nothing sent', () => {
+  for (const [what, path] of [['query', '/api?key=PH'], ['path', '/v1/PH/charges']]) {
+    for (const mode of ['ask', 'auto', 'trust']) {
+      it(`${what}, ${mode}, over TLS to the bound host`, { timeout: 20000 }, async () => {
+        await withProxy({ mode }, async (t) => {
+          const r = await t.sendTls('127.0.0.1', up.tlsBound.port, path.replace('PH', t.ph));
+          assert.equal(r.status, 403);
+          assert.equal(r.body.trim(), 'denied: secret.url');
+          assert.equal(up.tlsBound.seen.length, 0, 'the upstream saw a request');
+          assert.equal(t.proxy.pending().length, 0, 'never asks');
+          const { secretLines } = await t.end();
+          assert.deepEqual(secretLines.map((l) => [l.name, l.host, l.swapped]), [['STRIPE_API_KEY', '127.0.0.1', false]]);
+          assert.match(secretLines[0].rid, /^r\d+$/);
+          await assertNoLeak(t);
+        });
+      });
+    }
+  }
 });
