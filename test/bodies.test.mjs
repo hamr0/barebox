@@ -13,6 +13,7 @@ import { once } from 'node:events';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import net from 'node:net';
+import fs from 'node:fs';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -305,6 +306,29 @@ describe('held bodies live on disk', () => {
       assert.equal(t.proxy.pending().length, 0);
       assert.equal(up.hits.get('/hold') ?? 0, before);
     });
+  });
+
+  it('over the cap with a write error after the deny settled: still 403, never 500', { timeout: 30000 }, async () => {
+    // A write in flight at destroy emits ERR_STREAM_DESTROYED after the deny settled; simulate it
+    // deterministically by emitting that error right after destroy.
+    const orig = fs.createWriteStream;
+    fs.createWriteStream = (...a) => {
+      const w = orig(...a);
+      const d = w.destroy.bind(w);
+      w.destroy = (...x) => {
+        const r = d(...x);
+        queueMicrotask(() => w.emit('error', Object.assign(new Error('write after destroy'), { code: 'ERR_STREAM_DESTROYED' })));
+        return r;
+      };
+      return w;
+    };
+    try {
+      await withProxy({ maxBody: 1000 }, async (t) => {
+        const r = await t.send('hold', filler(5000, 12)).done;
+        assert.equal(r.status, 403);
+        assert.match(r.body.toString(), /body too large to hold/);
+      });
+    } finally { fs.createWriteStream = orig; }
   });
 
   it('chunked (no content-length): forwarded on approve with exact bytes', { timeout: 30000 }, async () => {

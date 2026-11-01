@@ -538,6 +538,7 @@ export function createProxy(opts) {
       };
       /** @param {string} reason @param {number} [status] */
       const refuse = (reason, status) => {
+        if (settled) return; // a late failure must not rewrite the settled deny's status
         if (status) ctx.status = status;
         finish({ decision: 'deny', reason });
       };
