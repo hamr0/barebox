@@ -30,7 +30,7 @@
   ],
   "primitives": "./primitives.json",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19"
   },
   "scripts": {
     "poc:m0": "bash poc/m0/run-m0.sh",

@@ -15,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - The host environment no longer reaches the sandbox. The inside gets barebox's own variables (`HOME`, `PATH`, the proxy and CA variables), `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `EDITOR`, `PAGER`, the config `env.pass` names, `env.set`, one placeholder per secret, and `extraEnv`. A caller that relied on an inherited variable lists it in `env.pass` (or passes `launch({ env })` / `extraEnv`). `launch()` still looks `bwrap` up on your `PATH` but starts it with `PATH=/usr/bin:/bin`.
+- Requires Node.js >= 22.19 (was >= 22): the test suite uses `tls.setDefaultCACertificates`, added in v22.19.0.
 
 ### Fixed
 
