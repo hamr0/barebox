@@ -275,7 +275,7 @@ Model endpoints are `r` (free in every mode): `api.anthropic.com`
 `POST /v1/messages` and `/v1/messages/count_tokens`; `api.openai.com`
 `POST /v1/chat/completions`, `/v1/responses` and `/v1/embeddings`; and on each
 `localLlm` host:port `POST /api/chat`, `/api/generate`, `/api/embed`,
-`/v1/chat/completions` and `/v1/completions` (http only). Any other path on
+`/v1/chat/completions` and `/v1/completions` (over http or https). Any other path on
 those hosts is a normal `POST`.
 
 Label folders are hidden inside the sandbox like the config file, so the agent
