@@ -127,14 +127,15 @@ describe(`end-to-end (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}` : 
   });
 
   it('agent curls the fixture through the proxy, logged under its name', async () => {
+    const from = log().length;
     const c = launch({ runtime: rt, agent: 'e2e', proj, socket: sock,
       caFile: proxy.caFile,
       command: ['bash', '-c', `curl -s --max-time 10 'https://127.0.0.1:${tlsUp.port}/?m=e2e'`] });
     const r = await run(c);
     assert.equal(r.code, 0, r.err);
     assert.equal(r.out, 'local-ok');
-    await waitFor(() => /"agent":"e2e"/.test(log()), 'log line naming agent e2e');
-    assert.match(log(), /m=e2e/);
+    const line = await waitFor(() => log().slice(from).split('\n').find((l) => /m=e2e/.test(l)), 'log line for the m=e2e request');
+    assert.match(line, /"agent":"e2e"/);
   });
 
   it('held POST waits for `sbx approve`, then 200', async () => {
