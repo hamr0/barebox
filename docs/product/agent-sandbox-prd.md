@@ -586,7 +586,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Swap | Every request header value is searched for each placeholder (substring, so `Bearer <ph>` works). Gate allows and the host is bound: replace with the real value. Denied: the placeholder never leaves (the request does not go upstream). Unbound host: `403 secret.host`. Never in the audit, the ask file or an error body. |
 | Audit | `annotate` lines in `gate.jsonl`, `verdict: "secret"`, `meta: { agent, rid, name, host, swapped }`. |
 | Out of scope to Nov 4 | Swaps in bodies, URLs or query strings; OAuth, refresh tokens and the agent's own sign-in (`~/.claude` stays readable, a known gap); macOS; a web UI; per-agent keys. |
-| Open | Whether `run()` / `createProxy()` take `secrets` directly (library callers) or only the CLI reads them; decided in the build brief. |
+| Open | None. `run()` and `createProxy()` take `secrets` directly; the CLI reads them from the config file (decided after the POC). |
 
 **M5 POC result (Oct 31): GO.** Checks A–G pass in a real shell, each shown red by its mutation (details in `docs/logs/findings.md`, "M5 — POC"). Build decisions (user, Oct 31, all recommendations accepted):
 
@@ -595,6 +595,8 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 - The launcher spawns bwrap with a clean environment (`env: { PATH: '/usr/bin:/bin' }`) and sets everything with `--setenv`. No `--clearenv`: proven redundant, and bwrap's own `/proc/1/environ` is what the clean spawn fixes.
 - Tests cover check C with a small fixture `$HOME` searched from inside; the full-filesystem search stays a manual POC script (`poc/m5`, 7 minutes).
 - The 0.6.0 ledger brief (`docs/logs/ledger-060-brief.md`) is built first, in separate commits on `m5`, then the M5 build (`docs/logs/m5-build-brief.md`).
+
+**M5 built (Nov 1, branch `m5`; not yet released).** `src/secrets.js` (`loadSecrets`, `findPlaceholders`, `applySecrets`), config keys `env` and `secrets`, `launch({ env })`, `createProxy({ secrets })`, and `run({ secrets, env })`; `sbx run` passes the config through. Detect runs before the gate, apply only after `allow` (and on the no-gate path), so the real value is never in a held request's headers. 41 new tests (secrets 11, config 6, launcher 5, proxy 16 in `test/m5.test.mjs`, run/CLI 3); the suite is 485 of 485, 0 fail 0 skip, three runs in a real shell. Build decisions: the launcher looks `bwrap` up on the caller's `PATH` but starts it with `PATH=/usr/bin:/bin` (so the fake `bwrap` the launcher tests put first on `PATH` still works); `NODE_USE_ENV_PROXY` is not set inside (it was only ever inherited). Known gaps: `~/.claude` stays readable; an upstream that echoes a request header hands the real value back to the agent. Check C (the 7-minute full-filesystem search) and the real Stripe/httpbin smoke are run by the orchestrator.
 
 ### M6. Scale run
 

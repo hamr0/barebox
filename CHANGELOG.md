@@ -8,7 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Keys the agent never holds. Config keys `secrets` (`NAME` -> `{ fromEnv` or `value, hosts }`) and `env` (`{ pass, set }`); `run()` takes `secrets` and `env`, `createProxy()` takes `secrets` (the list `loadSecrets` in the new `src/secrets.js` builds), `launch()` takes `env: { pass, set, placeholders }`. The sandbox gets a random placeholder per secret, new each run, under the secret's name. The proxy swaps the real value into request headers (a substring, also inside a decoded `Basic <base64>`) only after the gate allowed the request and only for the secret's hosts. A placeholder headed for any other host is refused `403 denied: secret.host` in every mode. Each hit is a `secret` annotate line in `gate.jsonl` (`meta: { agent, rid, name, host, swapped }`); the value is never in the audit, an ask or an error body. `env.pass` refuses names matching `KEY|TOKEN|SECRET|PASSWORD` (any case); a `fromEnv` variable that is unset exits 2 naming the secret. Headers only; the agent's own sign-in in `~/.claude` stays readable.
 - `loadLabels` is exported from `barebox`: an embedder builds the `labels` value `run()` and `createProxy()` take (`{ matcher, tools, dirs }`) without the `sbx` CLI.
+
+### Changed
+
+- The host environment no longer reaches the sandbox. The inside gets barebox's own variables (`HOME`, `PATH`, the proxy and CA variables), `TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `EDITOR`, `PAGER`, the config `env.pass` names, `env.set`, one placeholder per secret, and `extraEnv`. A caller that relied on an inherited variable lists it in `env.pass` (or passes `launch({ env })` / `extraEnv`). `launch()` still looks `bwrap` up on your `PATH` but starts it with `PATH=/usr/bin:/bin`.
 
 ### Fixed
 
@@ -16,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- The host environment no longer reaches the sandbox: before, every host variable (an exported API key, `SBX_RUNTIME`) was readable inside, in `env` and in `/proc/*/environ`. `bwrap` is started with a clean environment, so `/proc/1/environ` inside is clean too.
 - The mode no longer changes with `BAREGUARD_RWX_LETTERS` or `BAREGUARD_BUDGET_FILE` in the host environment: the gate gets its letters explicitly and no shared budget file, so a user shell or parent process that exports them cannot widen, break or budget-deny a run.
 
 ## [0.5.0] - 2026-10-30

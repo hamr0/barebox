@@ -108,7 +108,7 @@ agent's.
 (positive integer) and `localLlm` (array of `"host:port"`). A flag beats the file, the file beats the default; an
 unknown key, bad value or bad JSON exits 2 naming the file and key. The file
 is hidden inside the sandbox wherever it resolves. The library does not read it.
-Two more keys, `labels` and `tenants`, are described under "Labels and model endpoints".
+Two more keys, `labels` and `tenants`, are described under "Labels and model endpoints". Two more, `env` and `secrets`, are described under "Keys the agent never holds".
 
 ## Modes and the gate
 
@@ -154,6 +154,69 @@ still inside a `check()`.
 array of `"host:port"` strings. Only those exact pairs pass the wall's
 private/loopback check, never link-local (cloud metadata).
 
+## Keys the agent never holds
+
+The sandbox does not get your environment. The agent sees only barebox's own
+variables (`HOME`, `PATH`, the proxy and CA variables), a short default list
+(`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`,
+`SHELL`, `EDITOR`, `PAGER`), the host variables you name in `env.pass`, the
+values in `env.set`, and one placeholder per secret. Nothing else reaches it,
+`/proc/1/environ` included.
+
+```json
+{
+  "env": { "pass": ["MY_TOOL_HOME"], "set": { "FOO": "bar" } },
+  "secrets": {
+    "STRIPE_API_KEY": { "fromEnv": "REAL_STRIPE_KEY", "hosts": ["api.stripe.com"] },
+    "JIRA_TOKEN": { "value": "...", "hosts": ["acme.atlassian.net"] }
+  }
+}
+```
+
+- `env.pass` refuses a name with `KEY`, `TOKEN`, `SECRET` or `PASSWORD` in it
+  (any case): `env.pass: "GITHUB_TOKEN" looks like a secret; use "secrets" for
+  it`. There is no override; `env.set` covers a harmless match.
+- A secret has exactly one of `fromEnv` (a host variable; missing at startup
+  exits 2 naming the secret) or `value` (inline; the config file is hidden
+  inside the sandbox), and a non-empty `hosts` list of hostnames (no scheme,
+  no port).
+- The agent sees a random placeholder, `sbx-ph-<16 hex>`, under the secret's
+  name, new on every run. It uses it as it would the key: `curl -H
+  "Authorization: Bearer $STRIPE_API_KEY"`, `-u "$STRIPE_API_KEY:"`, an
+  `x-api-key` header.
+- The proxy looks for each placeholder in every request header value (as a
+  substring, also inside a decoded `Basic <base64>`). It swaps in the real
+  value only after the gate allowed the request (by mode or by your approval)
+  and only for a host the secret is bound to. A denied request never carries
+  it: it does not leave at all.
+- A placeholder headed for a host its secret is not bound to is refused in
+  every mode: `403 denied: secret.host`. Nothing goes upstream.
+- Headers only. A key in a body, URL or query string is not swapped.
+- Audit: one `annotate` line per hit, `verdict: "secret"`,
+  `meta: { agent, rid, name, host, swapped }`, joined to the gate line by
+  `rid`. The value is never written to the audit, an ask file or an error body.
+- The same path covers plain requests, decrypted HTTPS (CONNECT) and the TCP
+  door.
+
+Library callers pass the same shapes to `run()` (no `loadSecrets` call; `run()`
+makes the placeholders once per run):
+
+```js no-run
+import { run } from "barebox";
+await run({
+  proj: "/path/to/project",
+  command: ["bash", "-c", 'curl -H "Authorization: Bearer $STRIPE_API_KEY" https://api.stripe.com/v1/balance'],
+  secrets: { STRIPE_API_KEY: { fromEnv: "REAL_STRIPE_KEY", hosts: ["api.stripe.com"] } },
+  env: { pass: ["MY_TOOL_HOME"], set: { FOO: "bar" } },
+});
+```
+
+`createProxy({ secrets })` takes the loaded list (`loadSecrets` in
+`src/secrets.js`, internal) and `launch({ env: { pass, set, placeholders } })`
+takes the environment. Known gaps: the agent's own sign-in in `~/.claude`
+stays readable; an upstream that echoes a request header back in its response
+hands the real value to the agent.
+
 ## The audit file
 
 `<runtime>/gate.jsonl` (`runtimePaths(runtime).audit`; `run()` returns it as
@@ -164,7 +227,7 @@ private/loopback check, never link-local (cloud metadata).
   `result.status`.
 - barebox's own facts: `phase:"annotate"`, `surface:false`, keyed by `verdict`:
   `deny`, `hold`, `decide`, `hold-abandoned`, `hold-queue-full`, `stale-answer`,
-  `malformed-answer`, `body`, and `resp` (forward-all mode, no gate). A hold and
+  `malformed-answer`, `body`, `secret`, and `resp` (forward-all mode, no gate). A hold and
   its outcome share `meta.id`; a request with a body gets one `body` line,
   `meta: { agent, rid, bodyBytes, bodySha256 }`, joined to its gate line by
   `action.rid`.
@@ -252,7 +315,7 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
 - The upstream wall answers `403` for loopback, link-local (incl. `169.254.169.254`), the host's own addresses, private LAN ranges and unresolvable names. An IPv4 embedded in IPv6 is checked in every spelling: mapped, compat, uncompressed, NAT64 `64:ff9b::/96` (local-use `/48` denied outright) and 6to4 `2002::/16`; NAT64 and 6to4 of public sites stay reachable. Every DNS answer is checked and the dial is pinned to the checked IP; test-only options live under `unsafeTestOnly` (`allowLoopback`, `resolveUpstream`) and production never sets them.
 - `createProxy` throws synchronously on an unopenable `logFile` (a directory, a missing parent, no permission) and releases the runtime. The runtime root, `asks/`, `answers/`, `held/` and `socks/` are owner-only (`0700`) whatever the umask. An existing runtime dir you own is tightened to `0700`; one you don't own (such as `/tmp`) is refused with an error naming the dir and its owner and suggesting a subdir like `/tmp/sbx`. The audit file (`logFile`, `gate.jsonl`) is set to `0600` every time a proxy starts. No request header and no body content is written to it: a body is logged as its length and SHA-256 only. The ask payload's `bodyPreview` (the first 4 KB, card numbers masked except the last 4) lives in the ask file only; other secrets inside a body still show there until bareguard redaction lands. Your `redact` hook shapes the `meta` of barebox's own annotate lines.
 - One proxy per runtime: `createProxy` throws "in use by pid N" (`run()` rejects, `sbx run` exits 1) while a live proxy owns the runtime. The claim is held by the proxy process and the kernel frees it when the process dies, so a crashed proxy never blocks the runtime. Use another `SBX_RUNTIME`, or leave it unset for a fresh one.
-- `launch()` starts the agent in the project dir, in a new session (no controlling terminal). Locked drawers are 21 credential stores (see `LOCKED_PATHS` in `src/launcher.js`); the agent's own model credentials in `~/.claude` stay readable until keys move out of its reach.
+- `launch()` starts the agent in the project dir, in a new session (no controlling terminal). Locked drawers are 21 credential stores (see `LOCKED_PATHS` in `src/launcher.js`); the agent's own model credentials in `~/.claude` stay readable (a known gap: its sign-in tokens refresh themselves, so `secrets` does not cover them). The host environment does not reach the inside: callers that relied on an inherited variable list it in `env.pass` (or pass `launch({ env })` / `extraEnv`). `launch()` finds `bwrap` on your `PATH` but starts it with a fixed `PATH`.
 - `sbx` exits 0 ok, 1 unknown id / refused / no live proxy / run failure, 2 usage; `sbx run` mirrors the agent's exit code.
 - Any listening unix socket under `$HOME` (IDE IPC, rootless-container sockets) is reachable from inside the sandbox: a read-only bind does not block `connect(2)`; the locked-paths list is the lever.
 
