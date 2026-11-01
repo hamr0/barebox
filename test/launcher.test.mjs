@@ -1,10 +1,11 @@
 // Launcher tests: validation pure, walls need bwrap (real shell/CI, not sandbox).
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
+import { execFileSync, execFile } from 'node:child_process';
+import { copyFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, delimiter } from 'node:path';
+import { join, dirname, delimiter } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { launch, buildCaBundle } from '../src/launcher.js';
 import { bwrapUsable } from './fixtures/probes.mjs';
@@ -269,6 +270,60 @@ describe('locked file masks (no sandbox needed)', () => {
     assert.equal(at('--dev-bind', '/dev/null', join(home, '.npmrc')), -1, 'symlink spelling is not bound');
     assert.ok(!args.includes(outside) && !args.includes(join(home, '.pypirc')), 'outside link masked');
     assert.ok(!args.includes(join(home, '.git-credentials')), 'dangling link masked');
+  });
+
+  async function argsFor(opts) {
+    rmSync(process.env.BB_ARGS_FILE, { force: true });
+    const child = launch(opts);
+    await new Promise((res, rej) => { child.on('error', rej); child.on('close', res); });
+    return readFileSync(process.env.BB_ARGS_FILE, 'utf8').split('\n').filter((l) => l !== '');
+  }
+  const pathOf = (args) => args[args.indexOf('PATH') + 1];
+
+  it('a Node prefix outside /usr, $HOME and the project is bound read-only, before the masks, and first on PATH', async () => {
+    const home = join(root, 'h3'); const proj = join(root, 'p3'); const rt = join(root, 'r3');
+    const pfx = join(root, 'toolcache', 'node-22');
+    mkdirSync(join(home, '.aws'), { recursive: true });
+    mkdirSync(join(pfx, 'bin'), { recursive: true });
+    mkdirSync(proj);
+    process.env.HOME = home;
+    const args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: join(pfx, 'bin', 'node') });
+    const bind = args.findIndex((a, i) => a === '--ro-bind' && args[i + 1] === pfx && args[i + 2] === pfx);
+    assert.ok(bind >= 0, `--ro-bind ${pfx} missing: ${args.join(' ')}`);
+    assert.ok(bind < args.indexOf(join(home, '.aws')), 'the node bind must land before the locked-drawer masks');
+    assert.equal(pathOf(args), `${pfx}/bin:/usr/bin:/bin:/usr/sbin`);
+  });
+
+  it('a node not in a bin/ dir binds only its own dir, and that dir is on PATH', async () => {
+    const home = join(root, 'h6'); const proj = join(root, 'p6'); const rt = join(root, 'r6');
+    const dist = join(root, 'node-dist');
+    mkdirSync(home); mkdirSync(proj); mkdirSync(dist);
+    process.env.HOME = home;
+    const args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: join(dist, 'node') });
+    assert.ok(args.some((a, i) => a === '--ro-bind' && args[i + 1] === dist && args[i + 2] === dist), `--ro-bind ${dist} missing: ${args.join(' ')}`);
+    assert.ok(!args.includes(root), 'the parent of the install must not be bound');
+    assert.equal(pathOf(args), `${dist}:/usr/bin:/bin:/usr/sbin`);
+  });
+
+  it('a Node prefix under /usr or $HOME gets no extra bind; only a bin outside the fixed PATH is added', async () => {
+    const home = join(root, 'h4'); const proj = join(root, 'p4'); const rt = join(root, 'r4');
+    const nvm = join(home, '.nvm', 'node-22');
+    mkdirSync(join(nvm, 'bin'), { recursive: true }); mkdirSync(proj);
+    process.env.HOME = home;
+    const binds = (args) => args.map((a, i) => (a === '--ro-bind' ? args[i + 1] : null)).filter(Boolean);
+    const base = [home, proj, '/etc', '/usr'].sort();
+    // /usr: bin is /usr/bin, already on PATH, so nothing changes.
+    let args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: '/usr/bin/node' });
+    assert.deepEqual(binds(args).sort(), base);
+    assert.equal(pathOf(args), '/usr/bin:/bin:/usr/sbin');
+    // /usr/local: visible through /usr, but its bin is new on PATH.
+    args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: '/usr/local/bin/node' });
+    assert.deepEqual(binds(args).sort(), base);
+    assert.equal(pathOf(args), '/usr/local/bin:/usr/bin:/bin:/usr/sbin');
+    // nvm under $HOME: visible through the home bind; bin first on PATH.
+    args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: join(nvm, 'bin', 'node') });
+    assert.deepEqual(binds(args).sort(), base);
+    assert.equal(pathOf(args), `${nvm}/bin:/usr/bin:/bin:/usr/sbin`);
   });
 });
 
@@ -861,5 +916,28 @@ describe('M0 bypass set: no way out but the front door (needs bwrap)', { skip: N
     const c = launch({ runtime: rt, agent: 'b3', proj,
       command: ['bash', '-c', '! echo > /dev/tcp/192.0.2.1/9 2>/dev/null'] });
     assert.equal((await run(c)).code, 0);
+  });
+});
+
+describe('the host node runs inside (needs bwrap)', { skip: NEED_SANDBOX }, () => {
+  it('sbx run with a node copied outside /usr and $HOME: process.execPath inside is that copy', { timeout: 60000 }, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bb-nr-'));
+    try {
+      const bin = join(root, 'bin'); const proj = join(root, 'proj'); const home = join(root, 'home');
+      mkdirSync(bin); mkdirSync(proj); mkdirSync(home);
+      const copy = join(bin, 'node');
+      copyFileSync(process.execPath, copy);
+      chmodSync(copy, 0o755);
+      const cli = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.js');
+      const env = { PATH: process.env.PATH, HOME: home, SBX_RUNTIME: mkdtempSync(join(tmpdir(), 'bb-nrt-')) };
+      const r = await new Promise((resolve) => {
+        execFile(copy, [cli, 'run', '--', 'node', '-e', 'console.log(process.execPath)'],
+          { cwd: proj, encoding: 'utf8', timeout: 45000, env },
+          (error, stdout, stderr) => resolve({ code: error ? error.code : 0, stdout, stderr }));
+      });
+      rmSync(env.SBX_RUNTIME, { recursive: true, force: true });
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(r.stdout.split('\n')[0], copy, r.stdout + r.stderr); // line 1 is the agent's; the CLI adds "done exit 0"
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
