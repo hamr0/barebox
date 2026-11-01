@@ -126,7 +126,7 @@ M0–M2 are the go/no-go. Later: macOS (`sandbox-exec` + APFS clones), Windows v
 npm install barebox
 ```
 
-Requires Node.js >= 22.21. Two production dependencies, [bareguard](https://npmjs.com/package/bareguard) (the gate) and [rwxmap](https://npmjs.com/package/rwxmap) (the labels), pinned exactly. Needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap. CI builds bubblewrap 0.12.0 from a checksum-pinned source tarball, copies its Node into `/usr/bin` (the sandbox binds `/usr` only, so a Node installed elsewhere, such as under nvm, is not found inside), and fails if any test is skipped. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
+Requires Node.js >= 22.21. Two production dependencies, [bareguard](https://npmjs.com/package/bareguard) (the gate) and [rwxmap](https://npmjs.com/package/rwxmap) (the labels), pinned exactly. Needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap. CI builds bubblewrap 0.12.0 from a checksum-pinned source tarball (`scripts/ci-runner-deps.sh`) and fails if any test is skipped. A Node installed outside `/usr` and `$HOME` (nvm, a toolcache) is bound into the sandbox read-only, so it runs inside. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
 
 ## Try the POCs
 
