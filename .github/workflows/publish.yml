@@ -93,6 +93,9 @@ jobs:
           ninja -C /tmp/bwrap-build
           sudo ninja -C /tmp/bwrap-build install
           bwrap --version
+          # The sandbox binds /usr only (inside PATH /usr/bin:/bin): put setup-node's node there too.
+          sudo install -m755 "$(command -v node)" /usr/bin/node
+          /usr/bin/node --version
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Test (a skipped test fails CI — a skip is not a pass)
         run: |
