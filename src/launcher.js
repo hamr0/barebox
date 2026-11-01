@@ -4,8 +4,8 @@
 // `overlay:true` mounts the M4 tracing paper over it (see overlay.js).
 import { spawn } from 'node:child_process';
 import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join, relative, dirname, basename, delimiter } from 'node:path';
-import { assertAgentName, isInside, realPathOf, runtimePaths } from './runtime.js';
+import { join, relative, dirname, delimiter } from 'node:path';
+import { assertAgentName, hostNode, isInside, realPathOf, runtimePaths } from './runtime.js';
 import { assertOverlaySupport, setupOverlay } from './overlay.js';
 import { configPath } from './config.js';
 
@@ -48,24 +48,6 @@ const LOCKED_PATHS = [
 ];
 
 const SYSTEM_PATH = ['/usr/bin', '/bin', '/usr/sbin'];
-
-/**
- * What of the host to bind so a node executable runs inside: the install
- * prefix and the dir to put on PATH. Never more than the node install: an
- * exec in a `bin/` dir (nvm, fnm, toolcache, distro) binds the dir above, where
- * npm and the global CLIs live; any other layout binds only its own dir.
- *
- * @param {string} execPath absolute path of the node executable
- * @param {string} home the sandbox $HOME
- * @returns {{prefix: string|null, bin: string}} prefix is null when it must not be bound
- */
-function nodeInstall(execPath, home) {
-  const bin = dirname(execPath);
-  const dir = basename(bin) === 'bin' ? dirname(bin) : bin;
-  // `/`, $HOME and its ancestors are never bound for node: that would hand the sandbox the
-  // whole host or every user's home. The PATH entry stays.
-  return { prefix: isInside(dir, home) ? null : dir, bin };
-}
 
 /**
  * The bwrap args that mask one locked path, or none when it does not exist.
@@ -175,7 +157,7 @@ export function buildCaBundle(runtime, caFile) {
  * @param {{ pass?: string[], set?: Record<string, string>, placeholders?: Record<string, string> }} [opts.env] the inside's environment (M5). The host environment never reaches it except: a short default list (`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `EDITOR`, `PAGER`), the host variables named in `pass`, the values in `set`, and one placeholder per secret under its own name (`placeholders`, name to value). Set in that order, then `extraEnv`.
  * @param {string|null} [opts.socket] agent socket path, as returned by `proxy.addAgent` (default `<runtime>/socks/<agent>.sock`; the two must agree)
  * @param {string|null} [opts.caFile] barebox CA cert path (from `proxy.caFile`); when set, the sandbox trusts it for HTTPS alongside the system roots
- * @param {string} [opts.nodeExec] the node executable to run inside (default: this process's `process.execPath`). Its install is bound read-only and its `bin` dir put first on the inside PATH, unless already visible there (under `/usr`, `$HOME` or the project). An exec in a `bin/` dir binds the dir above it (npm and global CLIs live there); any other layout binds only the exec's own dir
+ * @param {string} [opts.nodeExec] the node executable to run inside (default: this process's `process.execPath`). The install is a `bin/` layout's parent dir (npm and global CLIs live there) or, for any other layout, the exec's own dir. It is bound read-only with the exec's dir first on the inside PATH, unless already visible there (under `/usr`, `$HOME` or the project). Never bound when it is `/`, `$HOME` or above it: then it is not on PATH either (see `hostNode` in `src/runtime.js`)
  * @param {string[]} [opts.maskDirs] extra folders hidden from the agent exactly like barebox's config dir (the `labels` folders: the agent must not read or rewrite a letter)
  * @param {boolean} [opts.overlay] when true, mount a per-run overlay upper over the project (M4 tracing paper) instead of binding it read-only; diff/commit/rollback address it as `runtimePaths(runtime).overlay(agent)`
  * @param {string[]} [opts.overlayIgnore] path segments invisible to the overlay (default `node_modules`; see overlay.js Q3)
@@ -218,11 +200,10 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   const home = process.env.HOME || '/root';
   // A Node outside /usr and $HOME (nvm, a CI toolcache) is bound read-only too, so the host's
   // node and its global CLIs run inside.
-  const { prefix: nodePrefix, bin: nodeBin } = nodeInstall(nodeExec, home);
+  const { bin: nodeBin, bind: nodeBind } = hostNode(nodeExec, home, proj);
   // Every path the sandbox binds in from the host: the locked drawers and mask folders are
   // hidden wherever they sit under one of these.
-  const roots = [home, proj, '/etc', '/usr', ...(nodePrefix ? [nodePrefix] : [])];
-  const nodeBound = nodePrefix !== null && !['/usr', home, proj].some((r) => isInside(r, nodePrefix));
+  const roots = [home, proj, '/etc', '/usr', ...(nodeBind ? [nodeBind] : [])];
   const args = [
     '--unshare-pid', '--unshare-uts', '--unshare-ipc', '--unshare-net',
     '--die-with-parent',
@@ -240,7 +221,7 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     ...(ov
       ? ['--overlay-src', proj, '--overlay', ov.upper, ov.work, proj]
       : ['--ro-bind', proj, proj]),
-    ...(nodeBound ? ['--ro-bind', nodePrefix, nodePrefix] : []),
+    ...(nodeBind ? ['--ro-bind', nodeBind, nodeBind] : []),
     '--chdir', proj,
     // Always detach from our controlling terminal: otherwise the agent could
     // open /dev/tty and TIOCSTI keystrokes into it (e.g. into `sbx approve`)
@@ -308,7 +289,7 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   }
   args.push(
     '--setenv', 'HOME', home,
-    '--setenv', 'PATH', (SYSTEM_PATH.includes(nodeBin) ? SYSTEM_PATH : [nodeBin, ...SYSTEM_PATH]).join(':'),
+    '--setenv', 'PATH', (!nodeBin || SYSTEM_PATH.includes(nodeBin) ? SYSTEM_PATH : [nodeBin, ...SYSTEM_PATH]).join(':'),
     '--setenv', 'HTTP_PROXY', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'HTTPS_PROXY', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'http_proxy', `http://127.0.0.1:${proxyPort}`,

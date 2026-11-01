@@ -907,6 +907,9 @@ export function createProxy(opts) {
       sock.removeListener('data', onData);
       sock.setTimeout(0); // the http.Server owns idle from here
       if (method === 'CONNECT') {
+        // Whoever removes the last data listener pauses: a flowing socket with no
+        // listener drops what arrives (a hello sent before the 200) and what is pushed back.
+        sock.pause();
         handleConnect(sock, target, buf.subarray(i + 4), agent);
       } else {
         // Plain HTTP (absolute- or origin-form): same parser, same handler.
@@ -947,13 +950,14 @@ export function createProxy(opts) {
         const gone = () => done(Buffer.alloc(0));
         sock.on('data', done);
         sock.on('close', gone);
+        sock.resume(); // paused by admit
       });
       sock.setTimeout(0);
       if (!first.length || closed || sock.destroyed) return;
     }
-    sock.unshift(first);
+    sock.unshift(first); // paused: admit paused it, and `done` pauses again
     if (first[0] !== 0x16) {
-      sock.resume(); // paused above; the http server only adds a data listener
+      sock.resume(); // the http server only adds a data listener
       server.emit('connection', sock);
       return;
     }

@@ -18,7 +18,7 @@ import {
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assertAgentName, runtimeTempDir, runtimePaths, safe } from './runtime.js';
+import { assertAgentName, hostNode, runtimeTempDir, runtimePaths, safe } from './runtime.js';
 
 /** One reviewed file change: what the sandbox did at `path`, and whether the project changed underneath it mid-run.
  *
@@ -468,8 +468,8 @@ function bwrapWalk({ lower, upper, work, ignore, scratch, stageDir = null, upper
   // /usr). Its prefix is bound read-only when /usr does not already show it.
   const node = realpathSync(process.execPath);
   const underUsr = node === '/usr' || node.startsWith('/usr/');
-  const nodeParent = dirname(node);
-  const nodePrefix = nodeParent.endsWith('/bin') ? dirname(nodeParent) : nodeParent;
+  // Only the install dir: this trusted walker binds even `/` (see below), so `refused` is ignored.
+  const nodePrefix = hostNode(node, process.env.HOME || '/root').dir;
   try {
     // No output cap (stdout carries no data) and no time limit: the walk
     // is finite (`lstat`, never following symlinks), and killing a commit's

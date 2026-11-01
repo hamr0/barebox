@@ -8,6 +8,7 @@ import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { launch, buildCaBundle } from '../src/launcher.js';
+import { hostNode } from '../src/runtime.js';
 import { bwrapUsable } from './fixtures/probes.mjs';
 
 function canUnix() {
@@ -326,7 +327,7 @@ describe('locked file masks (no sandbox needed)', () => {
     assert.equal(pathOf(args), `${nvm}/bin:/usr/bin:/bin:/usr/sbin`);
   });
 
-  it('a node prefix that is / or $HOME or above it is never bound; its bin stays on PATH', async () => {
+  it('a node prefix that is / or $HOME or above it is never bound, and its bin is not on PATH either', async () => {
     const home = join(root, 'h7', 'u'); const proj = join(root, 'p7'); const rt = join(root, 'r7');
     mkdirSync(home, { recursive: true }); mkdirSync(proj);
     process.env.HOME = home;
@@ -334,12 +335,14 @@ describe('locked file masks (no sandbox needed)', () => {
     // prefix `/`
     let args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: '/bin/node' });
     assert.ok(!args.some((a, i) => a === '--ro-bind' && args[i + 1] === '/'), `--ro-bind / present: ${args.join(' ')}`);
+    assert.equal(pathOf(args), '/usr/bin:/bin:/usr/sbin');
     // prefix is an ancestor of $HOME (root/h7), and $HOME itself
     const anc = join(root, 'h7');
     args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: join(anc, 'bin', 'node') });
     assert.ok(!bound(args, anc), `ancestor of HOME bound: ${args.join(' ')}`);
-    assert.equal(pathOf(args), `${anc}/bin:/usr/bin:/bin:/usr/sbin`);
+    assert.equal(pathOf(args), '/usr/bin:/bin:/usr/sbin');
     args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: join(home, 'bin', 'node') });
+    assert.equal(pathOf(args), '/usr/bin:/bin:/usr/sbin');
     assert.equal(args.filter((a, i) => a === '--ro-bind' && args[i + 1] === home).length, 1, 'HOME bound only by its own bind');
   });
 
@@ -965,6 +968,55 @@ describe('M0 bypass set: no way out but the front door (needs bwrap)', { skip: N
     const c = launch({ runtime: rt, agent: 'b3', proj,
       command: ['bash', '-c', '! echo > /dev/tcp/192.0.2.1/9 2>/dev/null'] });
     assert.equal((await run(c)).code, 0);
+  });
+});
+
+describe('hostNode: where the host node sits and what of it to bind', () => {
+  const home = '/tmp/hn-home/u';
+  it('a bin/ layout is the parent dir; its bin is the PATH entry and the parent is bound', () => {
+    assert.deepEqual(hostNode('/opt/tc/node-22/bin/node', home), { dir: '/opt/tc/node-22', bin: '/opt/tc/node-22/bin', bind: '/opt/tc/node-22', refused: null });
+  });
+  it('a flat layout is the exec\'s own dir', () => {
+    assert.deepEqual(hostNode('/opt/dist/node', home), { dir: '/opt/dist', bin: '/opt/dist', bind: '/opt/dist', refused: null });
+  });
+  it('/bin/node (dir /) is refused: no bind, no PATH entry', () => {
+    const r = hostNode('/bin/node', home);
+    assert.equal(r.dir, '/'); assert.equal(r.bind, null); assert.equal(r.bin, null);
+    assert.match(r.refused, /\$HOME or is \//);
+  });
+  it('an ancestor of $HOME and $HOME itself are refused', () => {
+    for (const exec of ['/tmp/hn-home/bin/node', '/tmp/hn-home/u/bin/node', '/tmp/hn-home/u/node']) {
+      const r = hostNode(exec, home);
+      assert.equal(r.bind, null, exec); assert.equal(r.bin, null, exec); assert.ok(r.refused, exec);
+    }
+  });
+  it('under /usr, $HOME or the project: not bound, bin still the PATH entry', () => {
+    assert.deepEqual(hostNode('/usr/local/bin/node', home), { dir: '/usr/local', bin: '/usr/local/bin', bind: null, refused: null });
+    assert.equal(hostNode(`${home}/.nvm/n22/bin/node`, home).bind, null);
+    assert.equal(hostNode('/srv/proj/tools/node', home, '/srv/proj').bind, null);
+    assert.equal(hostNode('/srv/proj/tools/node', home).bind, '/srv/proj/tools');
+  });
+});
+
+describe('sbx run says when it will not expose Node (needs bwrap)', { skip: NEED_SANDBOX }, () => {
+  it('a node copied to a prefix that holds $HOME: one stderr line, and the run still works', { timeout: 60000 }, async () => {
+    const root = mkdtempSync(join(tmpdir(), 'bb-nn-'));
+    try {
+      const home = join(root, 'home'); const proj = join(root, 'proj'); const bin = join(root, 'bin');
+      mkdirSync(home); mkdirSync(proj); mkdirSync(bin);
+      const copy = join(bin, 'node');
+      copyFileSync(process.execPath, copy); chmodSync(copy, 0o755);
+      const cli = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'cli.js');
+      const env = { PATH: process.env.PATH, HOME: home, SBX_RUNTIME: mkdtempSync(join(tmpdir(), 'bb-nnt-')) };
+      const r = await new Promise((resolve) => {
+        execFile(copy, [cli, 'run', '--', 'true'],
+          { cwd: proj, encoding: 'utf8', timeout: 45000, env },
+          (error, stdout, stderr) => resolve({ code: error ? error.code : 0, stdout, stderr }));
+      });
+      rmSync(env.SBX_RUNTIME, { recursive: true, force: true });
+      assert.equal(r.code, 0, r.stderr);
+      assert.ok(r.stderr.split('\n').includes(`barebox: not exposing Node at ${root} (it contains $HOME or is /); the sandbox uses /usr/bin/node if present`), r.stderr);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 
