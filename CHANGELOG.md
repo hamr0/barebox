@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+
+- A secret's placeholder in the URL path or query is refused `403 denied: secret.url` in every mode, before the gate. Keys are swapped in headers only; before, the placeholder was sent as is and the API answered 401 with no hint why.
+- The agent's `node` is the host's: the Node install that runs barebox (`process.execPath`, or `launch({ nodeExec })`) is bound read-only and its `bin` dir put first on the inside `PATH` when it lives outside `/usr`, `$HOME` and the project (nvm, fnm, asdf, a CI toolcache). An exec in a `bin/` dir binds the dir above it, where npm and global CLIs live; any other layout binds only its own dir.
+
+### Fixed
+
+- Node's built-in `fetch` to an `http://` URL failed inside the sandbox (`UND_ERR_SOCKET`), local models such as Ollama included: with `NODE_USE_ENV_PROXY=1` Node tunnels plain http with `CONNECT`, and the proxy treated every tunnel as TLS. The first byte inside a tunnel now decides; plain HTTP is checked like any request (a placeholder there gets `403 denied: secret.scheme`).
+- `node` (and npm-installed CLIs) from nvm, fnm or a toolcache were `not found` inside the sandbox (exit 127).
+
+### Security
+
+- A locked drawer or `maskDirs` folder under `/etc` or `/usr` (or the bound Node install) is now hidden like one under `$HOME`; before, only paths under `$HOME` and the project were masked, so such a folder stayed readable.
+
 ## [0.6.0] - 2026-11-01
 
 ### Added

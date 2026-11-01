@@ -158,7 +158,7 @@ private/loopback check, never link-local (cloud metadata).
 ## Keys the agent never holds
 
 The sandbox does not get your environment. The agent sees only barebox's own
-variables (`HOME`, `PATH`, the proxy and CA variables, `NODE_USE_ENV_PROXY=1`), a short default list
+variables (`HOME`, `PATH`, the proxy and CA variables, `NODE_USE_ENV_PROXY=1`, so Node's `fetch` reaches `http://` and `https://` URLs, local models included, through the proxy), a short default list
 (`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`,
 `SHELL`, `EDITOR`, `PAGER`), the host variables you name in `env.pass`, the
 values in `env.set`, and one placeholder per secret. Nothing else reaches it,
@@ -227,6 +227,9 @@ hands the real value to the agent.
 
 `<runtime>/gate.jsonl` (`runtimePaths(runtime).audit`; `run()` returns it as
 `audit`) is the only log, one JSON object per line, all in bareguard's shape.
+It is never rotated. `sbx run` without `SBX_RUNTIME` gets a fresh runtime, so a
+fresh log, each run; with a reused `SBX_RUNTIME` the file keeps growing: delete
+it between runs (no proxy running) to start a new one.
 - Decisions: bareguard's gate lines carry the action (`method`, `url`, `tool`,
   `agent`, `rid`) and an `aid`.
 - Response status: a `phase:"record"` line with the same `aid` and
