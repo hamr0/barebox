@@ -248,7 +248,9 @@ describe('positives', () => {
     }
   });
 
-  it('a plain HTTP request in the same write as CONNECT is answered', { timeout: 15000 }, async () => {
+  // Guards the plain path only (bytes after the CONNECT head are unshifted and the socket resumed);
+  // the pause that protects a TLS tunnel's first bytes is guarded by the two TLS tests above.
+  it('a plain HTTP request pipelined in the same write as CONNECT is answered', { timeout: 15000 }, async () => {
     const target = `127.0.0.1:${plainUp.port}`;
     const sock = net.connect(PORT, '127.0.0.1');
     await once(sock, 'connect');
@@ -375,7 +377,6 @@ describe('negatives', () => {
     const { port } = await p.ready;
     try { await fn(rt, port); } finally {
       await p.close();
-      chmodSync(join(rt, 'certs'), 0o700);
       rmSync(rt, { recursive: true, force: true });
     }
   }
@@ -405,7 +406,9 @@ describe('negatives', () => {
 
   it('a TLS tunnel whose cert cannot be minted is closed and logged as a 502 deny', { timeout: 20000 }, async () => {
     await withOwnProxy(async (rt, port) => {
-      chmodSync(join(rt, 'certs'), 0o500);
+      // A file where the dir was: the mint fails with ENOTDIR for any uid (a 0500 dir would not stop root).
+      rmSync(join(rt, 'certs'), { recursive: true });
+      writeFileSync(join(rt, 'certs'), '');
       const out = await tunnelRaw(port, `127.0.0.1:${tlsUp.port}`, Buffer.from([0x16, 0x03, 0x01, 0x00, 0x00]));
       assert.match(out, /^HTTP\/1\.1 200 Connection established\r\n\r\n$/, 'the 200 went out, then the close');
       await waitFor(() => /"code":502[^\n]*no cert for 127\.0\.0\.1/.test(readFileSync(join(rt, 'mitm.log'), 'latin1')),
