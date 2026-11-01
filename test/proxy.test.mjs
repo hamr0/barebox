@@ -19,6 +19,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import net from 'node:net';
+import { Duplex } from 'node:stream';
 import tls from 'node:tls';
 import http from 'node:http';
 import os from 'node:os';
@@ -174,6 +175,95 @@ describe('positives', () => {
     await waitLog(/m=node/, 'm=node');
   });
 
+  // The first bytes of a tunnel may ride in the same write as the CONNECT head.
+  // A Duplex glues the head to the client's first write (the TLS ClientHello) and
+  // strips the proxy's 200 from what it reads, so tls.connect sees a plain pipe.
+  // With `gapMs` the hello goes out as its own write that long after the head,
+  // before the 200 can have been read.
+  function coalescedTunnel(target, { port = PORT, gapMs = 0 } = {}) {
+    const raw = net.connect(port, '127.0.0.1');
+    const head = Buffer.from(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
+    let sent = false;
+    let acc = Buffer.alloc(0);
+    let open = false;
+    const d = new Duplex({
+      read() {},
+      write(chunk, _enc, cb) {
+        if (sent) { raw.write(chunk, cb); return; }
+        sent = true;
+        if (!gapMs) { raw.write(Buffer.concat([head, chunk]), cb); return; }
+        raw.write(head);
+        setTimeout(() => raw.write(chunk, cb), gapMs);
+      },
+      final(cb) { raw.end(); cb(); },
+      destroy(e, cb) { raw.destroy(); cb(e); },
+    });
+    raw.on('data', (c) => {
+      if (open) { d.push(c); return; }
+      acc = Buffer.concat([acc, c]);
+      const i = acc.indexOf('\r\n\r\n');
+      if (i < 0) return;
+      assert.match(acc.subarray(0, i).toString('latin1'), /200 Connection established/);
+      open = true;
+      if (acc.length > i + 4) d.push(acc.subarray(i + 4));
+    });
+    raw.on('end', () => d.push(null));
+    raw.on('error', (e) => d.destroy(e));
+    return d;
+  }
+
+  it('a TLS ClientHello in the same write as CONNECT still gets its ServerHello', { timeout: 15000 }, async () => {
+    const t = tls.connect({ socket: coalescedTunnel(`127.0.0.1:${tlsUp.port}`), ca: [CA_PEM], servername: '127.0.0.1' });
+    const timer = setTimeout(() => t.destroy(new Error('no handshake in 8s (ServerHello lost)')), 8000);
+    try {
+      await once(t, 'secureConnect');
+      t.write(`GET /?m=coalesced HTTP/1.1\r\nHost: 127.0.0.1:${tlsUp.port}\r\nConnection: close\r\n\r\n`);
+      const r = await readOneResponse(t);
+      assert.equal(r.status, 200);
+      assert.equal(r.body, 'local-ok');
+    } finally {
+      clearTimeout(timer);
+      t.destroy();
+    }
+  });
+
+  it('a ClientHello sent while the proxy is still checking the destination is not lost', { timeout: 20000 }, async () => {
+    // A resolver that takes 300 ms keeps handleConnect awaiting checkUpstream; the hello
+    // lands 50 ms after the head, with no data listener on the socket.
+    const rt = mkdtempSync(join(tmpdir(), 'bb-slowc-'));
+    const slow = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), runtime: rt, clientIdleMs: 1000,
+      unsafeTestOnly: { allowLoopback: true, resolveUpstream: () => new Promise((r) => setTimeout(() => r(['127.0.0.1']), 300)) } });
+    try {
+      const { port } = await slow.ready;
+      const ca = readFileSync(slow.caFile, 'utf8');
+      const one = async () => {
+        const t = tls.connect({ socket: coalescedTunnel(`slow.test:${tlsUp.port}`, { port, gapMs: 50 }), ca: [ca], servername: 'slow.test' });
+        const timer = setTimeout(() => t.destroy(new Error('no handshake in 8s (ServerHello lost)')), 8000);
+        try { await once(t, 'secureConnect'); } finally { clearTimeout(timer); t.destroy(); }
+      };
+      await Promise.all([one(), one(), one()]);
+    } finally {
+      await slow.close();
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
+  // Guards the plain path only (bytes after the CONNECT head are unshifted and the socket resumed);
+  // the pause that protects a TLS tunnel's first bytes is guarded by the two TLS tests above.
+  it('a plain HTTP request pipelined in the same write as CONNECT is answered', { timeout: 15000 }, async () => {
+    const target = `127.0.0.1:${plainUp.port}`;
+    const sock = net.connect(PORT, '127.0.0.1');
+    await once(sock, 'connect');
+    sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\nGET /?m=pipelined HTTP/1.1\r\nHost: ${target}\r\nConnection: close\r\n\r\n`);
+    let got = '';
+    const timer = setTimeout(() => sock.destroy(), 8000);
+    sock.on('data', (c) => { got += c.toString('latin1'); });
+    await once(sock, 'close');
+    clearTimeout(timer);
+    assert.match(got, /^HTTP\/1\.1 200 Connection established/);
+    assert.match(got, /HTTP\/1\.1 200 OK[\s\S]*local-ok/);
+  });
+
   it('HEAD answers from headers, no 6s body wait', async () => {
     const t0 = Date.now();
     const r = await curl('--cacert', CA, '-I', `${tlsUp.url}?m=head`);
@@ -277,6 +367,53 @@ describe('negatives', () => {
   it('certs are minted on demand (no pre-made certs needed)', async () => {
     const kc = await certFor(join(RT, 'certs'), 'minted.invalid');
     assert.ok(kc.key.length > 0 && kc.cert.length > 0);
+  });
+
+  // Own proxy + runtime, so the certs dir holds only what these tunnels mint.
+  async function withOwnProxy(fn) {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-pc-'));
+    const p = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), upstreamCa: CA, runtime: rt,
+      clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true } });
+    const { port } = await p.ready;
+    try { await fn(rt, port); } finally {
+      await p.close();
+      rmSync(rt, { recursive: true, force: true });
+    }
+  }
+  const tunnelRaw = (port, target, send) => new Promise((resolve, reject) => {
+    const s = net.connect(port, '127.0.0.1');
+    let out = '';
+    s.on('connect', () => s.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`));
+    s.on('data', (c) => {
+      const first = out === '';
+      out += c.toString('latin1');
+      if (first && out.includes('\r\n\r\n') && send) s.write(send);
+    });
+    s.on('close', () => { clearTimeout(t); resolve(out); });
+    s.on('error', reject);
+    const t = setTimeout(() => { s.destroy(); reject(new Error('tunnel did not finish')); }, 5000);
+  });
+
+  it('a plain-HTTP tunnel mints no cert', { timeout: 20000 }, async () => {
+    await withOwnProxy(async (rt, port) => {
+      const out = await tunnelRaw(port, `127.0.0.1:${plainUp.port}`,
+        `GET /?m=nocert HTTP/1.1\r\nHost: 127.0.0.1:${plainUp.port}\r\nConnection: close\r\n\r\n`);
+      assert.match(out, /^HTTP\/1\.1 200 Connection established/);
+      assert.match(out, /local-ok/, 'the plain request was answered');
+      assert.deepEqual(readdirSync(join(rt, 'certs')).filter((f) => f.startsWith('127.0.0.1')), []);
+    });
+  });
+
+  it('a TLS tunnel whose cert cannot be minted is closed and logged as a 502 deny', { timeout: 20000 }, async () => {
+    await withOwnProxy(async (rt, port) => {
+      // A file where the dir was: the mint fails with ENOTDIR for any uid (a 0500 dir would not stop root).
+      rmSync(join(rt, 'certs'), { recursive: true });
+      writeFileSync(join(rt, 'certs'), '');
+      const out = await tunnelRaw(port, `127.0.0.1:${tlsUp.port}`, Buffer.from([0x16, 0x03, 0x01, 0x00, 0x00]));
+      assert.match(out, /^HTTP\/1\.1 200 Connection established\r\n\r\n$/, 'the 200 went out, then the close');
+      await waitFor(() => /"code":502[^\n]*no cert for 127\.0\.0\.1/.test(readFileSync(join(rt, 'mitm.log'), 'latin1')),
+        'the 502 deny line for the failed mint');
+    });
   });
 
   it('upstream with an unknown-CA cert is 502 and never forwarded', async () => {

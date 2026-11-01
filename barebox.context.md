@@ -158,7 +158,7 @@ private/loopback check, never link-local (cloud metadata).
 ## Keys the agent never holds
 
 The sandbox does not get your environment. The agent sees only barebox's own
-variables (`HOME`, `PATH`, the proxy and CA variables, `NODE_USE_ENV_PROXY=1`), a short default list
+variables (`HOME`, `PATH`, the proxy and CA variables, `NODE_USE_ENV_PROXY=1`, so Node's `fetch` reaches `http://` and `https://` URLs, local models included, through the proxy), a short default list
 (`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`,
 `SHELL`, `EDITOR`, `PAGER`), the host variables you name in `env.pass`, the
 values in `env.set`, and one placeholder per secret. Nothing else reaches it,
@@ -195,7 +195,9 @@ values in `env.set`, and one placeholder per secret. Nothing else reaches it,
 - A real value is swapped only into a request that goes upstream over TLS. A
   placeholder to a bound host over plain http is refused in every mode, before
   the gate: `403 denied: secret.scheme`. Nothing goes upstream.
-- Headers only. A key in a body, URL or query string is not swapped.
+- Headers only. A key in a body is not swapped. A placeholder in the URL (path
+  or query string) is refused in every mode, before the gate: `403 denied:
+  secret.url`. Nothing goes upstream.
 - Audit: one `annotate` line per hit, `verdict: "secret"`,
   `meta: { agent, rid, name, host, swapped }`, joined to the gate line by
   `rid`. The value is never written to the audit, an ask file or an error body.
@@ -225,6 +227,9 @@ hands the real value to the agent.
 
 `<runtime>/gate.jsonl` (`runtimePaths(runtime).audit`; `run()` returns it as
 `audit`) is the only log, one JSON object per line, all in bareguard's shape.
+It is never rotated. `sbx run` without `SBX_RUNTIME` gets a fresh runtime, so a
+fresh log, each run; with a reused `SBX_RUNTIME` the file keeps growing: delete
+it between runs (no proxy running) to start a new one.
 - Decisions: bareguard's gate lines carry the action (`method`, `url`, `tool`,
   `agent`, `rid`) and an `aid`.
 - Response status: a `phase:"record"` line with the same `aid` and
@@ -275,7 +280,7 @@ Model endpoints are `r` (free in every mode): `api.anthropic.com`
 `POST /v1/messages` and `/v1/messages/count_tokens`; `api.openai.com`
 `POST /v1/chat/completions`, `/v1/responses` and `/v1/embeddings`; and on each
 `localLlm` host:port `POST /api/chat`, `/api/generate`, `/api/embed`,
-`/v1/chat/completions` and `/v1/completions` (http only). Any other path on
+`/v1/chat/completions` and `/v1/completions` (over http or https). Any other path on
 those hosts is a normal `POST`.
 
 Label folders are hidden inside the sandbox like the config file, so the agent
@@ -319,7 +324,7 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
 - The upstream wall answers `403` for loopback, link-local (incl. `169.254.169.254`), the host's own addresses, private LAN ranges and unresolvable names. An IPv4 embedded in IPv6 is checked in every spelling: mapped, compat, uncompressed, NAT64 `64:ff9b::/96` (local-use `/48` denied outright) and 6to4 `2002::/16`; NAT64 and 6to4 of public sites stay reachable. Every DNS answer is checked and the dial is pinned to the checked IP; test-only options live under `unsafeTestOnly` (`allowLoopback`, `resolveUpstream`) and production never sets them.
 - `createProxy` throws synchronously on an unopenable `logFile` (a directory, a missing parent, no permission) and releases the runtime. The runtime root, `asks/`, `answers/`, `held/` and `socks/` are owner-only (`0700`) whatever the umask. An existing runtime dir you own is tightened to `0700`; one you don't own (such as `/tmp`) is refused with an error naming the dir and its owner and suggesting a subdir like `/tmp/sbx`. The audit file (`logFile`, `gate.jsonl`) is set to `0600` every time a proxy starts. No request header and no body content is written to it: a body is logged as its length and SHA-256 only. The ask payload's `bodyPreview` (the first 4 KB, card numbers masked except the last 4) lives in the ask file only; other secrets inside a body still show there until bareguard redaction lands. Your `redact` hook shapes the `meta` of barebox's own annotate lines.
 - One proxy per runtime: `createProxy` throws "in use by pid N" (`run()` rejects, `sbx run` exits 1) while a live proxy owns the runtime. The claim is held by the proxy process and the kernel frees it when the process dies, so a crashed proxy never blocks the runtime. Use another `SBX_RUNTIME`, or leave it unset for a fresh one.
-- `launch()` starts the agent in the project dir, in a new session (no controlling terminal). Locked drawers are 21 credential stores (see `LOCKED_PATHS` in `src/launcher.js`); the agent's own model credentials in `~/.claude` stay readable (a known gap: its sign-in tokens refresh themselves, so `secrets` does not cover them). The host environment does not reach the inside: callers that relied on an inherited variable list it in `env.pass` (or pass `launch({ env })` / `extraEnv`). `launch()` finds `bwrap` on your `PATH` but starts it with a fixed `PATH`.
+- `launch()` starts the agent in the project dir, in a new session (no controlling terminal). Locked drawers are 21 credential stores (see `LOCKED_PATHS` in `src/launcher.js`); the agent's own model credentials in `~/.claude` stay readable (a known gap: its sign-in tokens refresh themselves, so `secrets` does not cover them). The host environment does not reach the inside: callers that relied on an inherited variable list it in `env.pass` (or pass `launch({ env })` / `extraEnv`). `launch()` finds `bwrap` on your `PATH` but starts it with a fixed `PATH`. The sandbox sees `/usr`, `/etc`, `$HOME` and the project read-only; the Node you run barebox with is visible too: a Node outside those (nvm, a CI toolcache) has its install bound read-only and its dir first on the inside `PATH`, so `node` and global CLIs run inside. A node in a `bin/` dir binds the dir above it; any other layout binds only the node's own dir. It is never bound when that dir is `/`, `$HOME` or above it; then its dir is not on `PATH` either and `sbx run` prints `barebox: not exposing Node at <dir> ...` on stderr (the sandbox uses `/usr/bin/node` if present). `launch({ nodeExec })` overrides `process.execPath`. Locked drawers and `maskDirs` folders are hidden wherever they sit under any of these (`/etc` and the Node install included). So is the runtime tree: a runtime under any of them gets an empty mask, and a runtime that IS `/etc`, `/usr` or the Node install dir throws. A project under the Node install keeps its overlay (the install is bound before it).
 - `sbx` exits 0 ok, 1 unknown id / refused / no live proxy / run failure, 2 usage; `sbx run` mirrors the agent's exit code.
 - Any listening unix socket under `$HOME` (IDE IPC, rootless-container sockets) is reachable from inside the sandbox: a read-only bind does not block `connect(2)`; the locked-paths list is the lever.
 

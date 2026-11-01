@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.7.0] - 2026-11-01
+
+### Added
+
+- The agent's `node` is the host's: the Node install that runs barebox (`process.execPath`, or `launch({ nodeExec })`) is bound read-only and its `bin` dir put first on the inside `PATH` when it lives outside `/usr`, `$HOME` and the project (nvm, fnm, asdf, a CI toolcache). An exec in a `bin/` dir binds the dir above it, where npm and global CLIs live; any other layout binds only its own dir. It is never bound when that dir is `/`, `$HOME` or above it (then it is not on `PATH` either, and `sbx run` says so on stderr).
+
+### Changed
+
+- A secret's placeholder in the URL path or query is refused `403 denied: secret.url` in every mode, before the gate. Keys are swapped in headers only; before, the placeholder was sent as is and the API answered 401 with no hint why.
+- A runtime or project under the bound Node install is safe: the runtime is masked like one under `$HOME` (its `asks/`, `answers/` and `socks/` are not visible), a project there keeps its overlay writable, and `launch()` throws when the runtime IS the Node install dir (or `/etc`, `/usr`).
+
+### Fixed
+
+- Node's built-in `fetch` to an `http://` URL failed inside the sandbox (`UND_ERR_SOCKET`), local models such as Ollama included: with `NODE_USE_ENV_PROXY=1` Node tunnels plain http with `CONNECT`, and the proxy treated every tunnel as TLS. The first byte inside a tunnel now decides; plain HTTP is checked like any request (a placeholder there gets `403 denied: secret.scheme`). A certificate is minted only for a TLS tunnel; a plain one mints nothing. The same holds when the first bytes (a TLS ClientHello, or a plain request) arrive in the same write as the `CONNECT` line: the hello was dropped and the handshake never answered.
+- `node` (and npm-installed CLIs) from nvm, fnm or a toolcache were `not found` inside the sandbox (exit 127).
+
+### Security
+
+- A locked drawer or `maskDirs` folder under `/etc` or `/usr` (or the bound Node install) is now hidden like one under `$HOME`; before, only paths under `$HOME` and the project were masked, so such a folder stayed readable.
+
 ## [0.6.0] - 2026-11-01
 
 ### Added

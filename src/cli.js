@@ -36,7 +36,7 @@ import { MODES } from './policy.js';
 import { writeFileAtomic } from './holds.js';
 import { run as sandboxRun } from './run.js';
 import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
-import { assertAgentName, createRuntime, runtimePaths, runtimeLive, safe, shellQuote } from './runtime.js';
+import { assertAgentName, createRuntime, hostNode, runtimePaths, runtimeLive, safe, shellQuote } from './runtime.js';
 
 const USAGE = 'usage: sbx [--help] | pending | approve <id> | deny <id> [reason] | diff [--agent <name>] | commit [--agent <name>] [--skip-conflicts] | rollback [--agent <name>] | run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]';
 
@@ -186,6 +186,8 @@ async function run(args) {
   const json = values.json ?? false;
   const overlay = values.overlay ?? false;
   const runtime = process.env.SBX_RUNTIME || createRuntime();
+  const node = hostNode(process.execPath, process.env.HOME || '/root', process.cwd());
+  if (node.refused) err(`barebox: not exposing Node at ${node.dir} (${node.refused}); the sandbox uses /usr/bin/node if present`);
   // Agent-controlled bytes, sanitized before they reach a terminal or a JSON consumer.
   const clean = (o, keys) => {
     const c = { ...o };

@@ -68,6 +68,28 @@ export function isInside(base, p) {
 }
 
 /**
+ * Where the host's node sits and what of it to bind so it runs inside the sandbox. An exec in a
+ * `bin/` dir (nvm, fnm, toolcache, distro) has its install one dir up, where npm and the global
+ * CLIs live; any other layout is its own dir. Never `/`, `$HOME` or an ancestor of it: binding
+ * that would hand the sandbox the whole host or every user's home, so it is `refused` and
+ * neither bound nor put on PATH.
+ *
+ * @param {string} execPath absolute path of the node executable
+ * @param {string} home the sandbox $HOME
+ * @param {string} [proj] the project dir, already visible inside
+ * @returns {{dir: string, bin: string|null, bind: string|null, refused: string|null}} `dir` the install folder; `bin` the PATH entry (null when refused); `bind` the dir to bind read-only (null when refused or already under `/usr`, `$HOME` or the project); `refused` a short reason or null
+ */
+export function hostNode(execPath, home, proj) {
+  const bin = path.dirname(execPath);
+  const dir = path.basename(bin) === 'bin' ? path.dirname(bin) : bin;
+  if (isInside(dir, home)) { // `/` is inside-of-everything: it lands here too
+    return { dir, bin: null, bind: null, refused: 'it contains $HOME or is /' };
+  }
+  const visible = ['/usr', home, ...(proj ? [proj] : [])].some((r) => isInside(r, dir));
+  return { dir, bin, bind: visible ? null : dir, refused: null };
+}
+
+/**
  * Create a short-lived runtime dir: a short `sbx-` temp dir, keeping unix
  * socket paths under the ~108-char limit.
  *
