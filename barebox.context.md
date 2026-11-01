@@ -157,7 +157,7 @@ private/loopback check, never link-local (cloud metadata).
 ## Keys the agent never holds
 
 The sandbox does not get your environment. The agent sees only barebox's own
-variables (`HOME`, `PATH`, the proxy and CA variables), a short default list
+variables (`HOME`, `PATH`, the proxy and CA variables, `NODE_USE_ENV_PROXY=1`), a short default list
 (`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`,
 `SHELL`, `EDITOR`, `PAGER`), the host variables you name in `env.pass`, the
 values in `env.set`, and one placeholder per secret. Nothing else reaches it,

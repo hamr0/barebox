@@ -284,6 +284,8 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     '--setenv', 'HTTPS_PROXY', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'http_proxy', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'https_proxy', `http://127.0.0.1:${proxyPort}`,
+    // Node's built-in fetch ignores the proxy variables unless this is set.
+    '--setenv', 'NODE_USE_ENV_PROXY', '1',
   );
   if (caBundle) {
     for (const v of CA_ENV_VARS) args.push('--setenv', v, '/run/sbx/ca-bundle.pem');

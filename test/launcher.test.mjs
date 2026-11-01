@@ -441,6 +441,15 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
       assert.equal(r.out.trim(), 'bb-term|passed-v|set-v|sbx-ph-0123456789abcdef|extra-v|unset');
     });
 
+    it('the proxy variables, NODE_USE_ENV_PROXY=1 included, are set inside', async () => {
+      await listenSock('te3b');
+      const c = launch({ runtime: rt, agent: 'te3b', proj,
+        command: ['bash', '-c', 'echo "$NODE_USE_ENV_PROXY"'] });
+      const r = await run(c);
+      assert.equal(r.code, 0, r.err);
+      assert.equal(r.out.trim(), '1');
+    });
+
     it('later layers win: set over pass, placeholder over set, extraEnv over all', async () => {
       setHost({ BB_L: 'host' });
       await listenSock('te4');
