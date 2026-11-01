@@ -65,24 +65,24 @@ function nodeInstall(execPath) {
  * The bwrap args that mask one locked path, or none when it does not exist.
  * A symlinked drawer (dotfile managers) is masked at its real target, which
  * is where bwrap lands a mount anyway, so the content is shut at both
- * spellings; a target outside `$HOME` and the project is not bound into the
- * sandbox at all, so there is nothing to mask.
+ * spellings; a target outside every bound root is not in the sandbox at all,
+ * so there is nothing to mask.
  *
- * @param {string} abs the locked path (under `$HOME` or the project to matter)
- * @param {string} home `$HOME`
- * @param {string} proj project dir
+ * @param {string} abs the locked path (under a bound root to matter)
+ * @param {string[]} roots the paths the sandbox binds in: `$HOME`, the project, `/etc`, `/usr` and the Node install
  * @returns {string[]} `--tmpfs <dir>` or `--dev-bind /dev/null <file>`, or `[]`
  */
-function lockMask(abs, home, proj) {
-  // Neither under $HOME nor the project: not bound into the sandbox at all.
-  if (!isInside(home, abs) && !isInside(proj, abs)) return [];
+function lockMask(abs, roots) {
+  const bound = (p) => roots.some((r) => isInside(r, p));
+  // Under no bound root: not in the sandbox at all.
+  if (!bound(abs)) return [];
   let target = abs;
   let st;
   try {
     st = lstatSync(abs);
     if (st.isSymbolicLink()) {
       target = realPathOf(abs);
-      if (!isInside(home, target) && !isInside(proj, target)) return [];
+      if (!bound(target)) return [];
       st = statSync(target);
     }
   } catch {
@@ -213,6 +213,9 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   // A Node outside /usr and $HOME (nvm, a CI toolcache) is bound read-only too, so the host's
   // node and its global CLIs run inside.
   const { prefix: nodePrefix, bin: nodeBin } = nodeInstall(nodeExec);
+  // Every path the sandbox binds in from the host: the locked drawers and mask folders are
+  // hidden wherever they sit under one of these.
+  const roots = [home, proj, '/etc', '/usr', nodePrefix];
   const nodeBound = !['/usr', home, proj].some((r) => isInside(r, nodePrefix));
   const args = [
     '--unshare-pid', '--unshare-uts', '--unshare-ipc', '--unshare-net',
@@ -242,12 +245,12 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   // Locked drawers AFTER the project mount: the tmpfs mask must land on top,
   // or a project that contains one of these paths (a project that IS $HOME,
   // or holds its own `.ssh`) would leak the real drawer through the overlay.
-  for (const p of LOCKED_PATHS) args.push(...lockMask(`${home}/${p}`, home, proj));
+  for (const p of LOCKED_PATHS) args.push(...lockMask(`${home}/${p}`, roots));
   // barebox's own config: settings the agent must neither read nor edit.
   // Masked wherever it resolves (XDG_CONFIG_HOME may move it).
-  args.push(...lockMask(dirname(configPath(process.env)), home, proj));
+  args.push(...lockMask(dirname(configPath(process.env)), roots));
   // The label folders (the letters live there) get the same mask.
-  for (const d of maskDirs) args.push(...lockMask(d, home, proj));
+  for (const d of maskDirs) args.push(...lockMask(d, roots));
   // The runtime tree holds the file-checkpoint dirs (`asks/`, `answers/`
   // — the approve/deny capability) and every agent's socket (identity). A
   // read-only bind does NOT stop connect(2) to a unix socket, so wherever

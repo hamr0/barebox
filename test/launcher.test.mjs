@@ -325,6 +325,18 @@ describe('locked file masks (no sandbox needed)', () => {
     assert.deepEqual(binds(args).sort(), base);
     assert.equal(pathOf(args), `${nvm}/bin:/usr/bin:/bin:/usr/sbin`);
   });
+
+  it('a maskDirs path under /etc is masked (it is bound in)', async () => {
+    const home = join(root, 'h5'); const proj = join(root, 'p5'); const rt = join(root, 'r5');
+    mkdirSync(home); mkdirSync(proj);
+    process.env.HOME = home;
+    const args = await argsFor({ runtime: rt, agent: 'ne', proj, command: ['true'],
+      maskDirs: ['/etc/ssl', '/etc/passwd'] });
+    const at = (...seq) => args.findIndex((_, i) => seq.every((x, k) => args[i + k] === x));
+    assert.ok(at('--dev-bind', '/dev/null', '/etc/passwd') >= 0, `/etc/passwd not masked: ${args.join(' ')}`);
+    assert.ok(at('--tmpfs', '/etc/ssl') >= 0 || !existsSync('/etc/ssl'), '/etc/ssl not masked');
+    assert.equal(at('--dev-bind', '/dev/null', '/etc/ssl'), -1);
+  });
 });
 
 describe('buildCaBundle (no sandbox needed)', () => {
@@ -599,6 +611,26 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
       maskDirs: [join(home, 'rwx-labels')] });
     const r = await run(c);
     assert.equal(r.code, 0, `exit ${r.code} (11 gate file readable, 12 drawer not empty): ${r.err}`);
+  });
+
+  it('masks a maskDirs folder under the bound Node prefix (a root the launcher binds, outside $HOME and the project)', async () => {
+    await listenSock('t1n');
+    // The test owns this prefix: nothing under the real /etc or /usr is written.
+    const pfx = mkdtempSync(join(tmpdir(), 'bb-pfx-'));
+    try {
+      mkdirSync(join(pfx, 'bin'));
+      mkdirSync(join(pfx, 'labels'));
+      writeFileSync(join(pfx, 'labels', 'jira.rwxmap.json'), '{"bareguard":{"tools":{}}}\n');
+      const script = [
+        'test -d "$0/bin" || exit 10',
+        '[ -z "$(cat "$0/labels/jira.rwxmap.json" 2>/dev/null)" ] || exit 11',
+        '[ -z "$(ls -A "$0/labels")" ] || exit 12',
+      ].join('\n');
+      const c = launch({ runtime: rt, agent: 't1n', proj, command: ['bash', '-c', script, pfx],
+        nodeExec: join(pfx, 'bin', 'node'), maskDirs: [join(pfx, 'labels')] });
+      const r = await run(c);
+      assert.equal(r.code, 0, `exit ${r.code} (10 prefix not bound, 11 file readable, 12 drawer not empty): ${r.err}`);
+    } finally { rmSync(pfx, { recursive: true, force: true }); }
   });
 
   it('masks the config where XDG_CONFIG_HOME puts it', async () => {
