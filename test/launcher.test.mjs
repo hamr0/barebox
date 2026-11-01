@@ -326,6 +326,23 @@ describe('locked file masks (no sandbox needed)', () => {
     assert.equal(pathOf(args), `${nvm}/bin:/usr/bin:/bin:/usr/sbin`);
   });
 
+  it('a node prefix that is / or $HOME or above it is never bound; its bin stays on PATH', async () => {
+    const home = join(root, 'h7', 'u'); const proj = join(root, 'p7'); const rt = join(root, 'r7');
+    mkdirSync(home, { recursive: true }); mkdirSync(proj);
+    process.env.HOME = home;
+    const bound = (args, d) => args.some((a, i) => a === '--ro-bind' && args[i + 1] === d);
+    // prefix `/`
+    let args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: '/bin/node' });
+    assert.ok(!args.some((a, i) => a === '--ro-bind' && args[i + 1] === '/'), `--ro-bind / present: ${args.join(' ')}`);
+    // prefix is an ancestor of $HOME (root/h7), and $HOME itself
+    const anc = join(root, 'h7');
+    args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: join(anc, 'bin', 'node') });
+    assert.ok(!bound(args, anc), `ancestor of HOME bound: ${args.join(' ')}`);
+    assert.equal(pathOf(args), `${anc}/bin:/usr/bin:/bin:/usr/sbin`);
+    args = await argsFor({ runtime: rt, agent: 'np', proj, command: ['true'], nodeExec: join(home, 'bin', 'node') });
+    assert.equal(args.filter((a, i) => a === '--ro-bind' && args[i + 1] === home).length, 1, 'HOME bound only by its own bind');
+  });
+
   it('a maskDirs path under /etc is masked (it is bound in)', async () => {
     const home = join(root, 'h5'); const proj = join(root, 'p5'); const rt = join(root, 'r5');
     mkdirSync(home); mkdirSync(proj);
@@ -954,9 +971,11 @@ describe('M0 bypass set: no way out but the front door (needs bwrap)', { skip: N
 describe('the host node runs inside (needs bwrap)', { skip: NEED_SANDBOX }, () => {
   it('sbx run with a node copied outside /usr and $HOME: process.execPath inside is that copy', { timeout: 60000 }, async () => {
     const root = mkdtempSync(join(tmpdir(), 'bb-nr-'));
+    // HOME in its own dir: a node prefix that holds $HOME is refused, not bound.
+    const home = mkdtempSync(join(tmpdir(), 'bb-nrh-'));
     try {
-      const bin = join(root, 'bin'); const proj = join(root, 'proj'); const home = join(root, 'home');
-      mkdirSync(bin); mkdirSync(proj); mkdirSync(home);
+      const bin = join(root, 'bin'); const proj = join(root, 'proj');
+      mkdirSync(bin); mkdirSync(proj);
       const copy = join(bin, 'node');
       copyFileSync(process.execPath, copy);
       chmodSync(copy, 0o755);
@@ -970,6 +989,6 @@ describe('the host node runs inside (needs bwrap)', { skip: NEED_SANDBOX }, () =
       rmSync(env.SBX_RUNTIME, { recursive: true, force: true });
       assert.equal(r.code, 0, r.stderr);
       assert.equal(r.stdout.split('\n')[0], copy, r.stdout + r.stderr); // line 1 is the agent's; the CLI adds "done exit 0"
-    } finally { rmSync(root, { recursive: true, force: true }); }
+    } finally { rmSync(root, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
   });
 });

@@ -47,6 +47,8 @@ const LOCKED_PATHS = [
   '.cargo/credentials.toml',
 ];
 
+const SYSTEM_PATH = ['/usr/bin', '/bin', '/usr/sbin'];
+
 /**
  * What of the host to bind so a node executable runs inside: the install
  * prefix and the dir to put on PATH. Never more than the node install: an
@@ -54,11 +56,15 @@ const LOCKED_PATHS = [
  * npm and the global CLIs live; any other layout binds only its own dir.
  *
  * @param {string} execPath absolute path of the node executable
- * @returns {{prefix: string, bin: string}}
+ * @param {string} home the sandbox $HOME
+ * @returns {{prefix: string|null, bin: string}} prefix is null when it must not be bound
  */
-function nodeInstall(execPath) {
+function nodeInstall(execPath, home) {
   const bin = dirname(execPath);
-  return basename(bin) === 'bin' ? { prefix: dirname(bin), bin } : { prefix: bin, bin };
+  const dir = basename(bin) === 'bin' ? dirname(bin) : bin;
+  // `/`, $HOME and its ancestors are never bound for node: that would hand the sandbox the
+  // whole host or every user's home. The PATH entry stays.
+  return { prefix: isInside(dir, home) ? null : dir, bin };
 }
 
 /**
@@ -212,11 +218,11 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   const home = process.env.HOME || '/root';
   // A Node outside /usr and $HOME (nvm, a CI toolcache) is bound read-only too, so the host's
   // node and its global CLIs run inside.
-  const { prefix: nodePrefix, bin: nodeBin } = nodeInstall(nodeExec);
+  const { prefix: nodePrefix, bin: nodeBin } = nodeInstall(nodeExec, home);
   // Every path the sandbox binds in from the host: the locked drawers and mask folders are
   // hidden wherever they sit under one of these.
-  const roots = [home, proj, '/etc', '/usr', nodePrefix];
-  const nodeBound = !['/usr', home, proj].some((r) => isInside(r, nodePrefix));
+  const roots = [home, proj, '/etc', '/usr', ...(nodePrefix ? [nodePrefix] : [])];
+  const nodeBound = nodePrefix !== null && !['/usr', home, proj].some((r) => isInside(r, nodePrefix));
   const args = [
     '--unshare-pid', '--unshare-uts', '--unshare-ipc', '--unshare-net',
     '--die-with-parent',
@@ -302,7 +308,7 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   }
   args.push(
     '--setenv', 'HOME', home,
-    '--setenv', 'PATH', ['/usr/bin', '/bin', '/usr/sbin'].includes(nodeBin) ? '/usr/bin:/bin:/usr/sbin' : `${nodeBin}:/usr/bin:/bin:/usr/sbin`,
+    '--setenv', 'PATH', (SYSTEM_PATH.includes(nodeBin) ? SYSTEM_PATH : [nodeBin, ...SYSTEM_PATH]).join(':'),
     '--setenv', 'HTTP_PROXY', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'HTTPS_PROXY', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'http_proxy', `http://127.0.0.1:${proxyPort}`,

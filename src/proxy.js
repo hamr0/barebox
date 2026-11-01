@@ -933,13 +933,6 @@ export function createProxy(opts) {
       denyRaw(sock, 403, verdict.reason);
       return;
     }
-    let creds;
-    try {
-      creds = await certFor(certDir, host);
-    } catch (e) {
-      denyRaw(sock, 502, `no cert for ${host}: ${e.message}`);
-      return;
-    }
     if (closed || sock.destroyed) return;
     try { sock.write('HTTP/1.1 200 Connection established\r\n\r\n'); }
     catch { return; }
@@ -964,6 +957,17 @@ export function createProxy(opts) {
       server.emit('connection', sock);
       return;
     }
+    // The cert is minted only for a TLS tunnel. The 200 is already sent, so a
+    // failure cannot answer 502: it is logged as the deny it would have been.
+    let creds;
+    try {
+      creds = await certFor(certDir, host);
+    } catch (e) {
+      log({ ev: 'deny', agent: agentOf(sock), code: 502, note: `no cert for ${host}: ${e.message}` });
+      sock.destroy();
+      return;
+    }
+    if (closed || sock.destroyed) return;
     const st = new tls.TLSSocket(sock, { isServer: true, key: creds.key, cert: creds.cert });
     st[AGENT] = agent;
     st[SECURE] = true;

@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- Node's built-in `fetch` to an `http://` URL failed inside the sandbox (`UND_ERR_SOCKET`), local models such as Ollama included: with `NODE_USE_ENV_PROXY=1` Node tunnels plain http with `CONNECT`, and the proxy treated every tunnel as TLS. The first byte inside a tunnel now decides; plain HTTP is checked like any request (a placeholder there gets `403 denied: secret.scheme`).
+- Node's built-in `fetch` to an `http://` URL failed inside the sandbox (`UND_ERR_SOCKET`), local models such as Ollama included: with `NODE_USE_ENV_PROXY=1` Node tunnels plain http with `CONNECT`, and the proxy treated every tunnel as TLS. The first byte inside a tunnel now decides; plain HTTP is checked like any request (a placeholder there gets `403 denied: secret.scheme`). A certificate is minted only for a TLS tunnel; a plain one mints nothing.
 - `node` (and npm-installed CLIs) from nvm, fnm or a toolcache were `not found` inside the sandbox (exit 127).
 
 ### Security

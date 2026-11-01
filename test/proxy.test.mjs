@@ -279,6 +279,52 @@ describe('negatives', () => {
     assert.ok(kc.key.length > 0 && kc.cert.length > 0);
   });
 
+  // Own proxy + runtime, so the certs dir holds only what these tunnels mint.
+  async function withOwnProxy(fn) {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-pc-'));
+    const p = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), upstreamCa: CA, runtime: rt,
+      clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true } });
+    const { port } = await p.ready;
+    try { await fn(rt, port); } finally {
+      await p.close();
+      chmodSync(join(rt, 'certs'), 0o700);
+      rmSync(rt, { recursive: true, force: true });
+    }
+  }
+  const tunnelRaw = (port, target, send) => new Promise((resolve, reject) => {
+    const s = net.connect(port, '127.0.0.1');
+    let out = '';
+    s.on('connect', () => s.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`));
+    s.on('data', (c) => {
+      const first = out === '';
+      out += c.toString('latin1');
+      if (first && out.includes('\r\n\r\n') && send) s.write(send);
+    });
+    s.on('close', () => { clearTimeout(t); resolve(out); });
+    s.on('error', reject);
+    const t = setTimeout(() => { s.destroy(); reject(new Error('tunnel did not finish')); }, 5000);
+  });
+
+  it('a plain-HTTP tunnel mints no cert', { timeout: 20000 }, async () => {
+    await withOwnProxy(async (rt, port) => {
+      const out = await tunnelRaw(port, `127.0.0.1:${plainUp.port}`,
+        `GET /?m=nocert HTTP/1.1\r\nHost: 127.0.0.1:${plainUp.port}\r\nConnection: close\r\n\r\n`);
+      assert.match(out, /^HTTP\/1\.1 200 Connection established/);
+      assert.match(out, /local-ok/, 'the plain request was answered');
+      assert.deepEqual(readdirSync(join(rt, 'certs')).filter((f) => f.startsWith('127.0.0.1')), []);
+    });
+  });
+
+  it('a TLS tunnel whose cert cannot be minted is closed and logged as a 502 deny', { timeout: 20000 }, async () => {
+    await withOwnProxy(async (rt, port) => {
+      chmodSync(join(rt, 'certs'), 0o500);
+      const out = await tunnelRaw(port, `127.0.0.1:${tlsUp.port}`, Buffer.from([0x16, 0x03, 0x01, 0x00, 0x00]));
+      assert.match(out, /^HTTP\/1\.1 200 Connection established\r\n\r\n$/, 'the 200 went out, then the close');
+      await waitFor(() => /"code":502[^\n]*no cert for 127\.0\.0\.1/.test(readFileSync(join(rt, 'mitm.log'), 'latin1')),
+        'the 502 deny line for the failed mint');
+    });
+  });
+
   it('upstream with an unknown-CA cert is 502 and never forwarded', async () => {
     // The proxy re-encrypts toward the real server, so it must verify like
     // a client: default trust (system roots + upstreamCa) only. This locks
