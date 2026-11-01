@@ -126,7 +126,10 @@ export async function gateFor({ agent, mode, auditPath, humanChannel, tools = TO
   const { letters, askUnheld } = MODE_RULES[mode];
   const gate = new Gate({
     audit: { path: auditPath },
-    rwx: { agent, agents: { [agent]: letters }, tools, askUnheld },
+    // Explicit letters and an empty sharedFile ('' is falsy: no file, and bareguard's
+    // `??` stops there) keep the host's BAREGUARD_RWX_LETTERS / BAREGUARD_BUDGET_FILE out.
+    rwx: { agent, letters, tools, askUnheld },
+    budget: { sharedFile: '' },
     // The mode letters plus the card/payment floor are the whole policy; bareguard's
     // default word patterns scan the URL and method and would fire before rwx.
     content: { askPatterns: [], denyPatterns: [] },

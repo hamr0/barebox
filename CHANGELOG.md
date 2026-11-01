@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- `loadLabels` is exported from `barebox`: an embedder builds the `labels` value `run()` and `createProxy()` take (`{ matcher, tools, dirs }`) without the `sbx` CLI.
+
+### Fixed
+
+- A held request refused for being over the body cap could answer 500 instead of 403 when a body write was still in flight.
+
+### Security
+
+- The mode no longer changes with `BAREGUARD_RWX_LETTERS` or `BAREGUARD_BUDGET_FILE` in the host environment: the gate gets its letters explicitly and no shared budget file, so a user shell or parent process that exports them cannot widen, break or budget-deny a run.
+
 ## [0.5.0] - 2026-10-30
 
 ### Added
