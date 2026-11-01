@@ -588,6 +588,14 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Out of scope to Nov 4 | Swaps in bodies, URLs or query strings; OAuth, refresh tokens and the agent's own sign-in (`~/.claude` stays readable, a known gap); macOS; a web UI; per-agent keys. |
 | Open | Whether `run()` / `createProxy()` take `secrets` directly (library callers) or only the CLI reads them; decided in the build brief. |
 
+**M5 POC result (Oct 31): GO.** Checks A–G pass in a real shell, each shown red by its mutation (details in `docs/logs/findings.md`, "M5 — POC"). Build decisions (user, Oct 31, all recommendations accepted):
+
+- `run()` and `createProxy()` take `secrets`; the CLI reads them from the config file and passes them in. One path for both.
+- The swap also decodes `Authorization: Basic <base64>`, swaps and re-encodes (`curl -u KEY:`, Stripe's documented style).
+- The launcher spawns bwrap with a clean environment (`env: { PATH: '/usr/bin:/bin' }`) and sets everything with `--setenv`. No `--clearenv`: proven redundant, and bwrap's own `/proc/1/environ` is what the clean spawn fixes.
+- Tests cover check C with a small fixture `$HOME` searched from inside; the full-filesystem search stays a manual POC script (`poc/m5`, 7 minutes).
+- The 0.6.0 ledger brief (`docs/logs/ledger-060-brief.md`) is built first, in separate commits on `m5`, then the M5 build (`docs/logs/m5-build-brief.md`).
+
 ### M6. Scale run
 
 | | |
