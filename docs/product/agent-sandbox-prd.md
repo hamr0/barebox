@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Name: barebox (CLI `sbx`).
-> Status: M0–M2 PASS. **barebox 0.4.0 is on npm** (provenance-signed); M2.5 (ask seam), M4 (undo layer) and the hardening branch are released. M3 is in progress on branch `m3` (design decided Oct 29; memory POC rounds 1 and 2, part A, bodies and parts B1, B2a and B2b done — bareguard decides every request; labels and model endpoints are wired; one audit file; B2c, the memory bench, done Oct 30: budget is a range, about 145-175 MB at 40 agents per proxy). Next: finish M3, then M5, M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M0–M2 PASS. **barebox 0.5.0 is on npm** (provenance-signed, Oct 30); M2.5 (ask seam), M4 (undo layer), the hardening branch and M3 (bareguard decides every request; rwxmap labels and model endpoints; one audit file; 40 agents per proxy; proxy memory budget about 145-175 MB at 40 agents) are released. Next: M5 (keys the agent never holds), then M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 2026 until the cutoff on **Nov 5 2026, 01:00 Amsterdam time (CET, GMT+1)**. Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.
@@ -512,7 +512,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 2. **The rwx file generator**: per mode, from rwxmap labels plus the default model-endpoint list.
 3. **`ask` / `auto` / `trust` as bareguard config** (rwx letters + `askUnheld` + the flags for the floor).
 4. **The body checker**, the 64 KB working slot per agent, held bodies in files, and the masked 4 KB preview (see "The body check").
-4a. **The config file**: `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, read by the CLI only. Keys today `mode`, `holdTimeoutSec`, `heldBodyMaxMB`, `localLlm`, `labels` and `tenants`; later modules add keys to the same file, no second user config file. A flag beats the file, the file beats the default. An unknown key, bad value or bad JSON makes `sbx run` exit 2 naming the file and key. It is hidden inside the sandbox (it reads empty); the mask must follow the resolved path, so a custom `XDG_CONFIG_HOME` under `$HOME` is hidden too (fixed in the body brief). Built Oct 29 (part A).
+4a. **The config file**: `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, read by the CLI only. Keys today `mode`, `holdTimeoutSec`, `heldBodyMaxMB`, `localLlm`, `labels`, `tenants`, `env` and `secrets`; later modules add keys to the same file, no second user config file. A flag beats the file, the file beats the default. An unknown key, bad value or bad JSON makes `sbx run` exit 2 naming the file and key. It is hidden inside the sandbox (it reads empty); the mask must follow the resolved path, so a custom `XDG_CONFIG_HOME` under `$HOME` is hidden too (fixed in the body brief). Built Oct 29 (part A).
 5. **The `gate` option**: none means a preset; otherwise a passed bareguard `Gate` or any object with the same `check(action)` contract. Matched by shape.
 6. **Audit** through `gate.record` and `gate.annotate`.
 7. **Reuse instead of barebox's own copies**:
@@ -559,6 +559,45 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 | Done when | An approved request reaches an API with the real header value. A denied one carries only the placeholder. A search of the sandbox for the real value finds nothing. |
 | Estimate | 0.5 day. |
 
+**M5 interview, round 1 (user, Oct 31; all recommendations accepted).**
+
+- *Scope:* M5 protects API keys sent in a request header to a service (Stripe, GitHub, Jira, Anthropic or OpenAI API keys). The agent's own sign-in (Claude Code's subscription login in `~/.claude`) is out of 0.6.0: those tokens refresh themselves; `~/.claude` stays readable and is a known gap.
+- *Host environment:* cleared. Measured Oct 31: today all 115 host variables reach the sandbox (`FAKE_API_KEY=sk-test-123 sbx run -- env` shows it), including `CLAUDE_CODE_MESSAGING_TOKEN` and `SBX_RUNTIME`; the ssh-agent and D-Bus sockets do not (`/run/user/<uid>` is not mounted). The inside gets barebox's own variables (`HOME`, `PATH`, the proxy and CA variables), a short default pass list (`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `EDITOR`, `PAGER`), config `env.pass` names, config `env.set` values, and one placeholder per configured secret. Proposed guard (not yet decided): `env.pass` refuses secret-looking names (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`) with "use `secrets` for this".
+- *Where keys live:* config `secrets`, each entry naming a host environment variable (`fromEnv`) by default, or holding the value inline (the config file is 0600 and masked). No OS keyring.
+- *When the real value goes in:* on any request the gate allows (by mode or by your approval), and only to the hosts that secret is bound to. A denied request, or one to any other host, carries the placeholder.
+
+**M5 interview, round 2 (user, Oct 31).**
+
+- *Placeholder:* random, made fresh per run, one per configured secret, under the secret's usual variable name. It lets tools start and send their auth header; the proxy finds it in a header and swaps in the real value only for an allowed request to a bound host. Seen headed anywhere else, it is a tripwire.
+- *Keys per agent:* one shared `secrets` set for every agent on the proxy for now; per-agent keys later, when needed, without changing this design.
+- *Audit:* no new file. Swap facts go into `<runtime>/gate.jsonl`, the one bareguard-shape file the suite shares, as `annotate` lines (`verdict: "secret"`, `meta: { agent, rid, name, host, swapped }`), joined to the gate line by `rid`. Never the value.
+
+**M5 interview, round 3 (user, Oct 31).** `env.pass` refuses secret-looking names (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, case-insensitive) at startup with "use `secrets` for this"; no override (`env.set` covers a harmless match). A placeholder headed for a host its secret is not bound to is blocked: `403 denied: secret.host`, plus the audit line, in every mode.
+
+**M5 spec (decided Oct 31).**
+
+| | |
+|---|---|
+| Problem | Every host environment variable reaches the sandbox today (115 measured), so any exported API key is readable by the agent. |
+| Goal | The agent holds only placeholders. The proxy, outside the sandbox's pid namespace, adds the real value to request headers on allowed requests to bound hosts. |
+| Go/no-go (POC) | With a secret configured: the real value appears 0 times inside the sandbox (environment of every process, `/proc/*/environ`, `/proc/*/cmdline`, every readable file under `/` except `/proc` and `/sys`, the CA bundle); an allowed request to the bound host arrives upstream with the real value; a denied one, and one to an unbound host, never carry it; the unbound one is blocked `403 secret.host`. Each check must be shown able to fail. |
+| Config | `env: { pass: [names], set: { name: value } }` and `secrets: { NAME: { fromEnv: "HOSTVAR" \| value: "...", hosts: ["api.stripe.com"] } }` in the one config file; unknown keys and a missing `fromEnv` variable fail at startup (exit 2). |
+| Environment inside | barebox's own variables, the default pass list, `env.pass`, `env.set`, one random per-run placeholder per secret under its own name. Nothing else. |
+| Swap | Every request header value is searched for each placeholder (substring, so `Bearer <ph>` works). Gate allows, the host is bound and the upstream hop is https: replace with the real value. Denied: the placeholder never leaves (the request does not go upstream). Unbound host: `403 secret.host`; bound host over plain http: `403 secret.scheme`. Never in the audit, the ask file or an error body. |
+| Audit | `annotate` lines in `gate.jsonl`, `verdict: "secret"`, `meta: { agent, rid, name, host, swapped }`. |
+| Out of scope to Nov 4 | Swaps in bodies, URLs or query strings; OAuth, refresh tokens and the agent's own sign-in (`~/.claude` stays readable, a known gap); macOS; a web UI; per-agent keys. |
+| Open | None. `run()` and `createProxy()` take `secrets` directly; the CLI reads them from the config file (decided after the POC). |
+
+**M5 POC result (Oct 31): GO.** Checks A–G pass in a real shell, each shown red by its mutation (details in `docs/logs/findings.md`, "M5 — POC"). Build decisions (user, Oct 31, all recommendations accepted):
+
+- `run()` and `createProxy()` take `secrets`; the CLI reads them from the config file and passes them in. One path for both.
+- The swap also decodes `Authorization: Basic <base64>`, swaps and re-encodes (`curl -u KEY:`, Stripe's documented style).
+- The launcher spawns bwrap with a clean environment (`env: { PATH: '/usr/bin:/bin' }`) and sets everything with `--setenv`. No `--clearenv`: proven redundant, and bwrap's own `/proc/1/environ` is what the clean spawn fixes.
+- Tests cover check C with a small fixture `$HOME` searched from inside; the full-filesystem search stays a manual POC script (`poc/m5`, 7 minutes).
+- The 0.6.0 ledger brief (`docs/logs/ledger-060-brief.md`) is built first, in separate commits on `m5`, then the M5 build (`docs/logs/m5-build-brief.md`).
+
+**M5 built (Nov 1, branch `m5`; not yet released).** `src/secrets.js` (`loadSecrets`, `findPlaceholders`, `applySecrets`), config keys `env` and `secrets`, `launch({ env })`, `createProxy({ secrets })`, and `run({ secrets, env })`; `sbx run` passes the config through. Detect runs before the gate, apply only after `allow` (and on the no-gate path), so the real value is never in a held request's headers. 41 new tests (secrets 11, config 6, launcher 5, proxy 16 in `test/m5.test.mjs`, run/CLI 3); the suite is 491 of 491, 0 fail 0 skip, in a real shell at the branch review (485 of 485 three times at the first build). Build decisions: the launcher looks `bwrap` up on the caller's `PATH` but starts it with `PATH=/usr/bin:/bin` (so the fake `bwrap` the launcher tests put first on `PATH` still works); `NODE_USE_ENV_PROXY=1` is set inside with the proxy variables (the host environment no longer reaches the sandbox, and Node's built-in `fetch` ignores the proxy variables without it; Node added the variable in v22.21.0). Known gaps: `~/.claude` stays readable; an upstream that echoes a request header hands the real value back to the agent. Check C (the 7-minute full-filesystem search) and the real Stripe/httpbin smoke are run by the orchestrator.
+
 ### M6. Scale run
 
 | | |
@@ -593,11 +632,11 @@ This is a plan, not a result. It shifts as POCs return. Review cap per module: o
 | 2 | Oct 27 | Graduation rewrite, reviews, rewrite bench (done) | Branch review: ready |
 | 3 | Oct 28 | M2.5 ask seam, M4 undo layer, hardening, release 0.4.0 (done) | 0.4.0 on npm |
 | 4 | Oct 29 | M3 scoping, memory POC (rounds 1 and 2 done) | |
-| 5–6 | Oct 30–31 | M3 build and review. bareguard 0.29.0 and rwxmap 0.8.0 land upstream. | Proxy about 145-175 MB at 40 agents on bareguard 0.30.0, pinned (143–172 MB measured, quiet to busy machine; re-decided Oct 30; was ≤ 80 MB) |
+| 5–6 | Oct 30–31 | M3 build and review. bareguard 0.29.0 and rwxmap 0.8.0 land upstream. (done Oct 30: 0.5.0 released) | Proxy about 145-175 MB at 40 agents on bareguard 0.30.0, pinned (143–172 MB measured, quiet to busy machine; re-decided Oct 30; was ≤ 80 MB) |
 | 7 | Nov 1 | M5 (keys) | |
 | 8 | Nov 2 | M6 numbers. Demo B. | Memory targets measured |
 | 9 | Nov 3 | Demo A, README. Freeze in the evening. | |
-| 10 | Nov 4 | Release 0.5.0 and submission | |
+| 10 | Nov 4 | Release 0.6.0 and submission (0.5.0 shipped M3 on Oct 30) | |
 | 11 | Nov 5 | Buffer only, before 01:00 Amsterdam time | |
 
 Days 1–3 are results; the rest is a plan. F1 (bareguard `askUnheld`) and F2 (rwxmap `match` entry) land in their own repos and gate M3's `auto`/`ask` modes; if either slips, M3 ships `trust` + floor first.

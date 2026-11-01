@@ -38,6 +38,15 @@
       "example": "import { launch } from \"barebox\";\nconst child = launch({ runtime: \"/tmp/sbx\", agent: \"fx\", proj: \"/tmp/proj\", command: [\"bash\", \"-c\", \"echo hi\"] });\nawait new Promise((r) => child.on(\"close\", r)); // child.exitCode === 0"
     },
     {
+      "name": "loadLabels",
+      "category": "labels",
+      "when": "Reach for this to build the `labels` value `run()` and `createProxy()` take: it reads rwxmap label folders once at startup and returns the request matcher, the tools table (letters from each gate file) and the absolute folders.",
+      "import": "import { loadLabels } from 'barebox'",
+      "signature": "loadLabels(cfg: object, env?: NodeJS.ProcessEnv) => { matcher: ReturnType<typeof matcherFrom>, tools: Record<string, any>, dirs: string[] }",
+      "fails": "Throws, naming the file or folder, on a folder with no review file, a review file without its gate file, a duplicate key across vendors, a tenants vendor no folder defines, an unreadable folder, or a label file written before rwxmap 0.8.0.",
+      "example": "import { loadLabels, run } from \"barebox\";\nconst labels = loadLabels({ labels: [\"/home/me/labels/jira\"], tenants: { jira: [\"https://acme.atlassian.net\"] } });\nawait run({ proj: \"/tmp/proj\", command: [\"bash\", \"-c\", \"true\"], labels });"
+    },
+    {
       "name": "rollbackOverlay",
       "category": "overlay",
       "when": "Reach for this to throw one run's tracing paper away: it drops every sandboxed change and leaves the project exactly as it was.",
@@ -52,7 +61,7 @@
       "when": "Reach for this to HARNESS-ONLY run one sandboxed agent start-to-finish in a single call: it starts the proxy, sandboxes the command, answers holds, and returns the exit code with the ask and audit trail (plus the overlay diff once M4 exists).",
       "import": "import { run } from 'barebox'",
       "signature": "run(opts: object) => Promise<{ exit: number, asks: AskRecord[], audit: string, diff: OverlayChange[], runtime: string }>",
-      "fails": "Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `onAsk`, a proxy that never becomes ready, a `launch` that throws (uncommitted overlay changes, a runtime inside the project — the proxy is closed first), or an overlay diff that cannot be read. The agent's own nonzero exit is returned as `exit`, never thrown.",
+      "fails": "Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `onAsk`, a `secrets` entry with no value (a `fromEnv` variable missing from this process's environment; the message names the secret, never a value), a proxy that never becomes ready, a `launch` that throws (uncommitted overlay changes, a runtime inside the project — the proxy is closed first), or an overlay diff that cannot be read. The agent's own nonzero exit is returned as `exit`, never thrown.",
       "example": "import { run } from \"barebox\";\nconst { exit, asks, audit } = await run({ proj: \"/tmp/proj\", command: [\"bash\", \"-c\", \"echo hi\"] });"
     }
   ]

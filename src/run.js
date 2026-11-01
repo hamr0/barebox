@@ -31,6 +31,7 @@ import { createRuntime, runtimePaths } from './runtime.js';
 import { launch } from './launcher.js';
 import { diffOverlay } from './overlay.js';
 import { MODES, gateFor } from './policy.js';
+import { loadSecrets } from './secrets.js';
 
 /**
  * A collected ask record: the parked ask plus how it was decided.
@@ -67,6 +68,8 @@ import { MODES, gateFor } from './policy.js';
  * @property {object} [unsafeTestOnly] TEST-ONLY escape hatch, forwarded to the proxy (see `createProxy`): everything under it weakens the sandbox wall
  * @property {NodeJS.WritableStream} [stdout] where the agent's stdout goes (default process.stdout)
  * @property {NodeJS.WritableStream} [stderr] where the agent's stderr goes (default process.stderr)
+ * @property {Record<string, { fromEnv?: string, value?: string, hosts: string[] }>} [secrets] keys the agent never holds (M5), the config `secrets` shape: the sandbox gets a random placeholder under each NAME; the proxy swaps in the real value on an allowed request to one of its `hosts` (see `createProxy`). A `fromEnv` variable missing from this process's environment rejects the run, naming the secret
+ * @property {{ pass?: string[], set?: Record<string, string> }} [env] the sandbox's environment (M5), the config `env` shape: the host environment never reaches it except a short default list (`TERM`, `LANG`, `LC_*`, `TZ`, ...), the host variables named in `pass` and the values in `set` (see `launch`)
  * @property {boolean} [overlay] when true, mount a per-run overlay upper over the project (M4 tracing paper) instead of binding it read-only; the result's `diff` lists the run's changes for commit/rollback
  * @property {string[]} [overlayIgnore] path segments invisible to the overlay (default `node_modules`; see overlay.js Q3)
  */
@@ -89,11 +92,13 @@ import { MODES, gateFor } from './policy.js';
  * @param {object|null} [opts.unsafeTestOnly] TEST-ONLY escape hatch, forwarded to the proxy (see `createProxy`)
  * @param {NodeJS.WritableStream|null} [opts.stdout] where the agent's stdout goes (default process.stdout)
  * @param {NodeJS.WritableStream|null} [opts.stderr] where the agent's stderr goes (default process.stderr)
+ * @param {Record<string, { fromEnv?: string, value?: string, hosts: string[] }>|null} [opts.secrets] keys the agent never holds (M5), the config `secrets` shape; see {@link RunOptions}
+ * @param {{ pass?: string[], set?: Record<string, string> }|null} [opts.env] the sandbox's environment (M5), the config `env` shape; see {@link RunOptions}
  * @param {boolean} [opts.overlay] when true, mount a per-run overlay upper over the project instead of binding it read-only; the result's `diff` lists the run's changes for commit/rollback
  * @param {string[]} [opts.overlayIgnore] path segments invisible to the overlay (default `node_modules`; see overlay.js Q3)
  * @returns {Promise<{ exit: number, asks: AskRecord[], audit: string, diff: import('./overlay.js').OverlayChange[], runtime: string }>} the agent process exit code, the collected ask records, the JSONL audit log path, the run's overlay diff (M4), and the runtime dir addressing it
  * @when Reach for this to HARNESS-ONLY run one sandboxed agent start-to-finish in a single call: it starts the proxy, sandboxes the command, answers holds, and returns the exit code with the ask and audit trail (plus the overlay diff once M4 exists).
- * @fails Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `onAsk`, a proxy that never becomes ready, a `launch` that throws (uncommitted overlay changes, a runtime inside the project — the proxy is closed first), or an overlay diff that cannot be read. The agent's own nonzero exit is returned as `exit`, never thrown.
+ * @fails Rejects on a missing/unreadable `proj`, an empty `command`, a bad `mode`, a misshapen `onAsk`, a `secrets` entry with no value (a `fromEnv` variable missing from this process's environment; the message names the secret, never a value), a proxy that never becomes ready, a `launch` that throws (uncommitted overlay changes, a runtime inside the project — the proxy is closed first), or an overlay diff that cannot be read. The agent's own nonzero exit is returned as `exit`, never thrown.
  * @example
  * import { run } from "barebox";
  * const { exit, asks, audit } = await run({ proj: "/tmp/proj", command: ["bash", "-c", "echo hi"] });
@@ -101,7 +106,7 @@ import { MODES, gateFor } from './policy.js';
 export async function run({ proj, command, mode = 'auto', onAsk = null,
   onEvent = null, runtime = null, agent = 'agent', timeoutMs, heldBodyMaxBytes,
   allowLocal = [], labels = null, unsafeTestOnly = null, stdout = null, stderr = null,
-  overlay = false, overlayIgnore }) {
+  overlay = false, overlayIgnore, secrets = null, env = null }) {
   if (typeof proj !== 'string' || !proj) throw new Error('run: proj must be a non-empty string');
   if (!fs.existsSync(proj)) throw new Error(`run: proj does not exist: ${proj}`);
   if (!Array.isArray(command) || !command.length) {
@@ -114,6 +119,8 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
   if (!MODES.includes(mode)) {
     throw new Error(`run: mode must be ${MODES.join('|')}, got ${JSON.stringify(mode)}`);
   }
+  // Once per run: the placeholders are fresh per run. A secret without a value throws here, before any runtime dir.
+  const loaded = loadSecrets(secrets ?? {});
   // Short temp dir: agent socket paths inherit it and cap at ~108 chars.
   const rt = runtime ?? createRuntime();
   const audit = runtimePaths(rt).audit;
@@ -136,7 +143,7 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
     : recordEvent;
 
   const proxy = createProxy({
-    runtime: rt, logFile: audit, allowLocal, unsafeTestOnly,
+    runtime: rt, logFile: audit, allowLocal, unsafeTestOnly, secrets: loaded,
     ...(labels ? { labels } : {}),
     gateFor: (name, { humanChannel, tools }) => gateFor({ agent: name, mode, auditPath: audit, humanChannel, tools }),
     hold: { onAsk, timeoutMs, maxBody: heldBodyMaxBytes, onEvent: holdOnEvent },
@@ -161,6 +168,7 @@ export async function run({ proj, command, mode = 'auto', onAsk = null,
       runtime: rt, agent, proj, command,
       socket: sock, caFile: proxy.caFile,
       overlay, overlayIgnore, maskDirs: labels?.dirs ?? [],
+      env: { ...env, placeholders: Object.fromEntries(loaded.map((s) => [s.name, s.placeholder])) },
     });
     const out = stdout ?? process.stdout;
     const err = stderr ?? process.stderr;

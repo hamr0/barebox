@@ -3,8 +3,8 @@
 // defaults are baked in, not switchable. The project bind is read-only unless
 // `overlay:true` mounts the M4 tracing paper over it (see overlay.js).
 import { spawn } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join, relative, dirname } from 'node:path';
+import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join, relative, dirname, delimiter } from 'node:path';
 import { assertAgentName, isInside, realPathOf, runtimePaths } from './runtime.js';
 import { assertOverlaySupport, setupOverlay } from './overlay.js';
 import { configPath } from './config.js';
@@ -88,6 +88,26 @@ const SYSTEM_BUNDLES = [
 const CA_ENV_VARS = ['SSL_CERT_FILE', 'NODE_EXTRA_CA_CERTS', 'REQUESTS_CA_BUNDLE',
   'CURL_CA_BUNDLE', 'GIT_SSL_CAINFO'];
 
+// Host variables that reach the inside without being asked for (M5). Nothing
+// else does: the sandbox gets a short list, not the host environment.
+const PASS_DEFAULT = /^(TERM|COLORTERM|LANG|LANGUAGE|LC_[A-Z_]+|TZ|USER|LOGNAME|SHELL|EDITOR|PAGER)$/;
+
+/**
+ * Where `bwrap` is, looked up on THIS process's PATH. The spawn below runs
+ * with a clean environment (its PATH is fixed), so node could not find a
+ * `bwrap` that the caller's PATH puts first (the fake one the tests use).
+ *
+ * @returns {string} the first executable `bwrap` on PATH, else the bare name (spawn then fails ENOENT as before)
+ */
+function bwrapBin() {
+  for (const d of (process.env.PATH ?? '').split(delimiter)) {
+    if (!d) continue;
+    const p = join(d, 'bwrap');
+    try { accessSync(p, constants.X_OK); return p; } catch {}
+  }
+  return 'bwrap';
+}
+
 /**
  * Build the CA bundle the sandbox trusts: system roots plus the barebox CA,
  * so public hosts verify as usual and the proxy's minted certs verify too.
@@ -131,7 +151,8 @@ export function buildCaBundle(runtime, caFile) {
  * @param {string} opts.proj project directory, bound read-only
  * @param {string[]} opts.command argv to run inside, for example `["python3", "agent.py"]`
  * @param {number} [opts.proxyPort] front-door port inside the sandbox (default 3128)
- * @param {object} [opts.extraEnv] extra environment entries for the inside
+ * @param {object} [opts.extraEnv] extra environment entries for the inside, set last (they win)
+ * @param {{ pass?: string[], set?: Record<string, string>, placeholders?: Record<string, string> }} [opts.env] the inside's environment (M5). The host environment never reaches it except: a short default list (`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `EDITOR`, `PAGER`), the host variables named in `pass`, the values in `set`, and one placeholder per secret under its own name (`placeholders`, name to value). Set in that order, then `extraEnv`.
  * @param {string|null} [opts.socket] agent socket path, as returned by `proxy.addAgent` (default `<runtime>/socks/<agent>.sock`; the two must agree)
  * @param {string|null} [opts.caFile] barebox CA cert path (from `proxy.caFile`); when set, the sandbox trusts it for HTTPS alongside the system roots
  * @param {string[]} [opts.maskDirs] extra folders hidden from the agent exactly like barebox's config dir (the `labels` folders: the agent must not read or rewrite a letter)
@@ -146,7 +167,7 @@ export function buildCaBundle(runtime, caFile) {
  * await new Promise((r) => child.on("close", r)); // child.exitCode === 0
  */
 export function launch({ runtime, agent, proj, command, proxyPort = 3128,
-  extraEnv = {}, socket = null, caFile = null, overlay = false, overlayIgnore, maskDirs = [] }) {
+  extraEnv = {}, env = {}, socket = null, caFile = null, overlay = false, overlayIgnore, maskDirs = [] }) {
   for (const [k, v] of Object.entries({ runtime, agent, proj })) {
     if (typeof v !== 'string' || !v) throw new Error(`launch: ${k} must be a non-empty string`);
   }
@@ -263,18 +284,33 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     '--setenv', 'HTTPS_PROXY', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'http_proxy', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'https_proxy', `http://127.0.0.1:${proxyPort}`,
+    // Node's built-in fetch ignores the proxy variables unless this is set.
+    '--setenv', 'NODE_USE_ENV_PROXY', '1',
   );
   if (caBundle) {
     for (const v of CA_ENV_VARS) args.push('--setenv', v, '/run/sbx/ca-bundle.pem');
   }
+  // M5: the host environment never enters. The default list and `env.pass` are read from this
+  // process; then `env.set`, one placeholder per secret, and `extraEnv` (last wins).
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && PASS_DEFAULT.test(k)) args.push('--setenv', k, v);
+  }
+  for (const k of env.pass ?? []) {
+    const v = process.env[k];
+    if (v !== undefined) args.push('--setenv', k, v);
+  }
+  for (const [k, v] of Object.entries(env.set ?? {})) args.push('--setenv', k, String(v));
+  for (const [k, v] of Object.entries(env.placeholders ?? {})) args.push('--setenv', k, String(v));
   for (const [k, v] of Object.entries(extraEnv)) args.push('--setenv', k, String(v));
   const door = String(proxyPort);
   const inner = 'ip link set lo up 2>/dev/null; ' +
     `socat TCP-LISTEN:${door},bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/sbx/agent.sock & ` +
     `ok=; for i in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/${door}) 2>/dev/null && { ok=1; break; }; sleep 0.1; done; ` +
     '[ -n "$ok" ] || exit 99; exec "$@"';
-  const child = spawn('bwrap', [...args, '/usr/bin/bash', '-c', inner, 'bash', ...command],
-    { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(bwrapBin(), [...args, '/usr/bin/bash', '-c', inner, 'bash', ...command],
+    // A clean spawn environment: bwrap's own pid-1 process keeps the environment it was started
+    // with (it is `/proc/1/environ` inside), so the host's must not be it.
+    { stdio: ['ignore', 'pipe', 'pipe'], env: { PATH: '/usr/bin:/bin' } });
   // No `.overlay` on the child: the tracing paper's address is one call,
   // `runtimePaths(runtime).overlay(agent)`, so there is nothing to keep in sync.
   return child;

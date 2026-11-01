@@ -164,7 +164,7 @@ async function run(args) {
     usage();
   }
   if (values.mode !== undefined && !MODES.includes(values.mode)) usage();
-  /** @type {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number }} */
+  /** @type {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number, env?: { pass?: string[], set?: Record<string, string> }, secrets?: Record<string, { fromEnv?: string, value?: string, hosts: string[] }> }} */
   let cfg;
   try {
     cfg = resolveConfig({ mode: values.mode });
@@ -211,7 +211,7 @@ async function run(args) {
       .map((s) => s.trim()).filter(Boolean);
     result = await sandboxRun({
       runtime, proj: process.cwd(), command, mode, timeoutMs,
-      allowLocal: cfg.localLlm, labels,
+      allowLocal: cfg.localLlm, labels, secrets: cfg.secrets, env: cfg.env,
       ...(cfg.heldBodyMaxMB ? { heldBodyMaxBytes: cfg.heldBodyMaxMB * 1048576 } : {}),
       unsafeTestOnly: { allowLoopback: process.env.SBX_UNSAFE_TEST_ALLOW_LOOPBACK === '1' },
       overlay,

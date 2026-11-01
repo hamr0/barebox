@@ -39,9 +39,9 @@ Three letters, each handled differently — the same `r`/`w`/`x` as [bareguard](
 The agent works in your house:
 
 - **Tracing paper (w).** The agent sees your real files, but every change lands on an overlay laid over them. At the end you commit it or roll it back (`sbx run --overlay -- <cmd>`, then `sbx diff`, `sbx commit`, `sbx rollback`).
-- **Locked drawers (r).** It reads most things. Keys and password stores (`~/.ssh`, `~/secrets`, `~/.gnupg`, `~/.password-store`, keyrings), browser profiles, cloud and cluster credentials (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/op`) and token files (`~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.cargo/credentials.toml`) stay shut. The agent's own model credentials (`~/.claude`) do not; moving those out is M5.
+- **Locked drawers (r).** It reads most things. Keys and password stores (`~/.ssh`, `~/secrets`, `~/.gnupg`, `~/.password-store`, keyrings), browser profiles, cloud and cluster credentials (`~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/op`) and token files (`~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.cargo/credentials.toml`) stay shut. The agent's own model credentials (`~/.claude`) do not (a known gap: those tokens refresh themselves).
 - **One front door with a doorman (x).** No network of its own. Lookups pass; anything that sends, pays, or publishes waits for your yes.
-- **Keys it never holds.** The agent types a placeholder; the doorman puts the real API key in the request header only after you approve that request.
+- **Keys it never holds.** The agent types a placeholder; the doorman puts the real API key in the request header only after the request is allowed, and only for the hosts that key is bound to. Your environment does not reach the sandbox.
 
 ## What it isn't
 
@@ -74,6 +74,21 @@ The agent works in your house:
 - **HTTPS inspection** uses a local CA that exists only inside the sandbox; the proxy reads method, URL, headers and body, then forwards.
 - **The doorman's x-rules**, strongest first: card numbers in the body (Luhn) → payment paths (`/checkout`, `/payment`, `/orders`, `/purchase`; a list of payment domains is not built) → rwxmap labels for known APIs → every other request by its letter and the mode (`ask`, `auto`, `trust`; see `barebox.context.md`). The card and payment floor asks in every mode, `trust` included; card numbers are checked in bodies of 64 KB or less.
 - **Approvals** come from a second terminal (`sbx pending`, `sbx approve <id>`, `sbx deny <id>`). Timeout means deny, with a clear `403` reason. One held request per agent at a time: later ones wait in line (16 at most, then `429 hold queue full`), and the deadline counts from arrival.
+
+## Keys the agent never holds
+
+Put the key in `~/.config/barebox/config.json`, bound to its hosts:
+
+```json
+{
+  "secrets": {
+    "STRIPE_API_KEY": { "fromEnv": "REAL_STRIPE_KEY", "hosts": ["api.stripe.com"] }
+  },
+  "env": { "pass": ["MY_TOOL_HOME"] }
+}
+```
+
+Inside the sandbox `$STRIPE_API_KEY` is a random placeholder, new each run. The agent sends it as it would the key (`curl -H "Authorization: Bearer $STRIPE_API_KEY"`, `curl -u "$STRIPE_API_KEY:"`). The proxy swaps the real value into the request headers only after the request is allowed, and only for `api.stripe.com`. A denied request never leaves. The same placeholder sent to any other host is refused: `403 denied: secret.host`. A real value is swapped only into a request that goes upstream over TLS: a placeholder to a bound host over plain `http://` is refused `403 denied: secret.scheme`. The rest of your environment stays out too, except a short default list (`TERM`, `LANG`, `LC_*`, `TZ`, ...) and the names in `env.pass`; `env.pass` refuses names like `*_TOKEN` and `*_KEY` (use `secrets`). Headers only. Details: `barebox.context.md`.
 
 ## Numbers
 
@@ -111,11 +126,11 @@ M0–M2 are the go/no-go. Later: macOS (`sandbox-exec` + APFS clones), Windows v
 npm install barebox
 ```
 
-Requires Node.js >= 22. Two production dependencies, [bareguard](https://npmjs.com/package/bareguard) (the gate) and [rwxmap](https://npmjs.com/package/rwxmap) (the labels), pinned exactly. Needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap. CI builds bubblewrap 0.12.0 from a checksum-pinned source tarball and fails if any test is skipped. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
+Requires Node.js >= 22.21. Two production dependencies, [bareguard](https://npmjs.com/package/bareguard) (the gate) and [rwxmap](https://npmjs.com/package/rwxmap) (the labels), pinned exactly. Needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollback` (Ubuntu 24.04 ships 0.9.0: build from source or use a newer distro); plain runs work with older bwrap. CI builds bubblewrap 0.12.0 from a checksum-pinned source tarball, copies its Node into `/usr/bin` (the sandbox binds `/usr` only, so a Node installed elsewhere, such as under nvm, is not found inside), and fails if any test is skipped. The API is in [`barebox.context.md`](barebox.context.md) and `primitives.json` (both ship in the package); the `sbx` CLI comes with it.
 
 ## Try the POCs
 
-Linux only, with `bwrap` (>= 0.11.0 only for the overlay), `socat`, `openssl`, Node >= 22 and Python 3. Needs a normal shell (namespaces + listening sockets), not a tool sandbox. The POCs are throwaway proofs, not the product.
+Linux only, with `bwrap` (>= 0.11.0 only for the overlay), `socat`, `openssl`, Node >= 22.21 and Python 3. Needs a normal shell (namespaces + listening sockets), not a tool sandbox. The POCs are throwaway proofs, not the product.
 
 ```
 git clone https://github.com/hamr0/barebox && cd barebox

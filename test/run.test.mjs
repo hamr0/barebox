@@ -8,7 +8,10 @@ for (const v of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
 }
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import http from 'node:http';
+import https from 'node:https';
+import tls from 'node:tls';
 import { Writable } from 'node:stream';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync,
   existsSync, renameSync, rmSync } from 'node:fs';
@@ -17,6 +20,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { run } from '../src/run.js';
+import { ensureCA, certFor } from '../src/certs.js';
 import { claimRuntime, runtimePaths } from '../src/runtime.js';
 import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
 import { setupOverlay } from '../src/overlay.js';
@@ -249,6 +253,24 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
     assert.deepEqual(readdirSync(join(rt, 'asks')), []);
   });
 
+  it('heldBodyMaxBytes takes effect: a 64-byte held POST over a 16-byte cap is 403 body too large to hold', { timeout: 60000 }, async () => {
+    const rt = join(root, 'rt-bodycap');
+    const out = capture();
+    const err = capture();
+    let asked = 0;
+    const res = await run({
+      proj, runtime: rt, heldBodyMaxBytes: 16, unsafeTestOnly: { allowLoopback: true }, timeoutMs: 15000,
+      stdout: out.stream, stderr: err.stream,
+      command: ['bash', '-c',
+        `curl -s -w '\\nHTTP:%{http_code}' --max-time 10 --data "$(head -c 64 /dev/zero | tr '\\0' a)" http://127.0.0.1:${plainUp.port}/hold; exit 0`],
+      onAsk: async () => { asked++; return { decision: 'allow' }; },
+    });
+    assert.equal(res.exit, 0, err.text());
+    assert.match(out.text(), /body too large to hold/);
+    assert.match(out.text(), /HTTP:403/);
+    assert.equal(asked, 0, 'an over-cap body is denied at the door, never asked');
+  });
+
   it('a command with no network creates a temp runtime and returns exit 0', async () => {
     const res = await run({ proj, command: ['true'] });
     assert.equal(res.exit, 0);
@@ -262,5 +284,89 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
     const res = await run({ proj, command: ['bash', '-c', 'exit 3'] });
     assert.equal(res.exit, 3);
     rmSync(dirname(res.audit), { recursive: true, force: true });
+  });
+  // M5: keys the agent never holds. The upstream records the headers it gets.
+  describe('secrets (M5)', () => {
+    const REAL = `sk_test_REAL_${Math.random().toString(36).slice(2)}${Date.now()}`;
+    // A real value is swapped only over TLS: the recording upstream is https
+    // with a cert from a fixture CA. The proxy under test trusts that CA
+    // through the host process (run() in-process: the default CA list; the CLI
+    // child: NODE_EXTRA_CA_CERTS); the sandbox trusts the proxy's own CA as always.
+    let recUp, seen, fixtureCa, certDir, savedCas;
+    before(async () => {
+      seen = [];
+      certDir = mkdtempSync(join(tmpdir(), 'bb-m5r-'));
+      await ensureCA(certDir);
+      fixtureCa = join(certDir, 'ca.pem');
+      const { key, cert } = await certFor(certDir, '127.0.0.1');
+      recUp = https.createServer({ key, cert }, (req, res) => { seen.push({ url: req.url, headers: req.headers }); req.resume(); res.end('upstream-ok'); });
+      await new Promise((r) => recUp.listen(0, '127.0.0.1', r));
+      savedCas = tls.getCACertificates('default');
+      tls.setDefaultCACertificates([...savedCas, readFileSync(fixtureCa, 'utf8')]);
+    });
+    after(async () => {
+      tls.setDefaultCACertificates(savedCas);
+      recUp.closeAllConnections?.(); await new Promise((r) => recUp.close(r));
+      rmSync(certDir, { recursive: true, force: true });
+    });
+    const upPort = () => recUp.address().port;
+    const curlBearer = (p) => `curl -s --max-time 10 -H "Authorization: Bearer $STRIPE_API_KEY" https://127.0.0.1:${upPort()}${p}`;
+
+    it('run({ secrets, env }): the upstream gets the real value; the inside holds a placeholder and no host variable', async () => {
+      seen.length = 0;
+      process.env.BB_M5_HOST = `bbhost-${Math.random().toString(36).slice(2)}`;
+      const out = capture();
+      const err = capture();
+      let res;
+      try {
+        res = await run({
+          proj, runtime: join(root, 'rt-secrets'), unsafeTestOnly: { allowLoopback: true },
+          secrets: { STRIPE_API_KEY: { value: REAL, hosts: ['127.0.0.1'] } },
+          env: { set: { BB_M5_SET: 'set-v' } },
+          stdout: out.stream, stderr: err.stream,
+          command: ['bash', '-c', `${curlBearer('/lib')}; echo; echo "key=$STRIPE_API_KEY set=$BB_M5_SET host=\${BB_M5_HOST-unset}"`],
+        });
+      } finally { delete process.env.BB_M5_HOST; }
+      assert.equal(res.exit, 0, err.text());
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].headers.authorization, `Bearer ${REAL}`);
+      const o = out.text();
+      assert.match(o, /upstream-ok/);
+      assert.match(o, /key=sbx-ph-[0-9a-f]{16} set=set-v host=unset/);
+      assert.ok(!o.includes(REAL) && !err.text().includes(REAL), 'the real value reached the agent');
+      const audit = readFileSync(res.audit, 'utf8');
+      assert.ok(!audit.includes(REAL), 'the real value is in the audit');
+      assert.match(audit, /"verdict":"secret"/);
+      assert.match(audit, /"swapped":true/);
+    });
+
+    it('run({ secrets }): a secret whose fromEnv variable is missing rejects naming the secret', async () => {
+      await assert.rejects(() => run({ proj, command: ['true'], secrets: { NOPE_KEY: { fromEnv: 'BB_M5_NOT_SET', hosts: ['a.test'] } } }),
+        (e) => e.message === 'secret NOPE_KEY: no value');
+    });
+
+    it('sbx run with a config secret: curl -H "Authorization: Bearer $NAME" inside reaches the bound upstream with the real value', { timeout: 60000 }, async () => {
+      seen.length = 0;
+      const xdg = join(root, 'xdg-cli');
+      mkdirSync(join(xdg, 'barebox'), { recursive: true });
+      writeFileSync(join(xdg, 'barebox', 'config.json'), JSON.stringify({
+        secrets: { STRIPE_API_KEY: { fromEnv: 'BB_M5_FROM', hosts: ['127.0.0.1'] } },
+        env: { pass: ['BB_M5_PASSED'] },
+      }));
+      const cli = join(dirname(fileURLToPath(import.meta.url)), '..', 'src/cli.js');
+      const r = await new Promise((resolve) => {
+        execFile('node', [cli, 'run', '--', 'bash', '-c',
+          `${curlBearer('/cli')}; echo; echo "key=$STRIPE_API_KEY from=\${BB_M5_FROM-unset} passed=$BB_M5_PASSED"`],
+        { cwd: proj, encoding: 'utf8', timeout: 50000,
+          env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: xdg, BB_M5_FROM: REAL, BB_M5_PASSED: 'pass-v',
+            SBX_UNSAFE_TEST_ALLOW_LOOPBACK: '1', NODE_EXTRA_CA_CERTS: fixtureCa } },
+        (error, stdout, stderr) => resolve({ code: error ? error.code : 0, stdout, stderr }));
+      });
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(seen.length, 1, r.stdout + r.stderr);
+      assert.equal(seen[0].headers.authorization, `Bearer ${REAL}`);
+      assert.match(r.stdout, /key=sbx-ph-[0-9a-f]{16} from=unset passed=pass-v/);
+      assert.ok(!r.stdout.includes(REAL) && !r.stderr.includes(REAL), 'the real value reached the terminal');
+    });
   });
 });

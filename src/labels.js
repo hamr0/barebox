@@ -30,6 +30,12 @@ function readJson(file) {
  * @param {NodeJS.ProcessEnv} [env] environment for `$HOME`
  * @returns {{ matcher: ReturnType<typeof matcherFrom>, tools: Record<string, any>, dirs: string[] }} `dirs` are the absolute folders (the launcher masks them)
  * @throws {Error} naming the file or folder on a missing gate or review file, a duplicate key, an unknown tenant vendor or a bad sidecar
+ * @when Reach for this to build the `labels` value `run()` and `createProxy()` take: it reads rwxmap label folders once at startup and returns the request matcher, the tools table (letters from each gate file) and the absolute folders.
+ * @fails Throws, naming the file or folder, on a folder with no review file, a review file without its gate file, a duplicate key across vendors, a tenants vendor no folder defines, an unreadable folder, or a label file written before rwxmap 0.8.0.
+ * @example
+ * import { loadLabels, run } from "barebox";
+ * const labels = loadLabels({ labels: ["/home/me/labels/jira"], tenants: { jira: ["https://acme.atlassian.net"] } });
+ * await run({ proj: "/tmp/proj", command: ["bash", "-c", "true"], labels });
  */
 export function loadLabels({ labels = [], tenants = {} }, env = process.env) {
   const home = env.HOME || os.homedir();

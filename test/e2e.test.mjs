@@ -99,6 +99,17 @@ describe(`end-to-end (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}` : 
     }
   });
 
+  it("node's built-in fetch inside goes through the proxy (NODE_USE_ENV_PROXY)", async () => {
+    const c = launch({ runtime: rt, agent: 'e2e', proj, socket: sock,
+      caFile: proxy.caFile,
+      command: ['node', '-e',
+        `fetch('https://127.0.0.1:${tlsUp.port}/?m=nodefetch').then((r) => r.text()).then((t) => console.log(t), (e) => { console.error(String(e.cause || e)); process.exit(1); })`] });
+    const r = await run(c);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out.trim(), 'local-ok');
+    await waitFor(() => /nodefetch/.test(log()), 'log line for the node fetch');
+  });
+
   it('agent curls the fixture through the proxy, logged under its name', async () => {
     const c = launch({ runtime: rt, agent: 'e2e', proj, socket: sock,
       caFile: proxy.caFile,

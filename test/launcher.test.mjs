@@ -1,5 +1,5 @@
 // Launcher tests: validation pure, walls need bwrap (real shell/CI, not sandbox).
-import { describe, it, before, after } from 'node:test';
+import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
@@ -84,7 +84,9 @@ describe('launch validation (no sandbox needed)', () => {
 });
 
 describe('mount order for a project under $HOME (no sandbox needed)', () => {
-  // Setup-independent: a fake `bwrap` on PATH records its argv and exits 0,
+  // Setup-independent: a fake `bwrap` on PATH records its argv and exits 0
+  // (to a path baked into the script: launch() spawns bwrap with a clean
+  // environment, so the fake inherits nothing),
   // so the mount ORDER is asserted without any sandbox. bwrap mounts cover
   // what is below them (later wins), so $HOME read-only must come FIRST,
   // then the project (overlay or read-only), then locked-path tmpfs masks,
@@ -95,7 +97,7 @@ describe('mount order for a project under $HOME (no sandbox needed)', () => {
     binDir = mkdtempSync(join(tmpdir(), 'bb-fakebin-'));
     const out = join(binDir, 'args');
     writeFileSync(join(binDir, 'bwrap'),
-      '#!/bin/sh\n[ "$1" = "--version" ] && { echo "bubblewrap 0.12.0"; exit 0; }\nprintf \'%s\\n\' "$@" > "$BB_ARGS_FILE"\nexit 0\n');
+      `#!/bin/sh\n[ "$1" = "--version" ] && { echo "bubblewrap 0.12.0"; exit 0; }\nprintf '%s\\n' "$@" > '${out}'\nexit 0\n`);
     chmodSync(join(binDir, 'bwrap'), 0o755);
     prevPath = process.env.PATH;
     process.env.PATH = `${binDir}${delimiter}${prevPath}`;
@@ -220,7 +222,7 @@ describe('locked file masks (no sandbox needed)', () => {
   before(() => {
     binDir = mkdtempSync(join(tmpdir(), 'bb-fakebin-'));
     writeFileSync(join(binDir, 'bwrap'),
-      '#!/bin/sh\n[ "$1" = "--version" ] && { echo "bubblewrap 0.12.0"; exit 0; }\nprintf \'%s\\n\' "$@" > "$BB_ARGS_FILE"\nexit 0\n');
+      `#!/bin/sh\n[ "$1" = "--version" ] && { echo "bubblewrap 0.12.0"; exit 0; }\nprintf '%s\\n' "$@" > '${join(binDir, 'args')}'\nexit 0\n`);
     chmodSync(join(binDir, 'bwrap'), 0o755);
     prevPath = process.env.PATH;
     process.env.PATH = `${binDir}${delimiter}${prevPath}`;
@@ -386,6 +388,95 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     const c = launch({ runtime: rt, agent: 't0', proj, command: ['true'] });
     const r = await run(c);
     assert.equal(r.code, 0, r.err);
+  });
+
+  describe('the inside gets a chosen environment, not the host\'s (M5)', () => {
+    // The needle is a random host variable; it is fed as an argument and only
+    // /proc/*/environ and files are searched, so its own place in the search's
+    // command line is never what is found. A control needle that IS in a file
+    // shows the search can find something.
+    const ENV_SEARCH = [
+      'n=$(grep -alF -- "$1" /proc/[0-9]*/environ 2>/dev/null | wc -l)',
+      'f=$(ls /proc/[0-9]*/environ 2>/dev/null | wc -l)',
+      'p=$(grep -acF -- "$1" /proc/1/environ 2>/dev/null)',
+      'echo "HITS=$n FILES=$f PID1=${p:-0}"',
+    ].join('\n');
+    const saved = {};
+    const setHost = (o) => { for (const [k, v] of Object.entries(o)) { saved[k] = process.env[k]; process.env[k] = v; } };
+    afterEach(() => {
+      for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    });
+
+    it('a host variable is in no process\'s environ inside, /proc/1 included', async () => {
+      const needle = `bbhost-${Math.random().toString(36).slice(2)}${Date.now()}`;
+      setHost({ BB_HOST_ONLY: needle });
+      await listenSock('te1');
+      const c = launch({ runtime: rt, agent: 'te1', proj, command: ['bash', '-c', ENV_SEARCH, 'x', needle] });
+      const r = await run(c);
+      assert.equal(r.code, 0, r.err);
+      assert.match(r.out, /HITS=0 FILES=\d+ PID1=0/, r.out);
+      assert.ok(Number(/FILES=(\d+)/.exec(r.out)[1]) >= 2, `the search must have files to read: ${r.out}`);
+    });
+
+    it('the search can fail: a variable that IS passed is found in environ', async () => {
+      const needle = `bbpass-${Math.random().toString(36).slice(2)}${Date.now()}`;
+      setHost({ BB_HOST_ONLY: needle });
+      await listenSock('te2');
+      const c = launch({ runtime: rt, agent: 'te2', proj, env: { pass: ['BB_HOST_ONLY'] },
+        command: ['bash', '-c', ENV_SEARCH, 'x', needle] });
+      const r = await run(c);
+      assert.equal(r.code, 0, r.err);
+      assert.doesNotMatch(r.out, /HITS=0 /, r.out);
+    });
+
+    it('the placeholder is under its name; TERM, an env.pass name and env.set pass; an unlisted host variable does not', async () => {
+      setHost({ TERM: 'bb-term', BB_PASSED: 'passed-v', BB_UNLISTED: 'nope' });
+      await listenSock('te3');
+      const c = launch({ runtime: rt, agent: 'te3', proj,
+        env: { pass: ['BB_PASSED'], set: { BB_SET: 'set-v' }, placeholders: { BB_KEY: 'sbx-ph-0123456789abcdef' } },
+        extraEnv: { BB_EXTRA: 'extra-v' },
+        command: ['bash', '-c', 'echo "$TERM|$BB_PASSED|$BB_SET|$BB_KEY|$BB_EXTRA|${BB_UNLISTED-unset}"'] });
+      const r = await run(c);
+      assert.equal(r.code, 0, r.err);
+      assert.equal(r.out.trim(), 'bb-term|passed-v|set-v|sbx-ph-0123456789abcdef|extra-v|unset');
+    });
+
+    it('the proxy variables, NODE_USE_ENV_PROXY=1 included, are set inside', async () => {
+      await listenSock('te3b');
+      const c = launch({ runtime: rt, agent: 'te3b', proj,
+        command: ['bash', '-c', 'echo "$NODE_USE_ENV_PROXY"'] });
+      const r = await run(c);
+      assert.equal(r.code, 0, r.err);
+      assert.equal(r.out.trim(), '1');
+    });
+
+    it('later layers win: set over pass, placeholder over set, extraEnv over all', async () => {
+      setHost({ BB_L: 'host' });
+      await listenSock('te4');
+      const c = launch({ runtime: rt, agent: 'te4', proj,
+        env: { pass: ['BB_L'], set: { BB_L: 'set', BB_M: 'set' }, placeholders: { BB_M: 'ph', BB_N: 'ph' } },
+        extraEnv: { BB_N: 'extra' },
+        command: ['bash', '-c', 'echo "$BB_L|$BB_M|$BB_N"'] });
+      const r = await run(c);
+      assert.equal(r.code, 0, r.err);
+      assert.equal(r.out.trim(), 'set|ph|extra');
+    });
+
+    it('a real value is in no file under the fixture $HOME or /tmp inside; a control needle is found', async () => {
+      const real = `sk_REAL_${Math.random().toString(36).slice(2)}${Date.now()}`;
+      const control = `bbctl-${Math.random().toString(36).slice(2)}${Date.now()}`;
+      setHost({ BB_REAL_SRC: real });
+      writeFileSync(join(home, 'control.txt'), `${control}\n`);
+      const files = 'echo "REAL=$(grep -rIlF -- "$1" "$HOME" /tmp 2>/dev/null | wc -l) CONTROL=$(grep -rIlF -- "$2" "$HOME" /tmp 2>/dev/null | sort -u | wc -l)"';
+      try {
+        await listenSock('te5');
+        const c = launch({ runtime: rt, agent: 'te5', proj, env: { placeholders: { BB_KEY: 'sbx-ph-aaaaaaaaaaaaaaaa' } },
+          command: ['bash', '-c', files, 'x', real, control] });
+        const r = await run(c);
+        assert.equal(r.code, 0, r.err);
+        assert.equal(r.out.trim(), 'REAL=0 CONTROL=1');
+      } finally { rmSync(join(home, 'control.txt'), { force: true }); }
+    });
   });
 
   it('runs the agent in its own session, detached from our terminal', async () => {
