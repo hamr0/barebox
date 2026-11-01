@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - A secret's placeholder in the URL path or query is refused `403 denied: secret.url` in every mode, before the gate. Keys are swapped in headers only; before, the placeholder was sent as is and the API answered 401 with no hint why.
 - The agent's `node` is the host's: the Node install that runs barebox (`process.execPath`, or `launch({ nodeExec })`) is bound read-only and its `bin` dir put first on the inside `PATH` when it lives outside `/usr`, `$HOME` and the project (nvm, fnm, asdf, a CI toolcache). An exec in a `bin/` dir binds the dir above it, where npm and global CLIs live; any other layout binds only its own dir. It is never bound when that dir is `/`, `$HOME` or above it (then it is not on `PATH` either, and `sbx run` says so on stderr).
+- A runtime or project under the bound Node install is safe: the runtime is masked like one under `$HOME` (its `asks/`, `answers/` and `socks/` are not visible), a project there keeps its overlay writable, and `launch()` throws when the runtime IS the Node install dir (or `/etc`, `/usr`).
 
 ### Fixed
 

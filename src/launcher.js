@@ -157,13 +157,13 @@ export function buildCaBundle(runtime, caFile) {
  * @param {{ pass?: string[], set?: Record<string, string>, placeholders?: Record<string, string> }} [opts.env] the inside's environment (M5). The host environment never reaches it except: a short default list (`TERM`, `COLORTERM`, `LANG`, `LANGUAGE`, `LC_*`, `TZ`, `USER`, `LOGNAME`, `SHELL`, `EDITOR`, `PAGER`), the host variables named in `pass`, the values in `set`, and one placeholder per secret under its own name (`placeholders`, name to value). Set in that order, then `extraEnv`.
  * @param {string|null} [opts.socket] agent socket path, as returned by `proxy.addAgent` (default `<runtime>/socks/<agent>.sock`; the two must agree)
  * @param {string|null} [opts.caFile] barebox CA cert path (from `proxy.caFile`); when set, the sandbox trusts it for HTTPS alongside the system roots
- * @param {string} [opts.nodeExec] the node executable to run inside (default: this process's `process.execPath`). The install is a `bin/` layout's parent dir (npm and global CLIs live there) or, for any other layout, the exec's own dir. It is bound read-only with the exec's dir first on the inside PATH, unless already visible there (under `/usr`, `$HOME` or the project). Never bound when it is `/`, `$HOME` or above it: then it is not on PATH either (see `hostNode` in `src/runtime.js`)
+ * @param {string} [opts.nodeExec] the node executable to run inside (default: this process's `process.execPath`). The install is a `bin/` layout's parent dir (npm and global CLIs live there) or, for any other layout, the exec's own dir. It is bound read-only with the exec's dir first on the inside PATH, unless already visible there (under `/usr`, `$HOME` or the project). Never bound when it is `/`, `$HOME` or above it: then it is not on PATH either (see `hostNode` in `src/runtime.js`). A runtime or project under the install is masked or mounted over it, so the bind never exposes either
  * @param {string[]} [opts.maskDirs] extra folders hidden from the agent exactly like barebox's config dir (the `labels` folders: the agent must not read or rewrite a letter)
  * @param {boolean} [opts.overlay] when true, mount a per-run overlay upper over the project (M4 tracing paper) instead of binding it read-only; diff/commit/rollback address it as `runtimePaths(runtime).overlay(agent)`
  * @param {string[]} [opts.overlayIgnore] path segments invisible to the overlay (default `node_modules`; see overlay.js Q3)
  * @returns {import('node:child_process').ChildProcess} the bwrap child (stdio piped); `close` gives its exit code
  * @when Reach for this to HARNESS-ONLY start one sandboxed agent run: it creates the sandbox the agent lives in. It does not decide anything; combine with the proxy for the front door and the gate (M3) for policy. Pass overlay:true for a writable tracing-paper run (M4). The agent starts in the project dir.
- * @fails Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on a non-integer `proxyPort`, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, when `runtime` IS `HOME` or the project dir (its sockets could not be hidden from the agent), or with overlay on when the runtime sits inside the project or uncommitted changes linger. The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.
+ * @fails Throws synchronously on a missing/empty `runtime`, `agent`, `proj`, or `command`, on a bad agent name, on a non-integer `proxyPort`, on an over-long socket path, when `socket` disagrees with `<runtime>/socks/<agent>.sock`, when `runtime` IS `HOME`, the project dir, `/etc`, `/usr` or the bound Node install dir (its sockets could not be hidden from the agent), or with overlay on when the runtime sits inside the project or uncommitted changes linger. The child fails at runtime (nonzero exit) when `bwrap` or `socat` is missing inside, or when nothing listens on the agent socket.
  * @example
  * import { launch } from "barebox";
  * const child = launch({ runtime: "/tmp/sbx", agent: "fx", proj: "/tmp/proj", command: ["bash", "-c", "echo hi"] });
@@ -211,7 +211,11 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     '--ro-bind', '/usr', '/usr',
     '--symlink', 'usr/lib64', '/lib64',
     '--ro-bind', '/etc', '/etc',
-    // $HOME first, the project second: a project under $HOME would otherwise
+    // The Node install first: a project or runtime inside it must win over it.
+    // It never holds $HOME and is never inside $HOME, /usr or the project (then
+    // it is not bound), so the only overlap is a project or runtime under it.
+    ...(nodeBind ? ['--ro-bind', nodeBind, nodeBind] : []),
+    // $HOME next, the project after: a project under $HOME would otherwise
     // vanish under the home bind (bwrap mounts cover what is below them —
     // the later mount wins where they overlap). The project mount (overlay
     // or read-only) therefore lands on top of the read-only home.
@@ -221,7 +225,6 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     ...(ov
       ? ['--overlay-src', proj, '--overlay', ov.upper, ov.work, proj]
       : ['--ro-bind', proj, proj]),
-    ...(nodeBind ? ['--ro-bind', nodeBind, nodeBind] : []),
     '--chdir', proj,
     // Always detach from our controlling terminal: otherwise the agent could
     // open /dev/tty and TIOCSTI keystrokes into it (e.g. into `sbx approve`)
@@ -256,21 +259,21 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
     // resolved), so a runtime passed as a symlink from outside $HOME/proj
     // can still land inside it and stay visible through the ro-binds — the
     // mask below covers that spelling too.
-    const hm = join(home);
-    const pr = join(proj);
+    // Every root the sandbox binds: (real path, the spelling bwrap sees).
+    const bases = roots.map((r) => [realPathOf(join(r)), join(r)]);
     const realRt = realPathOf(join(runtime));
-    const realHm = realPathOf(hm);
-    const realPr = realPathOf(pr);
     // One real-path comparison: a lexically-equal spelling resolves to the
     // same real path, so it is subsumed here.
-    if (realRt === realHm || realRt === realPr) {
-      throw new Error(`launch: runtime must not be ${realRt === realHm ? 'HOME' : 'the project dir'} itself (its sockets cannot be hidden there)`);
+    const same = bases.findIndex(([realBase]) => realRt === realBase);
+    if (same >= 0) {
+      const what = same === 0 ? 'HOME' : same === 1 ? 'the project dir' : roots[same] === nodeBind ? 'the Node install dir' : roots[same];
+      throw new Error(`launch: runtime must not be ${what} itself (its sockets cannot be hidden there)`);
     }
-    // Mask the sandbox-visible spelling join(home, relative(realHome, realRt))
-    // (likewise proj): where nothing is a symlink this IS the lexical path,
-    // so no separate lexical mask is needed.
-    for (const [realBase, baseSpelling] of [[realHm, hm], [realPr, pr]]) {
-      if (realRt !== realBase && isInside(realBase, realRt)) {
+    // Mask the sandbox-visible spelling join(root, relative(realRoot, realRt)):
+    // where nothing is a symlink this IS the lexical path, so no separate
+    // lexical mask is needed.
+    for (const [realBase, baseSpelling] of bases) {
+      if (isInside(realBase, realRt)) {
         const m = join(baseSpelling, relative(realBase, realRt));
         if (!args.includes(m)) args.push('--tmpfs', m);
       }

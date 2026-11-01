@@ -1044,3 +1044,70 @@ describe('the host node runs inside (needs bwrap)', { skip: NEED_SANDBOX }, () =
     } finally { rmSync(root, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
   });
 });
+
+describe('the Node install bind never exposes the runtime or shadows the project (needs bwrap)', { skip: NEED_SANDBOX }, () => {
+  // B is short: socket paths cap at 107 bytes. node at B/bin/node, so the install dir is B.
+  let B, savedHome, home;
+  before(() => {
+    B = mkdtempSync('/tmp/sbx-nb-');
+    mkdirSync(join(B, 'bin'));
+    symlinkSync(process.execPath, join(B, 'bin', 'node'));
+    home = mkdtempSync('/tmp/sbx-nbh-');
+    savedHome = process.env.HOME;
+    process.env.HOME = home;
+  });
+  after(() => {
+    process.env.HOME = savedHome;
+    rmSync(B, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
+  });
+  const nodeExec = () => join(B, 'bin', 'node');
+
+  it('a runtime under the node install is masked: its asks and sockets are not there to list or read', { timeout: 30000 }, async () => {
+    const rt = join(B, 'rt'); const proj = join(B, 'p0');
+    mkdirSync(join(rt, 'asks'), { recursive: true }); mkdirSync(join(rt, 'socks'));
+    mkdirSync(proj);
+    writeFileSync(join(rt, 'asks', 'h1.json'), '{"ask":"secret-ask"}\n');
+    const srv = net.createServer((s) => s.resume());
+    await new Promise((res, rej) => { srv.on('error', rej); srv.listen(join(rt, 'socks', 'a.sock'), res); });
+    try {
+      const script = 'echo "asks=[$(ls -A "$0/asks")] socks=[$(ls -A "$0/socks")]"; cat "$0/asks/h1.json" 2>&1; echo "cat=$?"';
+      const c = launch({ runtime: rt, agent: 'a', proj, nodeExec: nodeExec(), command: ['bash', '-c', script, rt] });
+      // the agent socket is the sandbox's own door; it must exist for the bridge
+      const r = await run(c);
+      assert.equal(r.out.split('\n').slice(0, 1).join(), 'asks=[] socks=[]', r.out + r.err);
+      assert.ok(!r.out.includes('secret-ask'), r.out);
+      assert.match(r.out, /No such file or directory/);
+      assert.match(r.out, /cat=1\n/);
+    } finally { await new Promise((res) => { srv.close(res); srv.closeAllConnections?.(); }); }
+  });
+
+  it('a project under the node install keeps its overlay: writes land, the host file is untouched', { timeout: 30000 }, async () => {
+    const rt = join(B, 'rt2'); const proj = join(B, 'proj');
+    mkdirSync(join(rt, 'socks'), { recursive: true }); mkdirSync(proj);
+    execFileSync('git', ['init', '-q'], { cwd: proj });
+    writeFileSync(join(proj, 'f'), 'orig\n');
+    execFileSync('git', ['add', 'f'], { cwd: proj });
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'i'], { cwd: proj });
+    const srv = net.createServer((s) => s.resume());
+    await new Promise((res, rej) => { srv.on('error', rej); srv.listen(join(rt, 'socks', 'b.sock'), res); });
+    try {
+      const c = launch({ runtime: rt, agent: 'b', proj, overlay: true, nodeExec: nodeExec(),
+        command: ['bash', '-c', 'echo new > f && cat f'] });
+      const r = await run(c);
+      assert.equal(r.code, 0, r.err);
+      assert.equal(r.out, 'new\n');
+      assert.equal(readFileSync(join(proj, 'f'), 'utf8'), 'orig\n');
+    } finally { await new Promise((res) => { srv.close(res); srv.closeAllConnections?.(); }); }
+  });
+
+  it('a runtime that IS the node install throws (it cannot be masked without hiding node)', () => {
+    const flat = mkdtempSync('/tmp/sbx-nbf-');
+    try {
+      writeFileSync(join(flat, 'node'), '');
+      const proj = join(flat, '..', 'sbx-nb-none');
+      assert.throws(() => launch({ runtime: flat, agent: 'c', proj, command: ['true'], nodeExec: join(flat, 'node') }),
+        /launch: runtime must not be the Node install dir itself \(its sockets cannot be hidden there\)/);
+    } finally { rmSync(flat, { recursive: true, force: true }); }
+  });
+});
