@@ -8,7 +8,8 @@ for (const v of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
 }
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import http from 'node:http';
 import { Writable } from 'node:stream';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync,
   existsSync, renameSync, rmSync } from 'node:fs';
@@ -280,5 +281,75 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
     const res = await run({ proj, command: ['bash', '-c', 'exit 3'] });
     assert.equal(res.exit, 3);
     rmSync(dirname(res.audit), { recursive: true, force: true });
+  });
+  // M5: keys the agent never holds. The upstream records the headers it gets.
+  describe('secrets (M5)', () => {
+    const REAL = `sk_test_REAL_${Math.random().toString(36).slice(2)}${Date.now()}`;
+    let recUp, seen;
+    before(async () => {
+      seen = [];
+      recUp = http.createServer((req, res) => { seen.push({ url: req.url, headers: req.headers }); req.resume(); res.end('upstream-ok'); });
+      await new Promise((r) => recUp.listen(0, '127.0.0.1', r));
+    });
+    after(async () => { recUp.closeAllConnections?.(); await new Promise((r) => recUp.close(r)); });
+    const upPort = () => recUp.address().port;
+    const curlBearer = (p) => `curl -s --max-time 10 -H "Authorization: Bearer $STRIPE_API_KEY" http://127.0.0.1:${upPort()}${p}`;
+
+    it('run({ secrets, env }): the upstream gets the real value; the inside holds a placeholder and no host variable', async () => {
+      seen.length = 0;
+      process.env.BB_M5_HOST = `bbhost-${Math.random().toString(36).slice(2)}`;
+      const out = capture();
+      const err = capture();
+      let res;
+      try {
+        res = await run({
+          proj, runtime: join(root, 'rt-secrets'), unsafeTestOnly: { allowLoopback: true },
+          secrets: { STRIPE_API_KEY: { value: REAL, hosts: ['127.0.0.1'] } },
+          env: { set: { BB_M5_SET: 'set-v' } },
+          stdout: out.stream, stderr: err.stream,
+          command: ['bash', '-c', `${curlBearer('/lib')}; echo; echo "key=$STRIPE_API_KEY set=$BB_M5_SET host=\${BB_M5_HOST-unset}"`],
+        });
+      } finally { delete process.env.BB_M5_HOST; }
+      assert.equal(res.exit, 0, err.text());
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].headers.authorization, `Bearer ${REAL}`);
+      const o = out.text();
+      assert.match(o, /upstream-ok/);
+      assert.match(o, /key=sbx-ph-[0-9a-f]{16} set=set-v host=unset/);
+      assert.ok(!o.includes(REAL) && !err.text().includes(REAL), 'the real value reached the agent');
+      const audit = readFileSync(res.audit, 'utf8');
+      assert.ok(!audit.includes(REAL), 'the real value is in the audit');
+      assert.match(audit, /"verdict":"secret"/);
+      assert.match(audit, /"swapped":true/);
+    });
+
+    it('run({ secrets }): a secret whose fromEnv variable is missing rejects naming the secret', async () => {
+      await assert.rejects(() => run({ proj, command: ['true'], secrets: { NOPE_KEY: { fromEnv: 'BB_M5_NOT_SET', hosts: ['a.test'] } } }),
+        (e) => e.message === 'secret NOPE_KEY: no value');
+    });
+
+    it('sbx run with a config secret: curl -H "Authorization: Bearer $NAME" inside reaches the bound upstream with the real value', { timeout: 60000 }, async () => {
+      seen.length = 0;
+      const xdg = join(root, 'xdg-cli');
+      mkdirSync(join(xdg, 'barebox'), { recursive: true });
+      writeFileSync(join(xdg, 'barebox', 'config.json'), JSON.stringify({
+        secrets: { STRIPE_API_KEY: { fromEnv: 'BB_M5_FROM', hosts: ['127.0.0.1'] } },
+        env: { pass: ['BB_M5_PASSED'] },
+      }));
+      const cli = join(dirname(fileURLToPath(import.meta.url)), '..', 'src/cli.js');
+      const r = await new Promise((resolve) => {
+        execFile('node', [cli, 'run', '--', 'bash', '-c',
+          `${curlBearer('/cli')}; echo; echo "key=$STRIPE_API_KEY from=\${BB_M5_FROM-unset} passed=$BB_M5_PASSED"`],
+        { cwd: proj, encoding: 'utf8', timeout: 50000,
+          env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: xdg, BB_M5_FROM: REAL, BB_M5_PASSED: 'pass-v',
+            SBX_UNSAFE_TEST_ALLOW_LOOPBACK: '1' } },
+        (error, stdout, stderr) => resolve({ code: error ? error.code : 0, stdout, stderr }));
+      });
+      assert.equal(r.code, 0, r.stderr);
+      assert.equal(seen.length, 1, r.stdout + r.stderr);
+      assert.equal(seen[0].headers.authorization, `Bearer ${REAL}`);
+      assert.match(r.stdout, /key=sbx-ph-[0-9a-f]{16} from=unset passed=pass-v/);
+      assert.ok(!r.stdout.includes(REAL) && !r.stderr.includes(REAL), 'the real value reached the terminal');
+    });
   });
 });
