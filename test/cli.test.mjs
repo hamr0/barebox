@@ -554,4 +554,37 @@ describe('sbx run process flags (needs bwrap + socket)', () => {
         rmSync(root, { recursive: true, force: true });
       }
     });
+
+  it('heldBodyMaxMB in the config file takes effect: a 100 KB POST is held, a 2 MB POST over a 1 MB cap is 403 body too large to hold',
+    { skip: skip || (hasBin('curl') && hasBin('socat') ? false : 'needs curl and socat'), timeout: 90000 }, async () => {
+      const root = mkdtempSync(join(tmpdir(), 'bb-c-cap-'));
+      const home = join(root, 'h'); const proj = join(root, 'p'); const xdg = join(root, 'xdg');
+      mkdirSync(home); mkdirSync(proj); mkdirSync(join(xdg, 'barebox'), { recursive: true });
+      writeFileSync(join(xdg, 'barebox', 'config.json'), '{"heldBodyMaxMB":1}\n');
+      const up = await startHttp();
+      let out = '', err = '';
+      try {
+        // A 100 KB body is under the 1 MB cap, so it is held (curl gives up, 000); only
+        // the 2 MB body is refused. The small one is what fails if the key stops scaling MB to bytes.
+        const post = (bytes, t) => `head -c ${bytes} /dev/zero | tr '\\0' a | curl -s -w '\\nHTTP:%{http_code}\\n' --max-time ${t} --data-binary @- http://127.0.0.1:${up.port}/hold`;
+        const child = spawn('node', [CLI, 'run', '--', 'bash', '-c',
+          `${post(102400, 3)}; ${post(2097152, 20)}; exit 0`],
+        { cwd: proj, env: { ...process.env, HOME: home, XDG_CONFIG_HOME: xdg,
+          SBX_RUNTIME: join(root, 'rt'), SBX_UNSAFE_TEST_ALLOW_LOOPBACK: '1' } });
+        child.stdout.on('data', (c) => { out += c; });
+        child.stderr.on('data', (c) => { err += c; });
+        const code = await new Promise((resolve, reject) => {
+          const t = setTimeout(() => { child.kill('SIGKILL'); reject(new Error(`sbx run timeout: ${out}${err}`)); }, 60000);
+          child.on('error', (e) => { clearTimeout(t); reject(e); });
+          child.on('close', (c) => { clearTimeout(t); resolve(c); });
+        });
+        assert.equal(code, 0, err);
+        assert.deepEqual([...(err + out).matchAll(/HTTP:(\d+)/g)].map((m) => m[1]), ['000', '403'],
+          'a 100 KB body is held, a 2 MB body is refused');
+        assert.match(err + out, /body too large to hold/);
+      } finally {
+        await up.close();
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
 });

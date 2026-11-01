@@ -249,6 +249,24 @@ describe(`run sandboxed (needs bwrap+unix+socat+curl${SKIP_WHY ? `: ${SKIP_WHY}`
     assert.deepEqual(readdirSync(join(rt, 'asks')), []);
   });
 
+  it('heldBodyMaxBytes takes effect: a 64-byte held POST over a 16-byte cap is 403 body too large to hold', { timeout: 60000 }, async () => {
+    const rt = join(root, 'rt-bodycap');
+    const out = capture();
+    const err = capture();
+    let asked = 0;
+    const res = await run({
+      proj, runtime: rt, heldBodyMaxBytes: 16, unsafeTestOnly: { allowLoopback: true }, timeoutMs: 15000,
+      stdout: out.stream, stderr: err.stream,
+      command: ['bash', '-c',
+        `curl -s -w '\\nHTTP:%{http_code}' --max-time 10 --data "$(head -c 64 /dev/zero | tr '\\0' a)" http://127.0.0.1:${plainUp.port}/hold; exit 0`],
+      onAsk: async () => { asked++; return { decision: 'allow' }; },
+    });
+    assert.equal(res.exit, 0, err.text());
+    assert.match(out.text(), /body too large to hold/);
+    assert.match(out.text(), /HTTP:403/);
+    assert.equal(asked, 0, 'an over-cap body is denied at the door, never asked');
+  });
+
   it('a command with no network creates a temp runtime and returns exit 0', async () => {
     const res = await run({ proj, command: ['true'] });
     assert.equal(res.exit, 0);
