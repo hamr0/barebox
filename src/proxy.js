@@ -23,6 +23,7 @@ import { ASK_BODY_LIMIT, DEFAULT_HOLD_MAX_BODY, bodyPreview, createHolds } from 
 import { claimRuntime, ensurePrivateDir, runtimePaths } from './runtime.js';
 import { paymentPath, toolFor, buildTools, emptyMatcher } from './policy.js';
 import { checkUpstream } from './wall.js';
+import { findPlaceholders, applySecrets } from './secrets.js';
 import { Gate } from 'bareguard';
 
 const AGENT = Symbol('agent');
@@ -60,6 +61,7 @@ const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
  *   so tests pass this; production never should.
  * @property {(host: string) => Promise<string[] | string | null>} [unsafeTestOnly.resolveUpstream]
  *   DNS stub: replaces the wall's resolver so rebinding is testable. Production omits it.
+ * @property {import('./secrets.js').Secret[]} [secrets] the loaded secrets (`loadSecrets`): a request carrying a secret's placeholder in a header gets the real value there only after the gate allowed it and only for a bound host; for any other host it is refused `403 denied: secret.host`. The value never reaches the audit file, an ask or an error body.
  * @property {number} [clientIdleMs] kill a client tunnel idle this long; never fires mid-request (default 60000)
  * @property {(entry: Record<string, unknown>) => Record<string, unknown>} [redact] log redaction hook, applied after built-in secret scrubbing; its result becomes the `meta` of an `annotate` line (default: identity)
  */
@@ -123,7 +125,7 @@ export function createProxy(opts) {
   const { logFile, runtime, port = null,
     upstreamCa = null, hold = null, gateFor = null, allowLocal = [], labels = null,
     upstreamTimeoutMs = 120000, clientIdleMs = 60000,
-    unsafeTestOnly = null,
+    unsafeTestOnly = null, secrets = [],
     redact = (e) => e } = opts ?? {};
   const { allowLoopback = false, resolveUpstream = null } = unsafeTestOnly ?? {};
   const gate = {
@@ -660,6 +662,27 @@ export function createProxy(opts) {
       denyRes(cres, 403, verdict.reason);
       return;
     }
+    // The request's one id: the audit lines of its secret swap, its body and
+    // its gate decision all carry it.
+    const rid = `r${++ridN}`;
+    // M5: a placeholder is found before the gate and swapped only after it
+    // allows (`withSecrets`), so the real value never sits in `ctx.headers`
+    // while the request waits for a decision. A placeholder headed for a host
+    // its secret is not bound to is refused in every mode.
+    const found = secrets.length ? findPlaceholders(creq.headers, url.hostname, secrets) : [];
+    const unbound = found.filter((f) => !f.bound);
+    if (unbound.length) {
+      for (const f of unbound) log({ ev: 'secret', agent, rid, name: f.name, host: url.hostname, swapped: false });
+      try { creq.resume(); } catch {}
+      denyRes(cres, 403, 'denied: secret.host');
+      return;
+    }
+    /** The headers to forward: the real values in, one audit line per swap. @param {Record<string, string | string[] | undefined>} headers */
+    const withSecrets = (headers) => {
+      if (!found.length) return headers;
+      for (const f of found) log({ ev: 'secret', agent, rid, name: f.name, host: url.hostname, swapped: true });
+      return applySecrets(headers, url.hostname, secrets);
+    };
     const cl = Number(creq.headers['content-length'] ?? 0);
     const hasBody = creq.headers['transfer-encoding'] !== undefined || cl > 0;
 
@@ -673,7 +696,6 @@ export function createProxy(opts) {
     // `end` fires once the whole body was read, whichever path read it (also
     // a streamed body past 64 KB), so the values cover all of it. A client
     // that aborts mid-body never reaches `end`: no line, as before.
-    const rid = `r${++ridN}`;
     if (hasBody) {
       creq.on('end', () => log({ ev: 'body', agent, rid, bodyBytes: tee.bytes, bodySha256: tee.digest() }));
     }
@@ -681,7 +703,7 @@ export function createProxy(opts) {
 
     // No gate: straight through. pipe() resumes the flow.
     if (!gateFor) {
-      forward({ agent, method, url: urlStr, headers: { ...creq.headers }, stream: creq, cres });
+      forward({ agent, method, url: urlStr, headers: withSecrets({ ...creq.headers }), stream: creq, cres });
       return;
     }
 
@@ -714,7 +736,7 @@ export function createProxy(opts) {
       const g = await gateOf(agent);
       const d = await decideAction(g, action);
       if (d.outcome === 'allow') {
-        const common = { agent, method, url: urlStr, headers: ctx.headers, cres,
+        const common = { agent, method, url: urlStr, headers: withSecrets(ctx.headers), cres,
           ...(d.aid ? { rec: { gate: g, action, aid: d.aid } } : {}) };
         if (ctx.heldId) {
           // The file is the exact body; the client's own framing (length or
