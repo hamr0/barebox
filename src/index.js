@@ -3,3 +3,4 @@ export { launch } from './launcher.js';
 export { createProxy } from './proxy.js';
 export { run } from './run.js';
 export { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
+export { loadLabels } from './labels.js';

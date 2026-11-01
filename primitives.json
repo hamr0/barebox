@@ -38,6 +38,15 @@
       "example": "import { launch } from \"barebox\";\nconst child = launch({ runtime: \"/tmp/sbx\", agent: \"fx\", proj: \"/tmp/proj\", command: [\"bash\", \"-c\", \"echo hi\"] });\nawait new Promise((r) => child.on(\"close\", r)); // child.exitCode === 0"
     },
     {
+      "name": "loadLabels",
+      "category": "labels",
+      "when": "Reach for this to build the `labels` value `run()` and `createProxy()` take: it reads rwxmap label folders once at startup and returns the request matcher, the tools table (letters from each gate file) and the absolute folders.",
+      "import": "import { loadLabels } from 'barebox'",
+      "signature": "loadLabels(cfg: object, env?: NodeJS.ProcessEnv) => { matcher: ReturnType<typeof matcherFrom>, tools: Record<string, any>, dirs: string[] }",
+      "fails": "Throws, naming the file or folder, on a folder with no review file, a review file without its gate file, a duplicate key across vendors, a tenants vendor no folder defines, an unreadable folder, or a label file written before rwxmap 0.8.0.",
+      "example": "import { loadLabels, run } from \"barebox\";\nconst labels = loadLabels({ labels: [\"/home/me/labels/jira\"], tenants: { jira: [\"https://acme.atlassian.net\"] } });\nawait run({ proj: \"/tmp/proj\", command: [\"bash\", \"-c\", \"true\"], labels });"
+    },
+    {
       "name": "rollbackOverlay",
       "category": "overlay",
       "when": "Reach for this to throw one run's tracing paper away: it drops every sandboxed change and leaves the project exactly as it was.",

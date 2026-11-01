@@ -214,7 +214,8 @@ those hosts is a normal `POST`.
 Label folders are hidden inside the sandbox like the config file, so the agent
 cannot rewrite a letter. `run()` and `createProxy()` take `labels:
 { matcher, tools }` (what `loadLabels` returns); omitted means no labels and
-only the built-in model endpoints.
+only the built-in model endpoints. `loadLabels` is exported from `barebox`:
+`import { loadLabels } from 'barebox'`.
 
 ## Undo layer
 
