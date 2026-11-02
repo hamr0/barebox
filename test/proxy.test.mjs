@@ -569,6 +569,102 @@ describe('negatives', () => {
   });
 });
 
+describe('one MITM TLS context per host', () => {
+  // Counts the proxy's own context builds: calls carrying a server cert. The
+  // proxy's `tls` is this same module object, so wrapping the property sees
+  // the explicit call and Node's internal one from `new TLSSocket({key, cert})`.
+  // Client-side and upstream builds pass no `cert` and are not counted.
+  async function withCounter(fn) {
+    const orig = tls.createSecureContext;
+    let n = 0;
+    tls.createSecureContext = function (o, ...rest) { if (o && o.cert) n++; return orig.call(this, o, ...rest); };
+    try { await fn(() => n); } finally { tls.createSecureContext = orig; }
+  }
+  async function ownProxy(fn, extra = {}) {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-pm-'));
+    const p = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), upstreamCa: CA, runtime: rt,
+      clientIdleMs: 1000, unsafeTestOnly: { allowLoopback: true, ...extra } });
+    const { port } = await p.ready;
+    try { await fn(rt, port); } finally {
+      await p.close();
+      rmSync(join(rt, 'certs'), { recursive: true, force: true });
+      rmSync(rt, { recursive: true, force: true });
+    }
+  }
+  // CONNECT to `target` through `port`, then a TLS handshake naming `host`. Returns the TLS socket.
+  async function tunnelTo(port, target, host, opts) {
+    const sock = net.connect(port, '127.0.0.1');
+    await once(sock, 'connect');
+    sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
+    let head = '';
+    await new Promise((resolve, reject) => {
+      const onData = (c) => {
+        head += c.toString('latin1');
+        if (head.includes('\r\n\r\n')) { sock.removeListener('data', onData); resolve(); }
+      };
+      sock.on('data', onData);
+      sock.on('error', reject);
+    });
+    assert.match(head, /200 Connection established/);
+    const t = tls.connect({ socket: sock, servername: host, ...opts });
+    await once(t, 'secureConnect');
+    return t;
+  }
+
+  it('five tunnels to one host build one context, a second host one more; each cert is valid for its host',
+    { timeout: 30000 }, async () => {
+      await ownProxy(async (rt, port) => {
+        // This proxy has its own CA (made at ready); the client context is built before the counter.
+        const ca = tls.createSecureContext({ ca: [readFileSync(join(rt, 'certs', 'ca.pem'), 'utf8')] });
+        await withCounter(async (count) => {
+          const c0 = count();
+          for (let i = 0; i < 5; i++) {
+            const t = await tunnelTo(port, `127.0.0.1:${tlsUp.port}`, '127.0.0.1', { secureContext: ca });
+            // T2: the handshake verified the proxy CA and the name (rejectUnauthorized is the default).
+            assert.equal(t.authorized, true, `tunnel ${i} verified against the proxy CA`);
+            t.write(`GET /?m=ctx${i} HTTP/1.1\r\nHost: 127.0.0.1:${tlsUp.port}\r\nContent-Length: 0\r\n\r\n`);
+            const r = await readOneResponse(t);
+            assert.equal(r.status, 200);
+            assert.equal(r.body, 'local-ok');
+            t.destroy();
+          }
+          assert.equal(count() - c0, 1, 'five tunnels to one host build exactly one context');
+          const t2 = await tunnelTo(port, `a.test:${tlsUp.port}`, 'a.test', { secureContext: ca });
+          assert.equal(t2.authorized, true);
+          assert.equal(t2.getPeerCertificate().subject.CN, 'a.test');
+          t2.destroy();
+          assert.equal(count() - c0, 2, 'a second host builds one more');
+        });
+      }, { resolveUpstream: async (h) => (h === 'a.test' ? '127.0.0.1' : undefined) });
+    });
+
+  it('the cache holds at most 256 hosts and drops the oldest first', { timeout: 60000 }, async () => {
+    await ownProxy(async (rt, port) => {
+      const dir = join(rt, 'certs');
+      const base = await certFor(dir, '127.0.0.1');
+      const N = 257;
+      for (let i = 0; i < N; i++) { // same cert under 257 names: the bound is under test, not the cert
+        writeFileSync(join(dir, `c${i}.test.key`), base.key);
+        writeFileSync(join(dir, `c${i}.test.pem`), base.cert);
+      }
+      const hit = async (i) => {
+        const t = await tunnelTo(port, `c${i}.test:${tlsUp.port}`, `c${i}.test`, { rejectUnauthorized: false });
+        t.destroy();
+      };
+      await withCounter(async (count) => {
+        const c0 = count();
+        for (let i = 0; i < N; i++) await hit(i);
+        assert.equal(count() - c0, N, 'one build per distinct host');
+        await hit(N - 1);
+        await hit(1);
+        assert.equal(count() - c0, N, 'the newest and the second-oldest are still cached');
+        await hit(0);
+        assert.equal(count() - c0, N + 1, 'the oldest was dropped at the 257th host: it is built again');
+      });
+    }, { resolveUpstream: async (h) => (/^c\d+\.test$/.test(h) ? '127.0.0.1' : undefined) });
+  });
+});
+
 describe('loopback wall: default deny after DNS resolution', () => {
   // Dedicated runtime + CA: the shared RT is claimed by the module proxy
   // for the whole file, so this chain owns its runtime (and CA request).

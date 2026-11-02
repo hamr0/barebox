@@ -37,6 +37,8 @@ const WORK_BODY_LIMIT = 65536;
 // Small teams: one proxy serves at most this many agents (the TCP door's
 // 'tcp' agent is not counted); more agents means another proxy.
 const MAX_AGENTS = 40;
+// Agents that browse many hosts must not grow the proxy without limit: one TLS context per host, at most this many.
+const MAX_MITM_CONTEXTS = 256;
 const EMPTY = Buffer.alloc(0);
 const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
   'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
@@ -251,6 +253,10 @@ export function createProxy(opts) {
   /** @type {Set<import('node:http').ClientRequest>} */
   const upstreams = new Set();
   const agentServers = new Map();
+  // host -> the MITM SecureContext, built once from the minted cert. Certs are valid 825 days and never
+  // re-minted while their files exist, so an entry cannot go stale within this proxy's life.
+  /** @type {Map<string, import('node:tls').SecureContext>} */
+  const mitmContexts = new Map();
   /** @type {import('node:net').Server|null} */
   let tcp = null;
   let closed = false;
@@ -963,16 +969,20 @@ export function createProxy(opts) {
     }
     // The cert is minted only for a TLS tunnel. The 200 is already sent, so a
     // failure cannot answer 502: it is logged as the deny it would have been.
-    let creds;
-    try {
-      creds = await certFor(certDir, host);
-    } catch (e) {
-      log({ ev: 'deny', agent: agentOf(sock), code: 502, note: `no cert for ${host}: ${e.message}` });
-      sock.destroy();
-      return;
+    let secureContext = mitmContexts.get(host);
+    if (!secureContext) {
+      try {
+        secureContext = tls.createSecureContext(await certFor(certDir, host));
+      } catch (e) {
+        log({ ev: 'deny', agent: agentOf(sock), code: 502, note: `no cert for ${host}: ${e.message}` });
+        sock.destroy();
+        return;
+      }
+      if (!mitmContexts.has(host) && mitmContexts.size >= MAX_MITM_CONTEXTS) mitmContexts.delete(mitmContexts.keys().next().value);
+      mitmContexts.set(host, secureContext);
     }
     if (closed || sock.destroyed) return;
-    const st = new tls.TLSSocket(sock, { isServer: true, key: creds.key, cert: creds.cert });
+    const st = new tls.TLSSocket(sock, { isServer: true, secureContext });
     st[AGENT] = agent;
     st[SECURE] = true;
     clients.add(st);

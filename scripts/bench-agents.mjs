@@ -5,6 +5,15 @@
 // else it prints a loud SKIP and exits 77 (neither pass nor fail); there are
 // no numbers on that path.
 //
+// All traffic is HTTPS through the MITM path (PRD M6, Nov 2): real agent traffic
+// is almost all TLS (model API, GitHub, npm) and so are the writes that get held,
+// and a live TLS session per tunnel is where the proxy's memory goes. Ten hosts
+// h0..h9.test resolve to one local HTTPS upstream (a cert per SNI name, from its
+// own CA); the proxy child trusts that CA through NODE_EXTRA_CA_CERTS, the
+// production trust path (no `upstreamCa`). One secret bound to the ten hosts is
+// sent as a placeholder on every allow and the upstream must see the real value
+// on every one.
+//
 // Method (PRD M3, "Memory", round 2): per agent count, one FRESH child
 // process runs the proxy (`node --expose-gc --max-semi-space-size=1`, the
 // CLI's flag; see bench-agents-child.mjs) with the real stack: policy.gateFor
@@ -17,8 +26,10 @@
 // Per agent, all at once: 1 sandbox, 1 parked hold (unlabelled POST, 64 KB
 // body), 16 waiting holds (the 18th gets 429, which proves the line is full),
 // and the working slot filled (a POST declaring 64 KB with 60 KB sent, so the
-// proxy keeps that buffer). Before the readings, 3600 labelled `allow` GETs
-// go through the proxy, so gate, matcher, `record` and `annotate` have all run.
+// proxy keeps that buffer), every request in its own CONNECT + TLS tunnel
+// (about 20 live TLS sessions per agent). Before the readings, 3600 labelled
+// `allow` GETs go through the proxy over one keep-alive tunnel per (agent, host),
+// so gate, matcher, secret swap, `record` and `annotate` have all run.
 //
 // Readings per count: idle (agents joined), after 3600 allows, worst case
 // held. At 20 agents also a drift check: 7200 more allows, VmRSS again.
@@ -27,24 +38,28 @@
 //
 // Limits: barebox targets small teams. 40 agents per proxy is the maximum
 // (enforced by addAgent); above that, run more proxies. The proxy budget is a
-// range, about 145-175 MB in the full worst case at 40 agents, quiet to busy
-// machine. Exit 1 when any proxy reading at any count (up to 40) exceeds the
-// top of the range, 175 MB, or any walls reading exceeds
-// 10 MB. The straight-line fit over the four worst-case points is printed as
+// range, about 205-245 MB in the full HTTPS worst case at 40 agents (PRD M6),
+// quiet to busy machine. Exit 1 when any proxy reading at any count (up to 40)
+// exceeds the top of the range, 245 MB, or any walls reading exceeds 10 MB. The straight-line fit over the four worst-case points is printed as
 // an estimate, with the MB per agent slope; it is not a gate.
 import { fork, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
+import tls from 'node:tls';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launch } from '../src/launcher.js';
+import { ensureCA, certFor } from '../src/certs.js';
 import { bwrapUsable, hasBin } from '../test/fixtures/probes.mjs';
 import { canUnix, pidChildren, rssKb, treeRss, waitFor, waitSteady } from './measure.mjs';
 
 const COUNTS = [10, 20, 30, 40];
 const DRIFT_AT = 20;
+const HOSTS = Array.from({ length: 10 }, (_, i) => `h${i}.test`);
+const SECRET = 'real-bench-secret-value-0123456789';
 const OPS = 170;
 const ALLOWS = 3600;
 const DRIFT_MORE = 7200;
@@ -52,7 +67,7 @@ const BODY = 65536;
 const SENT = 61440; // "about 60 KB" of the working-slot POST
 const PER_AGENT = 18; // 1 parked + 16 waiting + the 429
 const MAX_SANDBOX_MB = 10;
-const MAX_PROXY_MB = 175;
+const MAX_PROXY_MB = 245;
 const DRIFT_FINDING_MB = 1;
 const SKIP_EXIT = 77;
 
@@ -96,27 +111,48 @@ function makeLabels(/** @type {string} */ root) {
   return out;
 }
 
+let UP_PORT = 0;
+/** Client TLS sockets that finished the handshake and are not closed. @type {Set<tls.TLSSocket>} */
+const tunnels = new Set();
+
 /**
- * One GET through an agent's socket, absolute-form.
- * @param {http.Agent} agent keep-alive agent @param {string} sock @param {string} url
- * @returns {Promise<number>} status
+ * CONNECT `host:UP_PORT` over the agent's unix socket, then a real TLS handshake
+ * to it, trusting the proxy's CA. (The port is the upstream's: 443 is
+ * privileged, so CONNECT and Host carry it.)
+ * @param {string} sockPath @param {string} host @param {string} caPem
+ * @returns {Promise<tls.TLSSocket>}
  */
-const getVia = (agent, sock, url) => new Promise((resolve, reject) => {
-  const u = new URL(url);
-  const req = http.request({ socketPath: sock, agent, method: 'GET', path: url, headers: { host: u.host } },
-    (res) => { res.resume(); res.on('end', () => resolve(res.statusCode ?? 0)); });
-  req.on('error', reject);
-  req.end();
+const tunnel = (sockPath, host, caPem) => new Promise((resolve, reject) => {
+  const raw = net.connect(sockPath);
+  raw.on('error', reject);
+  let buf = '';
+  const onData = (/** @type {Buffer} */ c) => {
+    buf += c.toString('latin1');
+    if (!buf.includes('\r\n\r\n')) return;
+    raw.off('data', onData);
+    if (!/^HTTP\/1\.1 200 /.test(buf)) { raw.destroy(); reject(new Error(`CONNECT ${host}: ${buf.split('\r\n')[0]}`)); return; }
+    const t = tls.connect({ socket: raw, servername: host, ca: caPem });
+    t.once('error', reject);
+    t.once('secureConnect', () => {
+      t.on('error', () => {});
+      tunnels.add(t);
+      t.once('close', () => tunnels.delete(t));
+      resolve(t);
+    });
+  };
+  raw.on('data', onData);
+  raw.write(`CONNECT ${host}:${UP_PORT} HTTP/1.1\r\nHost: ${host}:${UP_PORT}\r\n\r\n`);
 });
 
-/** A raw POST head declaring `len` body bytes. */
-const head = (/** @type {string} */ tag, /** @type {number} */ len) =>
-  `POST http://127.0.0.1:1/${tag} HTTP/1.1\r\nHost: 127.0.0.1:1\r\nContent-Length: ${len}\r\n\r\n`;
+/** A raw POST head declaring `len` body bytes, to host number `k` (round-robin). */
+const head = (/** @type {number} */ k, /** @type {string} */ tag, /** @type {number} */ len) =>
+  `POST /${tag} HTTP/1.1\r\nHost: ${HOSTS[k % 10]}:${UP_PORT}\r\nContent-Length: ${len}\r\n\r\n`;
 
-/** @param {number} n @param {string} labelsDir @param {number} upstreamPort */
-async function runCount(n, labelsDir, upstreamPort) {
+/** @param {number} n @param {string} labelsDir @param {number} upstreamPort @param {string} upstreamCa @param {{ swapped: number, unswapped: number }} upstreamStats */
+async function runCount(n, labelsDir, upstreamPort, upstreamCa, upstreamStats) {
   const execArgv = ['--expose-gc', '--max-semi-space-size=1'];
-  const host = fork(path.join(here, 'bench-agents-child.mjs'), [], { execArgv });
+  const host = fork(path.join(here, 'bench-agents-child.mjs'), [],
+    { execArgv, env: { ...process.env, NODE_EXTRA_CA_CERTS: upstreamCa } });
   let seq = 0;
   const waiting = new Map();
   host.on('message', (/** @type {any} */ m) => { waiting.get(m.id)?.(m); waiting.delete(m.id); });
@@ -132,21 +168,20 @@ async function runCount(n, labelsDir, upstreamPort) {
   const sandboxes = [];
   /** @type {net.Socket[]} */
   const socks = [];
-  const agents = [];
   let runtime = '';
   try {
-    const init = /** @type {any} */ (await ask('init', { labelsDir, upstreamPort }));
+    const init = /** @type {any} */ (await ask('init', { labelsDir, upstreamPort, secretValue: SECRET }));
     runtime = init.runtime;
     const pid = /** @type {number} */ (init.pid);
     if (pid !== host.pid) throw new Error('child pid mismatch');
     const audit = path.join(runtime, 'mitm.log');
+    const caPem = readFileSync(init.caFile, 'utf8');
     const names = Array.from({ length: n }, (_, i) => `b${String(i).padStart(2, '0')}`);
     const sockOf = /** @type {any} */ ((await ask('agents', { names }))).socks;
     for (const name of names) {
       const c = launch({ runtime, agent: name, proj, command: ['sleep', '120'], socket: sockOf[name], caFile: init.caFile });
       c.on('error', () => {});
       sandboxes.push(c);
-      agents.push(new http.Agent({ keepAlive: true, maxSockets: 1 }));
     }
     await waitSteady(sandboxes);
     await sleep(1000); // each agent's gate is built by now
@@ -159,15 +194,40 @@ async function runCount(n, labelsDir, upstreamPort) {
     const stats = async () => /** @type {any} */ (await ask('stats'));
     const idle = await reading();
 
+    // One keep-alive TLS tunnel per (agent, host), made on first use.
+    const allowAgents = names.map(() => /** @type {Map<number, http.Agent>} */ (new Map()));
+    const agentFor = async (/** @type {number} */ a, /** @type {number} */ h) => {
+      let ag = allowAgents[a].get(h);
+      if (!ag) {
+        const t = await tunnel(sockOf[names[a]], HOSTS[h], caPem);
+        ag = new http.Agent({ keepAlive: true, maxSockets: 1 });
+        ag.createConnection = () => t;
+        allowAgents[a].set(h, ag);
+      }
+      return ag;
+    };
+    /** One GET inside the agent's tunnel to host h, the placeholder as a bearer token. */
+    const getTls = (/** @type {http.Agent} */ ag, /** @type {number} */ h, /** @type {string} */ p) => new Promise((resolve, reject) => {
+      const req = http.request({ agent: ag, method: 'GET', path: p,
+        headers: { host: `${HOSTS[h]}:${UP_PORT}`, authorization: `Bearer ${init.placeholder}` } },
+      (res) => { res.resume(); res.on('end', () => resolve(res.statusCode ?? 0)); });
+      req.on('error', reject);
+      req.end();
+    });
+    let swaps = 0;
+    let allowsDone = 0;
+
     // N labelled GETs spread over the agents, each agent sequential, agents in parallel.
     const allows = async (/** @type {number} */ total) => {
       const before = (await stats()).labelledAllows;
+      const swapBefore = upstreamStats.swapped;
       const each = total / n;
       let bad = 0;
       await Promise.all(names.map(async (name, a) => {
         for (let j = 0; j < each; j++) {
           const op = 3 * ((a + j) % 57); // a GET op (every third of 170)
-          const st = await getVia(agents[a], sockOf[name], `http://127.0.0.1:${upstreamPort}/items/${a}-${j}/op${op}`);
+          const h = (a + j) % 10;
+          const st = await getTls(await agentFor(a, h), h, `/items/${a}-${j}/op${op}`);
           if (st !== 200) bad++;
         }
       }));
@@ -181,6 +241,11 @@ async function runCount(n, labelsDir, upstreamPort) {
         stable = s === last ? stable + 1 : 0; last = s;
         await sleep(200);
       }
+      const swapped = upstreamStats.swapped - swapBefore;
+      if (swapped !== total) throw new Error(`upstream saw ${swapped} swapped authorization headers, expected ${total}`);
+      if (upstreamStats.unswapped) throw new Error(`${upstreamStats.unswapped} upstream requests carried an unswapped authorization`);
+      swaps += swapped;
+      allowsDone += total;
     };
 
     await allows(ALLOWS);
@@ -192,22 +257,25 @@ async function runCount(n, labelsDir, upstreamPort) {
       drift = { more: DRIFT_MORE, after: await reading() };
     }
 
-    // --- the worst case, all agents at once ---
+    // --- the worst case, all agents at once; every request in its OWN tunnel ---
     const body = Buffer.alloc(BODY, 0x61);
     const base = (await stats()).checks;
     const d429 = new Map(names.map((x) => [x, 0]));
-    const open = (/** @type {string} */ name, /** @type {(s: string) => void} */ onData) => {
-      const s = net.connect(sockOf[name]);
+    /** A fresh CONNECT + TLS tunnel for request k. */
+    const open = async (/** @type {string} */ name, /** @type {number} */ k, /** @type {(s: string) => void} */ onData) => {
+      const s = await tunnel(sockOf[name], HOSTS[k % 10], caPem);
       s.on('error', () => {});
       s.on('data', (c) => onData(c.toString('latin1')));
       socks.push(s);
       return s;
     };
-    for (let k = 0; k < n * PER_AGENT; k++) {
+    let rk = 0; // request counter: picks the host round-robin
+    await Promise.all(Array.from({ length: n * PER_AGENT }, async (_, k) => {
       const name = names[k % n];
-      const s = open(name, (t) => { if (/^HTTP\/1\.1 429 /.test(t)) d429.set(name, (d429.get(name) ?? 0) + 1); });
-      s.write(Buffer.concat([Buffer.from(head(`hold-${k}`, BODY)), body]));
-    }
+      const my = rk++;
+      const s = await open(name, my, (t) => { if (/^HTTP\/1\.1 429 /.test(t)) d429.set(name, (d429.get(name) ?? 0) + 1); });
+      s.write(Buffer.concat([Buffer.from(head(my, `hold-${k}`, BODY)), body]));
+    }));
     const delta = async (/** @type {Record<string, number>} */ from) => {
       const now = (await stats()).checks;
       return names.map((x) => (now[x] ?? 0) - (from[x] ?? 0));
@@ -222,31 +290,37 @@ async function runCount(n, labelsDir, upstreamPort) {
     // Control: with the slot free, a probe POST reaches the gate (and gets 429: the line is full).
     const afterHolds = (await stats()).checks;
     const got429 = new Array(n).fill(false);
-    names.forEach((name, a) => {
-      const s = open(name, (t) => { if (/^HTTP\/1\.1 429 /.test(t)) got429[a] = true; });
-      s.write(head(`ctl-${a}`, 4) + 'ping');
-    });
+    await Promise.all(names.map(async (name, a) => {
+      const my = rk++;
+      const s = await open(name, my, (t) => { if (/^HTTP\/1\.1 429 /.test(t)) got429[a] = true; });
+      s.write(head(my, `ctl-${a}`, 4) + 'ping');
+    }));
     await waitFor(async () => got429.every(Boolean) && (await delta(afterHolds)).every((d) => d === 1),
       'the control probes to reach the gate and get 429 (slot free)', 30000);
 
     // Fill the working slot: declare 64 KB, send 60 KB, withhold the rest.
-    const fillers = names.map((name, a) => {
+    const fillers = await Promise.all(names.map(async (name, a) => {
       let r429 = false;
-      const s = open(name, (t) => { if (/^HTTP\/1\.1 429 /.test(t)) r429 = true; });
-      s.write(Buffer.concat([Buffer.from(head(`fill-${a}`, BODY)), body.subarray(0, SENT)]));
+      const my = rk++;
+      const s = await open(name, my, (t) => { if (/^HTTP\/1\.1 429 /.test(t)) r429 = true; });
+      s.write(Buffer.concat([Buffer.from(head(my, `fill-${a}`, BODY)), body.subarray(0, SENT)]));
       return { s, got: () => r429 };
-    });
+    }));
     await sleep(1500);
     const worst = await reading();
+    const tunnelsWorst = tunnels.size;
+    const tunnelsMin = n * (PER_AGENT + 2); // 18 per agent + control + filler
+    if (tunnelsWorst < tunnelsMin) throw new Error(`only ${tunnelsWorst} live TLS tunnels at the worst reading, expected at least ${tunnelsMin}`);
 
     // Proof the slot is held: a further body-carrying POST per agent must NOT reach the gate
     // and must get no answer while the filler stalls.
     const afterCtl = (await stats()).checks;
     const probe429 = new Array(n).fill(false);
-    names.forEach((name, a) => {
-      const s = open(name, (t) => { if (/^HTTP\/1\.1 429 /.test(t)) probe429[a] = true; });
-      s.write(head(`probe-${a}`, 4) + 'ping');
-    });
+    await Promise.all(names.map(async (name, a) => {
+      const my = rk++;
+      const s = await open(name, my, (t) => { if (/^HTTP\/1\.1 429 /.test(t)) probe429[a] = true; });
+      s.write(head(my, `probe-${a}`, 4) + 'ping');
+    }));
     await sleep(2000);
     const blocked = (await delta(afterCtl)).every((d) => d === 0) && !probe429.some(Boolean)
       && !fillers.some((f) => f.got());
@@ -257,10 +331,10 @@ async function runCount(n, labelsDir, upstreamPort) {
       && (await delta(afterCtl)).every((d) => d === 2),
     'the stalled filler and the probe to reach the gate once the body completes', 30000);
 
-    return { n, idle, after3600, worst, drift, wallsMean, wallsMax, tools: init.tools };
+    return { n, idle, after3600, worst, drift, wallsMean, wallsMax, tools: init.tools, tunnelsWorst, swaps, allowsDone };
   } finally {
     for (const s of socks) { try { s.destroy(); } catch {} }
-    for (const a of agents) a.destroy();
+    for (const t of [...tunnels]) { try { t.destroy(); } catch {} }
     for (const c of sandboxes) { try { c.kill('SIGKILL'); } catch {} }
     host.removeAllListeners('exit');
     host.kill('SIGKILL');
@@ -272,29 +346,40 @@ async function runCount(n, labelsDir, upstreamPort) {
 
 // --- main ------------------------------------------------------------------
 const root = mkdtempSync(path.join(os.tmpdir(), 'bb-ba-'));
-// The allow target: a local server that answers every GET (the test fixture is not typechecked).
-const srv = http.createServer((_req, res) => { res.end('ok'); });
+// The allow target: one HTTPS server presenting a cert per SNI name, each signed
+// by a CA of its own (the proxy child trusts it via NODE_EXTRA_CA_CERTS). It
+// records whether every authorization header carries the REAL secret (the swap).
+const upstreamStats = { swapped: 0, unswapped: 0 };
+const caDir = path.join(root, 'upca');
+await ensureCA(caDir);
+const upstreamCa = path.join(caDir, 'ca.pem');
+const ctx = new Map();
+for (const h of HOSTS) ctx.set(h, tls.createSecureContext(await certFor(caDir, h)));
+const srv = https.createServer({ SNICallback: (name, cb) => cb(null, ctx.get(name) ?? ctx.get(HOSTS[0])) }, (req, res) => {
+  if (req.headers.authorization === `Bearer ${SECRET}`) upstreamStats.swapped++; else upstreamStats.unswapped++;
+  res.end('ok');
+});
 await new Promise((r) => srv.listen(0, '127.0.0.1', () => r(undefined)));
-const upstream = { port: /** @type {import('node:net').AddressInfo} */ (srv.address()).port,
-  close: () => new Promise((r) => srv.close(r)) };
+UP_PORT = /** @type {import('node:net').AddressInfo} */ (srv.address()).port;
+const upstream = { port: UP_PORT, close: () => new Promise((r) => srv.close(r)) };
 let exit = 0;
 try {
   const labelsDir = makeLabels(root);
   const results = [];
   for (const n of COUNTS) {
-    const r = await runCount(n, labelsDir, upstream.port);
-    console.error(`  ${n} agents done (worst ${r.worst.toFixed(1)} MB)`);
+    const r = await runCount(n, labelsDir, upstream.port, upstreamCa, upstreamStats);
+    console.error(`  ${n} agents done (worst ${r.worst.toFixed(1)} MB, ${r.tunnelsWorst} live TLS tunnels)`);
     results.push(r);
   }
 
   const f = (/** @type {number} */ v) => v.toFixed(1);
   console.log('');
-  console.log(`Proxy VmRSS (MB) after forced GC, own process, \`--max-semi-space-size=1\`; real gates (auto), ${results[0].tools}-key tools table (${OPS} labelled operations).`);
+  console.log(`HTTPS worst case: every request in its own MITM TLS tunnel, secret swapped on each allow. Proxy VmRSS (MB) after forced GC, own process, \`--max-semi-space-size=1\`; real gates (auto), ${results[0].tools}-key tools table (${OPS} labelled operations).`);
   console.log('');
-  console.log('| agents | idle | after 3600 allows | worst case held | walls mean/sandbox | walls max/sandbox |');
-  console.log('|---|---|---|---|---|---|');
+  console.log('| agents | idle | after 3600 allows | worst case held | walls mean/sandbox | walls max/sandbox | live TLS (worst) | swaps |');
+  console.log('|---|---|---|---|---|---|---|---|');
   for (const r of results) {
-    console.log(`| ${r.n} | ${f(r.idle)} | ${f(r.after3600)} | ${f(r.worst)} | ${f(r.wallsMean)} | ${f(r.wallsMax)} |`);
+    console.log(`| ${r.n} | ${f(r.idle)} | ${f(r.after3600)} | ${f(r.worst)} | ${f(r.wallsMean)} | ${f(r.wallsMax)} | ${r.tunnelsWorst} | ${r.swaps}/${r.allowsDone} |`);
   }
   const d = results.find((r) => r.drift);
   if (d?.drift) {
