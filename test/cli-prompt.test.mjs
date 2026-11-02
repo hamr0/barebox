@@ -8,8 +8,8 @@ for (const v of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
 }
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { spawn, execFile } from 'node:child_process';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -74,9 +74,9 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       if (root) rmSync(root, { recursive: true, force: true });
     });
 
-    const viaPty = (typed, marker, name) => new Promise((resolve, reject) => {
-            const curl = `curl -s -w '\\nHTTP:%{http_code}\\n' --max-time 20 --data m=${marker} http://127.0.0.1:${up.port}/hold`;
-      const child = spawn('python3', ['-I', '-c', DRIVER, typed, process.execPath, CLI, 'run', '--name', name, '--', 'bash', '-c', curl], {
+    const viaPty = (typed, marker, name, flags = []) => new Promise((resolve, reject) => {
+      const curl = `curl -s -w '\\nHTTP:%{http_code}\\n' --max-time 20 --data m=${marker} http://127.0.0.1:${up.port}/hold`;
+      const child = spawn('python3', ['-I', '-c', DRIVER, typed, process.execPath, CLI, 'run', ...flags, '--name', name, '--', 'bash', '-c', curl], {
         cwd: proj,
         env: { PATH: process.env.PATH, HOME: join(root, 'home'), XDG_CONFIG_HOME: join(root, 'xdg'),
           TMPDIR: join(root, 'tmp'), SBX_UNSAFE_TEST_ALLOW_LOOPBACK: '1', TERM: 'xterm' },
@@ -107,5 +107,33 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.match(r.out, /✗ denied/);
       assert.match(r.out, /HTTP:403/);
       assert.match(r.out, /denied at the terminal/);
+    });
+
+    it('--json never prompts: the ask is a JSON event, and `sbx approve --name` answers it', { timeout: 60000 }, async () => {
+      const name = 'pty-json';
+      const env = { PATH: process.env.PATH, HOME: join(root, 'home'), XDG_CONFIG_HOME: join(root, 'xdg'), TMPDIR: join(root, 'tmp') };
+      const ask = join(root, 'tmp', `sbx-${process.getuid()}`, name, 'asks', 'h1.json');
+      const run = viaPty('', 'PTYJSON', name, ['--json']);
+      const approver = (async () => {
+        const end = Date.now() + 40000;
+        while (!existsSync(ask)) {
+          if (Date.now() > end) throw new Error('the ask file never appeared');
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        return new Promise((resolve, reject) => {
+          execFile(process.execPath, [CLI, 'approve', 'h1', '--name', name], { cwd: proj, env, timeout: 20000 },
+            (e, stdout, stderr) => (e ? reject(new Error(`approve failed: ${stderr}`)) : resolve(stdout)));
+        });
+      })();
+      // Settle both so a failed approve cannot leave the run unreaped.
+      const [r, a] = await Promise.allSettled([run, approver]);
+      assert.equal(a.status, 'fulfilled', String(a.reason));
+      assert.equal(r.status, 'fulfilled', String(r.reason));
+      const { code, out, err } = r.value;
+      assert.equal(code, 0, out + err);
+      assert.match(out, /\{"ev":"ask","id":"h1"/);
+      assert.ok(!/Allow\?/.test(out), `--json must not prompt: ${out}`);
+      assert.match(out, /\{"ev":"decided","id":"h1","decision":"allow"/);
+      assert.match(out, /HTTP:200/);
     });
   });

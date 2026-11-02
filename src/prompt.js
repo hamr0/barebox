@@ -50,44 +50,37 @@ export function questionLines(ask, now = Date.now()) {
 }
 
 /**
- * The terminal prompt. One question open at a time; a second ask waits its
- * turn. `ask()` opens (or queues) a question, `decided()` closes it when the
- * hold ended some other way, `close()` releases `input`.
+ * The terminal prompt. One question open at a time. `ask()` opens a question
+ * and returns true, or returns false when one is already open (or the prompt
+ * is closed) so the caller prints the plain `ask` line instead; `decided()`
+ * closes the question when the hold ended some other way, `close()` releases
+ * `input`.
  *
- * @param {{ input: import('node:stream').Readable, output: { write: (s: string) => unknown }, answer: (id: string, decision: 'allow'|'deny', reason?: string) => void }} opts streams and the answer writer
- * @returns {{ ask: (ask: AskRecord) => void, decided: (e: { id: string, decision: string, reason?: string }) => void, close: () => void }} the prompt
+ * @param {{ input: import('node:stream').Readable, output: { write: (s: string) => unknown }, answer: (id: string, decision: 'allow'|'deny', reason?: string) => boolean|void }} opts streams and the answer writer
+ * @returns {{ ask: (ask: AskRecord) => boolean, decided: (e: { id: string, decision: string, reason?: string }) => void, close: () => void }} the prompt
  */
 export function createTerminalPrompt({ input, output, answer }) {
   /** @type {AskRecord|null} */
   let open = null;
-  /** @type {AskRecord[]} */
-  const queue = [];
   let buf = '';
   let closed = false;
   const say = (/** @type {string} */ s) => { output.write(`${s}\n`); };
 
-  const openNext = () => {
-    open = queue.shift() ?? null;
-    buf = ''; // a half-typed line from before the question is stale
-    if (open) for (const l of questionLines(open)) say(l);
-  };
-
   const onLine = (/** @type {string} */ line) => {
-    if (!open) return; // nothing asked: stale input, dropped
+    if (!open) return; // unreachable at runtime (onData checks); narrows the type for tsc
     const { id } = open;
     open = null; // closed before the write: one answer per question
     const yes = YES.has(line.trim().toLowerCase());
     try {
-      answer(id, yes ? 'allow' : 'deny', yes ? undefined : 'denied at the terminal');
+      const written = answer(id, yes ? 'allow' : 'deny', yes ? undefined : 'denied at the terminal') !== false;
+      say(!written ? 'answered elsewhere' : yes ? '✓ allowed' : '✗ denied');
     } catch {
       // The hold ended (or the runtime went) before this write; the run goes on.
     }
-    say(yes ? '✓ allowed' : '✗ denied');
-    openNext();
   };
 
   const onData = (/** @type {string|Buffer} */ chunk) => {
-    if (!open) { buf = ''; return; }
+    if (!open) return;
     buf += String(chunk);
     for (let m = EOL.exec(buf); m && open; m = EOL.exec(buf)) {
       const line = buf.slice(0, m.index);
@@ -101,26 +94,23 @@ export function createTerminalPrompt({ input, output, answer }) {
 
   return {
     ask(ask) {
-      if (closed) return;
-      queue.push(ask);
-      if (!open) openNext();
+      if (closed || open) return false;
+      open = ask;
+      buf = ''; // a half-typed line from before the question is stale
+      for (const l of questionLines(open)) say(l);
+      return true;
     },
     decided(e) {
-      const q = queue.findIndex((a) => a.id === e.id);
-      if (q >= 0) queue.splice(q, 1);
       if (open?.id !== e.id) return;
       open = null; // closed before anything else: no answer can follow
       const why = safe(e.reason);
       say(why === 'hold timeout' ? `timed out: ${safe(e.decision)}`
         : why === 'client gone' || why === 'proxy closing' ? `agent gone: ${safe(e.decision)}`
           : `answered elsewhere: ${safe(e.decision)}${why ? ` (${why})` : ''}`);
-      openNext();
     },
     close() {
-      if (closed) return;
       closed = true;
       open = null;
-      queue.length = 0;
       input.removeListener('data', onData);
       input.pause();
     },

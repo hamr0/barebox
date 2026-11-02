@@ -85,7 +85,6 @@ describe('createTerminalPrompt', () => {
   it('CRLF is one line', async () => {
     const { input, p, answers } = setup();
     p.ask(ask({ id: 'h1' }));
-    p.ask(ask({ id: 'h2' }));
     input.write('y\r\n');
     await tick();
     assert.deepEqual(answers, [['h1', 'allow', undefined]]);
@@ -114,13 +113,26 @@ describe('createTerminalPrompt', () => {
     assert.deepEqual(answers, [['h1', 'deny', 'denied at the terminal']], '"s" is not yes');
   });
 
-  it('a y typed for h1 does not approve a queued h2', async () => {
-    const { input, p, answers } = setup();
-    p.ask(ask({ id: 'h1' }));
-    p.ask(ask({ id: 'h2' }));
-    input.write('y\ny\n'); // second y was typed before h2 was printed
+  it('a second ask while one is open is refused (false) and never answered here', async () => {
+    const { input, p, answers, out } = setup();
+    assert.equal(p.ask(ask({ id: 'h1' })), true);
+    assert.equal(p.ask(ask({ id: 'h2' })), false, 'the caller prints the plain ask line for h2');
+    input.write('y\ny\n');
     await tick();
     assert.deepEqual(answers, [['h1', 'allow', undefined]]);
+    assert.equal((out().match(/Allow\?/g) ?? []).length, 1, 'h2 was never printed as a question');
+  });
+
+  it('an answer that lost to an earlier one prints "answered elsewhere", not allowed/denied', async () => {
+    const input = new PassThrough();
+    const chunks = [];
+    const p = createTerminalPrompt({ input, output: { write: (s) => { chunks.push(s); } }, answer: () => false });
+    p.ask(ask({ id: 'h1' }));
+    input.write('y\n');
+    await tick();
+    const out = chunks.join('');
+    assert.match(out, /answered elsewhere\n$/);
+    assert.ok(!/✓ allowed|✗ denied/.test(out), out);
   });
 
   // Must hold 2
@@ -160,9 +172,9 @@ describe('createTerminalPrompt', () => {
     const output = { write: () => {} };
     const p = createTerminalPrompt({ input, output, answer: () => { throw new Error('ENOENT'); } });
     p.ask(ask({ id: 'h1' }));
-    p.ask(ask({ id: 'h2' }));
     input.write('y\n');
     await tick();
+    p.ask(ask({ id: 'h2' }));
     input.write('n\n');
     await tick();
     // A throw from the answer writer would surface as an uncaught exception and fail this file.

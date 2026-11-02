@@ -4,7 +4,7 @@
 # and Ubuntu's AppArmor blocks unprivileged user namespaces unless relaxed.
 set -euo pipefail
 
-sudo apt-get install -y socat curl openssl meson ninja-build libcap-dev pkg-config
+sudo apt-get install -y socat curl openssl python3 meson ninja-build libcap-dev pkg-config
 curl -sSfL -o /tmp/bwrap.tar.xz https://github.com/containers/bubblewrap/releases/download/v0.12.0/bubblewrap-0.12.0.tar.xz
 echo "9760d007363e3abba7c747489910f9f82d9fca53ba3bd3282e396fa3c97a3314  /tmp/bwrap.tar.xz" | sha256sum -c -
 tar -xJf /tmp/bwrap.tar.xz -C /tmp

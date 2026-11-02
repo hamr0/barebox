@@ -8,7 +8,6 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, existsSync, rmSync, statSync, writeFileSync, readdirSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
@@ -20,7 +19,7 @@ const UID = process.getuid();
 
 describe('namedRuntime', () => {
   let root, savedTmp;
-  before(() => { root = mkdtempSync(join(tmpdir(), 'bb-nr-')); savedTmp = process.env.TMPDIR; process.env.TMPDIR = root; });
+  before(() => { root = mkdtempSync('/tmp/bb-nr-'); savedTmp = process.env.TMPDIR; process.env.TMPDIR = root; });
   after(() => {
     if (savedTmp === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = savedTmp;
     rmSync(root, { recursive: true, force: true });
@@ -77,7 +76,7 @@ describe('namedRuntime', () => {
 
 function canUnix() {
   return new Promise((resolve) => {
-    const p = join(tmpdir(), `bb-nprobe-${process.pid}.sock`);
+    const p = join('/tmp', `bb-nprobe-${process.pid}.sock`);
     const s = net.createServer();
     s.on('error', () => resolve(false));
     s.listen(p, () => s.close(() => { try { rmSync(p); } catch {} resolve(true); }));
@@ -88,7 +87,7 @@ const CAN_RUN = bwrapUsable() && await canUnix() && hasBin('socat') && hasBin('c
 describe('sbx --name (CLI)', () => {
   let root, proj, env;
   before(() => {
-    root = mkdtempSync(join(tmpdir(), 'bb-nc-'));
+    root = mkdtempSync('/tmp/bb-nc-');
     proj = join(root, 'proj');
     mkdirSync(proj, { recursive: true });
     mkdirSync(join(root, 'home'), { recursive: true });

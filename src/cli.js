@@ -37,7 +37,6 @@ import { parseArgs } from 'node:util';
 import { resolveConfig } from './config.js';
 import { loadLabels } from './labels.js';
 import { MODES } from './policy.js';
-import { writeFileAtomic } from './holds.js';
 import { run as sandboxRun } from './run.js';
 import { createTerminalPrompt } from './prompt.js';
 import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
@@ -253,7 +252,7 @@ async function run(args) {
     })
     : null;
   const emitAsk = (h) => {
-    if (prompt) { prompt.ask(h); return; }
+    if (prompt?.ask(h)) return;
     const c = clean(h, ['id', 'agent', 'method', 'url', 'rule', 'bodyPreview']);
     if (json) out(JSON.stringify({ ev: 'ask', ...c }));
     else out(`ask ${c.id} ${c.agent} ${c.method} ${c.url} rule=${c.rule}`);
@@ -442,27 +441,47 @@ async function answerTarget(rest) {
 
 /**
  * The one writer of answer files (`sbx approve`, `sbx deny`, the terminal prompt).
+ * The first answer wins: the file is created exclusively (hard link of a 0600
+ * tmp file), so a second answer for the same id writes nothing.
  *
  * @param {ReturnType<typeof runtimePaths>} paths runtime paths
  * @param {string} id hold id
  * @param {'allow'|'deny'} decision the answer
  * @param {string} [reason] deny reason
- * @returns {void}
+ * @returns {boolean} true when written, false when the hold was already answered
  */
 function writeAnswer(paths, id, decision, reason) {
-  writeFileAtomic(paths.answerFile(id), JSON.stringify(decision === 'allow' ? { decision } : { decision, reason }));
+  const final = paths.answerFile(id);
+  fs.mkdirSync(path.dirname(final), { recursive: true });
+  const tmp = `${final}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  fs.writeFileSync(tmp, JSON.stringify(decision === 'allow' ? { decision } : { decision, reason }), { mode: 0o600 });
+  try {
+    fs.linkSync(tmp, final);
+    return true;
+  } catch (e) {
+    if (/** @type {NodeJS.ErrnoException} */ (e).code === 'EEXIST') return false;
+    throw e;
+  } finally {
+    fs.unlinkSync(tmp);
+  }
+}
+
+/** @param {string} id hold id @returns {never} */
+function alreadyAnswered(id) {
+  err(`${id} already answered`);
+  process.exit(1);
 }
 
 /** @param {string[]} rest @returns {Promise<void>} */
 async function approve(rest) {
   const { id, paths } = await answerTarget(rest);
-  writeAnswer(paths, id, 'allow');
+  if (!writeAnswer(paths, id, 'allow')) alreadyAnswered(id);
   out(`approved ${id}`);
 }
 
 /** @param {string[]} rest @returns {Promise<void>} */
 async function deny(rest) {
   const { id, reason, paths } = await answerTarget(rest);
-  writeAnswer(paths, id, 'deny', reason);
+  if (!writeAnswer(paths, id, 'deny', reason)) alreadyAnswered(id);
   out(`denied ${id}`);
 }

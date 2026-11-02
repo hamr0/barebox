@@ -666,7 +666,7 @@ Findings from the real-agent run (not fixed in M6):
 
 | | |
 |---|---|
-| Demo A | Flight booking. Search runs free. Payment stops for approval. The key is never in the agent. Use an API whose key goes in a header, for example Stripe test mode. |
+| Demo A | Flight booking. Search runs free. Payment stops for approval. The key is never in the agent. Use an API whose key goes in a header, for example Stripe test mode. Decision (user, Nov 2): httpbin stands in for Stripe (no account, deterministic); the key swap shows in httpbin's echo. Built on branch `m7`, after m6 merges. |
 | Demo B | A prompt-injected agent tries to read `~/.ssh` and push it out. Blocked. Good work is committed. Bad edits are rolled back. |
 | Numbers | Start time. Memory per agent. Prompts per task versus a stock agent setup. Blocked exfiltration attempts. |
 | Also | README. |
