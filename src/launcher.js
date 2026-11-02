@@ -5,7 +5,7 @@
 import { spawn } from 'node:child_process';
 import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative, dirname, delimiter } from 'node:path';
-import { assertAgentName, hostNode, isInside, realPathOf, runtimePaths } from './runtime.js';
+import { assertAgentName, hostNode, isInside, realPathOf, runtimePaths, usrLinks } from './runtime.js';
 import { assertOverlaySupport, setupOverlay } from './overlay.js';
 import { configPath } from './config.js';
 
@@ -137,7 +137,8 @@ export function buildCaBundle(runtime, caFile) {
 }
 
 /**
- * Start one sandboxed agent. The agent sees a read-only `/usr` and `/etc`,
+ * Start one sandboxed agent. The agent sees a read-only `/usr` and `/etc`
+ * (and the host's `/bin`, `/sbin`, `/lib`, `/lib64`, mirrored),
  * its project and home read-only, the locked drawers masked, no network of
  * its own, and a single front door: anything sent to `localhost:<proxyPort>`
  * is carried out through this agent's socket to the proxy. The agent starts
@@ -203,13 +204,14 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   const { bin: nodeBin, bind: nodeBind } = hostNode(nodeExec, home, proj);
   // Every path the sandbox binds in from the host: the locked drawers and mask folders are
   // hidden wherever they sit under one of these.
-  const roots = [home, proj, '/etc', '/usr', ...(nodeBind ? [nodeBind] : [])];
+  const links = usrLinks();
+  const roots = [home, proj, '/etc', '/usr', ...links.bound, ...(nodeBind ? [nodeBind] : [])];
   const args = [
     '--unshare-pid', '--unshare-uts', '--unshare-ipc', '--unshare-net',
     '--die-with-parent',
     '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
     '--ro-bind', '/usr', '/usr',
-    '--symlink', 'usr/lib64', '/lib64',
+    ...links.args,
     '--ro-bind', '/etc', '/etc',
     // The Node install first: a project or runtime inside it must win over it.
     // It never holds $HOME and is never inside $HOME, /usr or the project (then
@@ -292,7 +294,10 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   }
   args.push(
     '--setenv', 'HOME', home,
-    '--setenv', 'PATH', (!nodeBin || SYSTEM_PATH.includes(nodeBin) ? SYSTEM_PATH : [nodeBin, ...SYSTEM_PATH]).join(':'),
+    // ~/.local/bin (where `claude` installs) goes last, so it never shadows a system tool; no new
+    // exposure: the dir is already visible through the read-only $HOME bind.
+    '--setenv', 'PATH', [...(!nodeBin || SYSTEM_PATH.includes(nodeBin) ? [] : [nodeBin]), ...SYSTEM_PATH,
+      ...(existsSync(`${home}/.local/bin`) ? [`${home}/.local/bin`] : [])].join(':'),
     '--setenv', 'HTTP_PROXY', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'HTTPS_PROXY', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'http_proxy', `http://127.0.0.1:${proxyPort}`,

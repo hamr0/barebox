@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- `~/.local/bin` is on the agent's inside `PATH` when it exists, after the system dirs, so tools installed there (Claude Code's native `claude`) run by bare name. The dir was already visible through the read-only `$HOME` bind; nothing new is exposed.
+
+### Fixed
+
+- `#!/bin/sh` scripts and Node's `exec` failed inside the sandbox on merged-`/usr` hosts (`/bin`, `/sbin` and `/lib` did not exist; only `/lib64` was recreated). The sandbox now mirrors the host's top-level `/bin`, `/sbin`, `/lib` and `/lib64`. This shipped in 0.7.0 and earlier.
+
 ## [0.7.0] - 2026-11-01
 
 ### Added

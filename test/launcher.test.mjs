@@ -2,13 +2,13 @@
 import { describe, it, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, execFile } from 'node:child_process';
-import { copyFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, chmodSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, symlinkSync, chmodSync, lstatSync, readlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { launch, buildCaBundle } from '../src/launcher.js';
-import { hostNode } from '../src/runtime.js';
+import { hostNode, usrLinks } from '../src/runtime.js';
 import { bwrapUsable } from './fixtures/probes.mjs';
 
 function canUnix() {
@@ -293,6 +293,22 @@ describe('locked file masks (no sandbox needed)', () => {
     assert.ok(bind >= 0, `--ro-bind ${pfx} missing: ${args.join(' ')}`);
     assert.ok(bind < args.indexOf(join(home, '.aws')), 'the node bind must land before the locked-drawer masks');
     assert.equal(pathOf(args), `${pfx}/bin:/usr/bin:/bin:/usr/sbin`);
+  });
+
+  it('~/.local/bin, when it exists, is last on the inside PATH, after the system dirs and the node bin', async () => {
+    const home = join(root, 'h8'); const proj = join(root, 'p8'); const rt = join(root, 'r8');
+    const pfx = join(root, 'toolcache', 'node-lb');
+    mkdirSync(join(home, '.local', 'bin'), { recursive: true });
+    mkdirSync(join(pfx, 'bin'), { recursive: true });
+    mkdirSync(proj);
+    process.env.HOME = home;
+    let args = await argsFor({ runtime: rt, agent: 'lb', proj, command: ['true'] });
+    assert.ok(pathOf(args).endsWith(`:/usr/sbin:${home}/.local/bin`) && pathOf(args).startsWith('/usr/bin:/bin:'), pathOf(args));
+    args = await argsFor({ runtime: rt, agent: 'lb', proj, command: ['true'], nodeExec: join(pfx, 'bin', 'node') });
+    assert.equal(pathOf(args), `${pfx}/bin:/usr/bin:/bin:/usr/sbin:${home}/.local/bin`);
+    rmSync(join(home, '.local'), { recursive: true });
+    args = await argsFor({ runtime: rt, agent: 'lb', proj, command: ['true'] });
+    assert.ok(!pathOf(args).includes('.local'), pathOf(args));
   });
 
   it('a node not in a bin/ dir binds only its own dir, and that dir is on PATH', async () => {
@@ -653,6 +669,41 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     } finally { rmSync(pfx, { recursive: true, force: true }); }
   });
 
+  it('/bin/sh and Node exec work inside (merged-/usr links mirrored)', async () => {
+    await listenSock('t1ub');
+    const r = await run(launch({ runtime: rt, agent: 't1ub', proj, command: ['/bin/sh', '-c', 'echo bin-sh-ok'] }));
+    assert.equal(r.code, 0, `exit ${r.code}: ${r.err}`);
+    assert.equal(r.out.trim(), 'bin-sh-ok');
+    const e = await run(launch({ runtime: rt, agent: 't1ub', proj, command: ['node', '-e',
+      "require('child_process').exec('echo exec-ok', (err, out) => { process.stdout.write(err ? 'ERR ' + err.message : out); process.exit(err ? 1 : 0); })"] }));
+    assert.equal(e.code, 0, `exit ${e.code}: ${e.err}`);
+    assert.equal(e.out.trim(), 'exec-ok');
+  });
+
+  it('a #!/bin/sh script in the project runs', async () => {
+    await listenSock('t1us');
+    const sh = join(proj, 'run-usr-links.sh');
+    writeFileSync(sh, '#!/bin/sh\necho shebang-marker\n');
+    chmodSync(sh, 0o755);
+    try {
+      const r = await run(launch({ runtime: rt, agent: 't1us', proj, command: ['./run-usr-links.sh'] }));
+      assert.equal(r.code, 0, `exit ${r.code}: ${r.err}`);
+      assert.equal(r.out.trim(), 'shebang-marker');
+    } finally { rmSync(sh, { force: true }); }
+  });
+
+  it('a program in ~/.local/bin runs by bare name inside', async () => {
+    await listenSock('t1lb');
+    mkdirSync(join(home, '.local', 'bin'), { recursive: true });
+    writeFileSync(join(home, '.local', 'bin', 'hello'), '#!/usr/bin/sh\necho local-bin-marker\n');
+    chmodSync(join(home, '.local', 'bin', 'hello'), 0o755);
+    try {
+      const r = await run(launch({ runtime: rt, agent: 't1lb', proj, command: ['sh', '-c', 'hello'] }));
+      assert.equal(r.code, 0, `exit ${r.code}: ${r.err}`);
+      assert.equal(r.out.trim(), 'local-bin-marker');
+    } finally { rmSync(join(home, '.local'), { recursive: true, force: true }); }
+  });
+
   it('masks the config where XDG_CONFIG_HOME puts it', async () => {
     await listenSock('t1d');
     mkdirSync(join(home, 'altcfg', 'barebox'), { recursive: true });
@@ -968,6 +1019,30 @@ describe('M0 bypass set: no way out but the front door (needs bwrap)', { skip: N
     const c = launch({ runtime: rt, agent: 'b3', proj,
       command: ['bash', '-c', '! echo > /dev/tcp/192.0.2.1/9 2>/dev/null'] });
     assert.equal((await run(c)).code, 0);
+  });
+});
+
+describe('usrLinks: mirror the host top-level links', () => {
+  it('matches lstat of each path on this host', () => {
+    const want = [];
+    for (const p of ['/bin', '/sbin', '/lib', '/lib64']) {
+      let st; try { st = lstatSync(p); } catch { continue; }
+      if (st.isSymbolicLink()) want.push('--symlink', readlinkSync(p), p);
+      else if (st.isDirectory()) want.push('--ro-bind', p, p);
+    }
+    assert.deepEqual(usrLinks().args, want);
+  });
+
+  it('a fake root: link, real dir and missing path', () => {
+    const fake = mkdtempSync(join(tmpdir(), 'bb-ul-'));
+    try {
+      mkdirSync(join(fake, 'usr', 'bin'), { recursive: true });
+      symlinkSync('usr/bin', join(fake, 'bin'));
+      mkdirSync(join(fake, 'lib'));
+      const r = usrLinks(fake);
+      assert.deepEqual(r.args, ['--symlink', 'usr/bin', '/bin', '--ro-bind', join(fake, 'lib'), '/lib']);
+      assert.deepEqual(r.bound, ['/lib']);
+    } finally { rmSync(fake, { recursive: true, force: true }); }
   });
 });
 

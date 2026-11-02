@@ -29,7 +29,7 @@ import {
   finishFailedCommit, changedSince, overlaySupportError, fpNow, OverlayConflictError, DEFAULT_IGNORE,
   hashFile,
 } from '../src/overlay.js';
-import { runtimePaths } from '../src/runtime.js';
+import { runtimePaths, usrLinks } from '../src/runtime.js';
 import { launch } from '../src/launcher.js';
 import { run } from '../src/run.js';
 import { bwrapUsable } from './fixtures/probes.mjs';
@@ -93,7 +93,7 @@ function agentWrite({ lower, upper, work, script }) {
   const merged = mkdtempSync(join(dirname(upper), 't-merged-'));
   try {
     const res = spawnSync('bwrap',
-      ['--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib64', '/lib64',
+      ['--ro-bind', '/usr', '/usr', ...usrLinks().args,
         '--overlay-src', lower, '--overlay', upper, work, merged,
         '--', '/usr/bin/bash', '-c', `M=${sqTest(merged)}; ${script}`],
       { encoding: 'utf8', timeout: 60000 });

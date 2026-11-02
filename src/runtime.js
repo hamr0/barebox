@@ -90,6 +90,27 @@ export function hostNode(execPath, home, proj) {
 }
 
 /**
+ * The host's top-level `/bin`, `/sbin`, `/lib` and `/lib64`, as bwrap args that mirror them
+ * inside the sandbox. On a merged-/usr host they are symlinks into `/usr` (`/bin -> usr/bin`),
+ * recreated as the same links; a real directory (a non-merged distro) is bound read-only;
+ * a missing path is skipped. Without them `#!/bin/sh` scripts and Node's `exec` fail.
+ *
+ * @param {string} [prefix] prepended to each path when looking at the host (tests point it at a fake root); the inside paths are always `/bin` etc.
+ * @returns {{args: string[], bound: string[]}} `args` the bwrap args, to go right after the `/usr` bind; `bound` the real directories bound (they are sandbox roots, so the masks apply under them)
+ */
+export function usrLinks(prefix = '') {
+  const args = [];
+  const bound = [];
+  for (const p of ['/bin', '/sbin', '/lib', '/lib64']) {
+    let st;
+    try { st = fs.lstatSync(prefix + p); } catch { continue; }
+    if (st.isSymbolicLink()) args.push('--symlink', fs.readlinkSync(prefix + p), p);
+    else if (st.isDirectory()) { args.push('--ro-bind', prefix + p, p); bound.push(p); }
+  }
+  return { args, bound };
+}
+
+/**
  * Create a short-lived runtime dir: a short `sbx-` temp dir, keeping unix
  * socket paths under the ~108-char limit.
  *

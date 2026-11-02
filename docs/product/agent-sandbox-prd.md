@@ -650,6 +650,15 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 
 Walls 7.8-8.1 MB. Same code, same bench: the difference is machine load (native TLS memory is released later on a busy box), the same pattern as the plain range (143-172 MB). Drift at 20 agents over 7200 more TLS allows: +1.2 MB quiet, +5.4 MB busy.
 
+**2 GB check (Nov 2): pass.** The whole HTTPS bench (10, 20, 30 and 40 agents) ran inside a 2 GB memory cgroup with swap off (`systemd-run --user --scope -p MemoryMax=2G -p MemorySwapMax=0`): exit 0, proxy 116.4 / 141.0 / 179.9 / 207.2 MB, walls 8.0 MB, cgroup `memory.peak` 527 MB for everything (proxy, 40 sandboxes, the bench and its 1120 client TLS sockets), `oom_kill 0`. A first try as a systemd service (not a scope) died on a TLS handshake after 9 s at 99 MB, not OOM: a service gets a stripped environment; the scope keeps the caller's.
+
+**Real agent (Nov 2).** Claude Code 2.1.316, `claude -p` "summarise README.md in 3 lines", auto mode, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` in both runs; exit 0 every time, about 7-16 s each. Peak RSS (`VmHWM`, polled from the host's `/proc`): Claude Code 249 MB bare and 248 MB inside barebox (2 runs each); the `sbx` process with its in-process proxy 83 MB (2 runs); walls about 8 MB (bench figure). So barebox adds about 91 MB to one real agent and does not change the agent's own memory; the proxy is shared, so each further agent adds about 8 MB of walls plus about 3 MB at the proxy. Whole-cgroup peaks (`memory.peak`) read lower inside (288 vs 321-346 MB) because they count page cache, and bare Claude Code writes its session files under `~/.claude`, which is read-only inside; they are not used for the number.
+
+Findings from the real-agent run (not fixed in M6):
+- `claude` is not on the inside `PATH`: the native installer puts it in `~/.local/bin`, and the sandbox's `PATH` is the system `PATH` plus the bound Node's `bin`. `sbx run -- claude` exits 127 `claude: not found`; the binary itself is visible (via the `$HOME` bind), so `sbx run -- ~/.local/bin/claude` works.
+- `/bin`, `/sbin` and `/lib` did not exist inside on merged-`/usr` hosts (only `/lib64` was recreated): `#!/bin/sh` scripts and Node's `child_process.exec` failed (`spawn /bin/sh ENOENT`), in every release so far. Decision (user, Nov 2): fix before Demo B by mirroring the host's top-level links. `~/.local/bin` is now appended to the inside `PATH` when it exists (user decision, Nov 2).
+- Lead, not reproduced as a barebox bug: under `sbx run -- /usr/bin/time -v claude -p ...`, `time`'s report stops at the same byte both times and the run exits 1, although Claude Code finished; `time -v true` and 300 lines of output pass intact inside.
+
 **Decision (user, Nov 2, replaces the 200-230 MB above):** the proxy budget is **about 205-245 MB in the full HTTPS worst case at 40 agents, quiet to busy machine**. The bench fails above 245 MB.
 
 ### M7. Demos, numbers, README
