@@ -302,12 +302,12 @@ describe('locked file masks (no sandbox needed)', () => {
     mkdirSync(join(pfx, 'bin'), { recursive: true });
     mkdirSync(proj);
     process.env.HOME = home;
-    let args = await argsFor({ runtime: rt, agent: 'lb', proj, command: ['true'] });
+    let args = await argsFor({ runtime: rt, agent: 'lb', proj, command: ['true'], nodeExec: '/usr/bin/node' });
     assert.ok(pathOf(args).endsWith(`:/usr/sbin:${home}/.local/bin`) && pathOf(args).startsWith('/usr/bin:/bin:'), pathOf(args));
     args = await argsFor({ runtime: rt, agent: 'lb', proj, command: ['true'], nodeExec: join(pfx, 'bin', 'node') });
     assert.equal(pathOf(args), `${pfx}/bin:/usr/bin:/bin:/usr/sbin:${home}/.local/bin`);
     rmSync(join(home, '.local'), { recursive: true });
-    args = await argsFor({ runtime: rt, agent: 'lb', proj, command: ['true'] });
+    args = await argsFor({ runtime: rt, agent: 'lb', proj, command: ['true'], nodeExec: '/usr/bin/node' });
     assert.ok(!pathOf(args).includes('.local'), pathOf(args));
   });
 
