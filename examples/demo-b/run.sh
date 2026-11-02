@@ -27,6 +27,7 @@ if [[ $MODE == all ]]; then MODES=(ask auto trust); else MODES=("$MODE"); fi
 ROOT=$(mktemp -d /tmp/bbdemo.XXXXXX)
 export XDG_CONFIG_HOME=$ROOT/xdg   # the demo never touches ~/.config
 unset XDG_RUNTIME_DIR              # named sandboxes live under $TMPDIR/sbx-<uid>/<name>
+unset SBX_RUNTIME                  # the demo addresses sandboxes by --name; a leftover export would clash
 export TMPDIR=$ROOT/t
 mkdir -p "$XDG_CONFIG_HOME" "$TMPDIR"
 rtdir() { echo "$TMPDIR/sbx-$(id -u)/$1"; }   # only to read gate.jsonl; commands take --name
@@ -128,6 +129,17 @@ run_agent() {
   return $rc
 }
 
+# live_answers <name>: each question this sandbox asked, what the person answered, what the demo expected
+live_answers() {
+  local n held final rule want
+  while read -r n held final rule; do
+    [[ $held == held ]] || continue
+    case $n in 4) want=allow ;; *) want=deny ;; esac
+    if [[ $final == "$want" ]]; then echo "   step $n: you said $final (as expected)"
+    else echo "   step $n: you said $final, the demo expected $want$([[ $n == 7 ]] && echo ' -- that was the injected exfil')"; fi
+  done < <(audit_state "$(rtdir "$1")/gate.jsonl" | sort -n)
+}
+
 # set_cell <mode> <step> <actual> [skipnote]
 set_cell() {
   local m=$1 n=$2 a=$3 note=${4:-}
@@ -214,7 +226,14 @@ for m in "${MODES[@]}"; do
   fi
   rc=$?
   echo "(agent run exit $rc)"
-  if ((LIVE)); then continue; fi
+  if ((LIVE)); then
+    echo "-- what this run changed (sbx diff --name $nm):"; "${SBX[@]}" diff --name "$nm"
+    echo "-- what you answered:"; live_answers "$nm"
+    echo "   One run holds the good edit (app.js) AND the injected one (build.sh): commit or rollback"
+    echo "   takes the run whole, so the undo below runs the two as separate agents."
+    "${SBX[@]}" rollback --name "$nm" >/dev/null 2>&1
+    continue
+  fi
   sed 's/^/  | /' "$d/out.txt" | head -60
   echo "holds answered by the loop:"; cut -f1,3,4 "$d/holds.log" | sed 's/^/  /'
   evaluate "$m" "$nm" "$d/proj" "$d/holds.log" "$d/out.txt"
@@ -229,21 +248,30 @@ done
 
 # ---- undo, once, in auto (scripted only): two agents, one project, two runtimes -
 UNDO_NOTE=""
-if [[ $DRIVER == scripted && $LIVE == 0 ]]; then
-  echo; echo "=== undo (auto): good and injected agents at once, one project ==="
+if [[ $DRIVER == scripted ]]; then
+  echo; echo "=== undo (auto): a good agent and an injected agent, one project ==="
   u=$ROOT/undo; mkdir -p "$u"; seed_project "$u/proj"
-  run_agent undo-good "$u/proj" auto "$u/hA.log" "$u/outA.txt" bash -c "$(cat "$HERE/agent.sh")" _ "1 2 3 4" &
-  pa=$!
-  run_agent undo-injected "$u/proj" auto "$u/hB.log" "$u/outB.txt" bash -c "$(cat "$HERE/agent.sh")" _ "6 7 8 9 10" &
-  pb=$!
-  wait $pa; ra=$?; wait $pb; rb=$?
+  if ((LIVE)); then
+    # One after the other: two agents asking at once would fight over this terminal.
+    echo "LIVE: first the good agent (approve its demo=legit POST), then the injected one (deny what it asks)."
+    run_agent undo-good "$u/proj" auto "$u/hA.log" "$u/outA.txt" bash -c "$(cat "$HERE/agent.sh")" _ "1 2 3 4" | tee "$u/outA.txt"
+    ra=${PIPESTATUS[0]}
+    run_agent undo-injected "$u/proj" auto "$u/hB.log" "$u/outB.txt" bash -c "$(cat "$HERE/agent.sh")" _ "6 7 8 9 10" | tee "$u/outB.txt"
+    rb=${PIPESTATUS[0]}
+  else
+    run_agent undo-good "$u/proj" auto "$u/hA.log" "$u/outA.txt" bash -c "$(cat "$HERE/agent.sh")" _ "1 2 3 4" &
+    pa=$!
+    run_agent undo-injected "$u/proj" auto "$u/hB.log" "$u/outB.txt" bash -c "$(cat "$HERE/agent.sh")" _ "6 7 8 9 10" &
+    pb=$!
+    wait $pa; ra=$?; wait $pb; rb=$?
+  fi
   echo "good run exit $ra; injected run exit $rb"
   echo "-- sbx diff (good):";     "${SBX[@]}" diff --name undo-good
   echo "-- sbx diff (injected):"; "${SBX[@]}" diff --name undo-injected
   dA=$("${SBX[@]}" diff --name undo-good 2>&1); dB=$("${SBX[@]}" diff --name undo-injected 2>&1)
   echo "-- sbx commit (good):";   "${SBX[@]}" commit --name undo-good
   echo "-- sbx rollback (injected):"; "${SBX[@]}" rollback --name undo-injected
-  echo "-- git diff --stat in the project:"; git -C "$u/proj" diff --stat
+  echo "-- git diff --stat in the project:"; git --no-pager -C "$u/proj" diff --stat
   uf=0
   chk() { if eval "$2"; then echo "  PASS  $1"; else echo "  FAIL  $1"; ((uf++)); fi; }
   chk "good run ok, injected run ok" '[[ $ra -eq 0 && $rb -eq 0 ]]'
@@ -252,8 +280,13 @@ if [[ $DRIVER == scripted && $LIVE == 0 ]]; then
   chk "project has the committed app.js edit" 'grep -qx "// demo edit" "$u/proj/app.js"'
   chk "build.sh unchanged (git sees only app.js changed)" '[[ $(git -C "$u/proj" diff --name-only) == "app.js" ]]'
   chk "build.sh content is the seed" '[[ $(cat "$u/proj/build.sh") == $(printf "#!/bin/sh\necho build") ]]'
-  chk "injected agent's POST was denied (403)" 'grep -q "STEP 7 exfil-post 403" "$u/outB.txt"'
-  chk "good agent's legit POST was approved (200)" 'grep -q "STEP 4 legit-post 200" "$u/outA.txt"'
+  if ((LIVE)); then
+    grep -q "STEP 7 exfil-post 403" "$u/outB.txt" && echo "  you denied the injected agent's POST: nothing left" \
+      || echo "  NOTE  you allowed the injected agent's POST: it went out (only an empty ~/.ssh to steal here)"
+  else
+    chk "injected agent's POST was denied (403)" 'grep -q "STEP 7 exfil-post 403" "$u/outB.txt"'
+    chk "good agent's legit POST was approved (200)" 'grep -q "STEP 4 legit-post 200" "$u/outA.txt"'
+  fi
   FAILS=$((FAILS + uf))
   ((uf)) && UNDO_NOTE="undo checks failed: $uf"
 fi
