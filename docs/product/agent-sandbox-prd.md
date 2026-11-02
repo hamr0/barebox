@@ -1,7 +1,7 @@
 # PRD: Lightweight local sandbox for AI agents
 
 > Name: barebox (CLI `sbx`).
-> Status: M0–M2 PASS. **barebox 0.7.0 is on npm** (provenance-signed, Nov 1); M2.5 (ask seam), M4 (undo layer), the hardening branch, M3 (bareguard decides every request; rwxmap labels and model endpoints; one audit file; 40 agents per proxy; proxy memory budget about 145-175 MB at 40 agents for plain HTTP, re-decided Nov 2 to about 205-245 MB over HTTPS) and M5 (keys the agent never holds) are released. Next: M6, M7 (order decided Oct 27). Scopes the idea note `agent-sandbox.md` in this folder.
+> Status: M0–M2 PASS. **barebox 0.8.0 is on npm** (provenance-signed, Nov 2); M2.5 (ask seam), M4 (undo layer), the hardening branch, M3 (bareguard decides every request; rwxmap labels and model endpoints; one audit file; 40 agents per proxy; proxy memory budget about 145-175 MB at 40 agents for plain HTTP, re-decided Nov 2 to about 205-245 MB over HTTPS) M5 (keys the agent never holds) and M6 (HTTPS memory budget, real-agent fixes, terminal approvals, `--name`, Demo B) are released. Next: M7 (Demo A, README numbers). Scopes the idea note `agent-sandbox.md` in this folder.
 > Build window: Meta Global AI Developer Hackathon, Oct 26 2026 until the cutoff on **Nov 5 2026, 01:00 Amsterdam time (CET, GMT+1)**. Built to be the seed of a real product, not a throwaway.
 
 This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Problem & goal, Go/no-go, Out of scope, Modules, Open questions. Every POC result updates this file. A result that flips the go/no-go or a module's assumption is a spec change.

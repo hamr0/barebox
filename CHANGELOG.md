@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.8.0] - 2026-11-02
 
 ### Added
 
@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- The proxy builds one MITM TLS context per host (cached, at most 256, oldest evicted) instead of one per tunnel. Over HTTPS at 40 agents this cut about 37 MB; the budget is now about 205-245 MB in the full HTTPS worst case, quiet to busy machine.
 - Calls to a model endpoint are no longer card-scanned. A card number in the conversation held a Claude Code call and killed the agent, while its larger calls passed unscanned. Every other request keeps the floor, in every mode.
 
 ### Fixed
