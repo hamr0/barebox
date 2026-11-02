@@ -400,3 +400,39 @@ F's mutation shows no leak channel, because nothing writes request headers to th
 **Memory: M5 changes nothing measurable.** `npm run bench:agents`, worst case at 40 agents, quiet machine. Two m5 runs at load 0.9-1.3: 147.9 and 163.5 MB. Then main (0.5.0) and m5 alternated at load 2.4-3.2: main 150.4 and 151.1 MB, m5 147.7 and 149.7 MB. At 20 agents: main 112.6 and 128.1, m5 113.2 and 118.6. Drift over 7200 more requests: main −0.4 and +17.6 MB, m5 +6.7 and +1.1 MB. Walls 7.8-8.1 MB in every run. All six pass at 175 MB. The 163.5 MB reading had a pre-hold baseline of 119.5 MB, the same unexplained step main also shows (its +17.6 MB drift run); it is run-to-run variance, not M5. The bench configures no secrets, so the swap code does not run in it; its cost was measured in the POC (3.9-10.7 µs per request).
 
 **Smoke, real internet** (`sbx run`, mode `auto`, a made-up key `sk_test_SMOKE_<hex>` in a host variable, bound to `httpbin.org`): inside, only the placeholder (`sbx-ph-<hex>`) and no host variable; httpbin echoed the real value for curl `Authorization: Bearer`, curl `-u KEY:` (Basic) and Node `fetch` with `x-api-key`; the same placeholder to `postman-echo.com` got `denied: secret.host`. The real value appears 0 times in `gate.jsonl` and in every runtime file; 4 `secret` lines: 3 `swapped: true` for httpbin.org, 1 `swapped: false` for postman-echo.com.
+
+## M6 — HTTPS memory (Nov 2)
+
+Brief: `docs/logs/m6-tls-poc-brief.md`, then `docs/logs/m6-ctx-cache-brief.md`. POC code in `poc/m6/` (never shipped). The M3 bench sends plain HTTP only. Real agent traffic is almost all HTTPS, so the question was what the proxy costs when every request sits in its own live MITM TLS tunnel.
+
+**POC.** 40 agents, worst case, 1120 live TLS sessions (400 keep-alive allow tunnels, one per agent and host, plus 720 held, waiting or working tunnels). Every allow's secret swapped (3600 of 3600). VmRSS after forced GC:
+
+| 40 agents | after 3600 allows | worst case | native outside V8 |
+|---|---|---|---|
+| Plain HTTP (the M3 bench) | 87.1 | 147.1 MB | 104 MB |
+| HTTPS, POC as first built (`upstreamCa`) | 195.9-216.9 | 279.2-296.7 MB | 231-247 MB |
+| HTTPS, production trust path (test CA via `NODE_EXTRA_CA_CERTS`) | 135.8 | 240.8 MB | 193 MB |
+| HTTPS, production trust + one MITM `SecureContext` per host | 120.9 | 203.6 MB | 161 MB |
+
+The go/no-go (175 MB at 40 agents over HTTPS) failed.
+
+**Test artifact, about 40 MB.** `upstreamCa` makes every new upstream TLS connection build a context from about 145 roots plus the test CA. Production passes none. The bench now uses the production trust path.
+
+**Per-host context cache, about 37 MB saved.** Each MITM tunnel built its own context from the PEM files. One cached context per host removes that.
+
+**What stays, about 50 KB per live TLS session.** That is OpenSSL's per-connection state. No cache removes it. 1120 sessions at 40 agents is the main reason HTTPS costs more than plain HTTP.
+
+**Built and measured.** `npm run bench:agents`, HTTPS worst case, production trust path, cache in `src/proxy.js`:
+
+| Agents | quiet (load 5.5) | busy (load 12-17) | live TLS at worst |
+|---|---|---|---|
+| 10 | 117.3 MB | 117.9 MB | 280 |
+| 20 | 133.5 MB | 151.3 MB | 560 |
+| 30 | 176.9 MB | 206.8 MB | 840 |
+| 40 | 206.6 MB | 241.0 MB | 1120 |
+
+After 3600 allows over HTTPS, keep-alive tunnels open, before any holds (quiet / busy): 94.9 / 95.4 MB at 10 agents, 102.5 / 113.3 at 20, 110.8 / 147.4 at 30, 123.8 / 157.5 at 40. Walls 7.8-8.1 MB. The same code and bench read differently on a quiet and a busy machine: native TLS memory is released later under load, the same pattern as the plain range.
+
+**Drift.** Over 7200 more TLS allows at 20 agents: +1.2 MB quiet, +5.4 MB busy. Not shown to be a leak or not: the bench flags growth over 1 MB as a finding; a longer run would settle it.
+
+**Decision (user, Nov 2).** The proxy budget is about 205-245 MB in the full HTTPS worst case at 40 agents, quiet to busy machine. It replaces about 145-175 MB, which was measured with plain HTTP only. The 40-agent cap and the 10 MB walls limit stay. The bench fails above 245 MB.
