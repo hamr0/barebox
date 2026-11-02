@@ -779,6 +779,30 @@ describe('launch walls (needs bwrap)', { skip: NEED_SANDBOX }, () => {
     }
   });
 
+  // The bridge runs `socat -lf /dev/null`: a connection that closes early makes socat print
+  // `E write(...): Broken pipe` on the agent's stderr, which looks like a failure and is not.
+  it('a connection the far end drops early leaves no socat error on the agent stderr', { timeout: 30000 }, async () => {
+    const sock = join(rt, 'socks', 'tq.sock');
+    mkdirSync(join(rt, 'socks'), { recursive: true });
+    try { rmSync(sock); } catch {}
+    const srv = net.createServer((s) => { s.on('error', () => {}); s.destroy(); });
+    await new Promise((resolve, reject) => { srv.on('error', reject); srv.listen(sock, resolve); });
+    servers.push(srv);
+    // Let the far end drop, then write into the dead connection twice.
+    const c = launch({ runtime: rt, agent: 'tq', proj,
+      command: ['bash', '-c', 'trap "" PIPE; exec 3<>/dev/tcp/127.0.0.1/3128; sleep 0.5; echo a >&3; sleep 0.5; echo b >&3; sleep 0.5; true'] });
+    const r = await run(c);
+    assert.notEqual(r.code, 99, `the bridge never came up: ${r.err}`);
+    assert.ok(!/socat\[/.test(r.err), `socat printed on the agent stderr: ${r.err}`);
+  });
+
+  it('exits 99 when the bridge never opens the door (no socat on the inside PATH)', { timeout: 30000 }, async () => {
+    await listenSock('tx');
+    const c = launch({ runtime: rt, agent: 'tx', proj, env: { set: { PATH: '/nonexistent' } },
+      command: ['true'] });
+    assert.equal((await run(c)).code, 99);
+  });
+
   it('sets CA trust env pointing at a readable combined bundle', async () => {
     await listenSock('t6');
     const caDir = join(root, 'ca');

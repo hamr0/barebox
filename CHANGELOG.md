@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- The sandbox bridge no longer prints socat connection errors (`E write(…): Broken pipe`, `Connection reset by peer`) on the agent's stderr when a connection closes early, such as a denied hold.
 - `#!/bin/sh` scripts and Node's `exec` failed inside the sandbox on merged-`/usr` hosts (`/bin`, `/sbin` and `/lib` did not exist; only `/lib64` was recreated). The sandbox now mirrors the host's top-level `/bin`, `/sbin`, `/lib` and `/lib64`. This shipped in 0.7.0 and earlier.
 
 ## [0.7.0] - 2026-11-01

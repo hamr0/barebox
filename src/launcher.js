@@ -321,8 +321,10 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   for (const [k, v] of Object.entries(env.placeholders ?? {})) args.push('--setenv', k, String(v));
   for (const [k, v] of Object.entries(extraEnv)) args.push('--setenv', k, String(v));
   const door = String(proxyPort);
+  // `-lf /dev/null` drops socat's own log: an early-closed connection prints harmless `E` lines.
+  // Safe because a bridge that failed to start is still caught below by the door probe (exit 99).
   const inner = 'ip link set lo up 2>/dev/null; ' +
-    `socat TCP-LISTEN:${door},bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/sbx/agent.sock & ` +
+    `socat -lf /dev/null TCP-LISTEN:${door},bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/sbx/agent.sock & ` +
     `ok=; for i in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/${door}) 2>/dev/null && { ok=1; break; }; sleep 0.1; done; ` +
     '[ -n "$ok" ] || exit 99; exec "$@"';
   const child = spawn(bwrapBin(), [...args, '/usr/bin/bash', '-c', inner, 'bash', ...command],
