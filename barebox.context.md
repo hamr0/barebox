@@ -113,10 +113,11 @@ sbx run [--name <n>] [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]
 ```
 
 `sbx run` uses the current directory as the project and `--name`'s runtime or
-`SBX_RUNTIME` as the runtime (a short temp dir otherwise, printed on stderr). It prints an `ask`
-line when a request parks and a `decided` line when it ends, then `done`;
-with `--json` stdout carries only JSON lines. Its exit code mirrors the
-agent's.
+`SBX_RUNTIME` as the runtime (a short temp dir otherwise, printed on stderr). With a
+terminal it asks each held request in place (see above); without one, or with `--json`, it
+prints an `ask` line when a request parks. Either way a `decided` line follows when it ends,
+then `done`; with `--json` stdout carries only JSON lines and nothing is ever prompted.
+Its exit code mirrors the agent's.
 
 `sbx run` reads one optional config file,
 `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, with keys `mode`,
@@ -244,8 +245,8 @@ hands the real value to the agent.
 
 `<runtime>/gate.jsonl` (`runtimePaths(runtime).audit`; `run()` returns it as
 `audit`) is the only log, one JSON object per line, all in bareguard's shape.
-It is never rotated. `sbx run` without `SBX_RUNTIME` gets a fresh runtime, so a
-fresh log, each run; with a reused `SBX_RUNTIME` the file keeps growing: delete
+It is never rotated. `sbx run` without `SBX_RUNTIME` or `--name` gets a fresh runtime, so a
+fresh log, each run; with a reused `SBX_RUNTIME` or `--name` (its runtime dir is kept) the file keeps growing: delete
 it between runs (no proxy running) to start a new one.
 - Decisions: bareguard's gate lines carry the action (`method`, `url`, `tool`,
   `agent`, `rid`) and an `aid`.
