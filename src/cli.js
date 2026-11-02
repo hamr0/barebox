@@ -9,7 +9,11 @@
 // Settings (mode, holdTimeoutSec, heldBodyMaxMB, localLlm) come from the one config file, see config.js;
 // a flag beats the file. A bad file is a usage-class error (exit 2).
 //
-// sbx run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]
+// With a terminal (stdin and stderr TTYs, no --json) `sbx run` asks each hold in place (prompt.js);
+// `--name <n>` names the sandbox (agent name + runtime dir, runtime.js namedRuntime) and every
+// command takes `--name` instead of SBX_RUNTIME (both together: exit 2).
+//
+// sbx run [--mode ask|auto|trust] [--name <n>] [--json] [--overlay] -- <cmd> [...]
 // Runs one sandboxed agent start-to-finish in this process (project = cwd).
 // The runtime is SBX_RUNTIME when set, else a short temp dir (printed to
 // stderr so a second terminal can approve from it). With --json, stdout
@@ -33,12 +37,12 @@ import { parseArgs } from 'node:util';
 import { resolveConfig } from './config.js';
 import { loadLabels } from './labels.js';
 import { MODES } from './policy.js';
-import { writeFileAtomic } from './holds.js';
 import { run as sandboxRun } from './run.js';
+import { createTerminalPrompt } from './prompt.js';
 import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
-import { assertAgentName, createRuntime, hostNode, runtimePaths, runtimeLive, safe, shellQuote } from './runtime.js';
+import { assertAgentName, createRuntime, namedRuntime, hostNode, runtimePaths, runtimeLive, safe, shellQuote } from './runtime.js';
 
-const USAGE = 'usage: sbx [--help] | pending | approve <id> | deny <id> [reason] | diff [--agent <name>] | commit [--agent <name>] [--skip-conflicts] | rollback [--agent <name>] | run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]';
+const USAGE = 'usage: sbx [--help] | run [--mode ask|auto|trust] [--name <n>] [--json] [--overlay] -- <cmd> [...] | pending|diff|rollback [--name <n>] | approve <id> [--name <n>] | deny <id> [reason] [--name <n>] | commit [--name <n>] [--skip-conflicts]  (--name replaces SBX_RUNTIME; --agent stays for diff/commit/rollback)';
 
 /** Hold ids the CLI accepts: `h<n>` only. Anything else is a usage error, never a path. */
 const HOLD_ID_RE = /^h\d+$/;
@@ -60,8 +64,27 @@ function usage() {
   err(USAGE);
   process.exit(2);
 }
-/** `SBX_RUNTIME` or a usage error. @returns {string} */
-function needRuntime() {
+/**
+ * The runtime a command addresses: `--name` (via `namedRuntime`) or
+ * `SBX_RUNTIME`, never both, never neither. Only `sbx run` creates the dirs.
+ *
+ * @param {string|undefined} name the `--name` value
+ * @param {boolean} [create] make the named dirs (run only)
+ * @returns {string} runtime dir
+ */
+function needRuntime(name, create = false) {
+  if (name !== undefined) {
+    if (process.env.SBX_RUNTIME) {
+      err('give --name or SBX_RUNTIME, not both');
+      process.exit(2);
+    }
+    try {
+      return namedRuntime(name, process.env, { create });
+    } catch (e) {
+      err(e instanceof Error ? e.message : String(e));
+      process.exit(2);
+    }
+  }
   const runtime = process.env.SBX_RUNTIME;
   if (!runtime) usage();
   return runtime;
@@ -73,13 +96,13 @@ function needRuntime() {
  * @returns {{ runtime: string, agent: string, skipConflicts: boolean }}
  */
 function overlayArgs(rest, { skipConflicts = false } = {}) {
-  const runtime = needRuntime();
-  /** @type {{ agent?: string, 'skip-conflicts'?: boolean }} */
+  /** @type {{ name?: string, agent?: string, 'skip-conflicts'?: boolean }} */
   let flagValues;
   try {
     ({ values: flagValues } = parseArgs({
       args: rest,
       options: {
+        name: { type: 'string' },
         agent: { type: 'string' },
         'skip-conflicts': { type: 'boolean' },
       },
@@ -89,7 +112,8 @@ function overlayArgs(rest, { skipConflicts = false } = {}) {
   } catch {
     usage();
   }
-  const agent = flagValues.agent ?? 'agent';
+  const runtime = needRuntime(flagValues.name);
+  const agent = flagValues.agent ?? flagValues.name ?? 'agent';
   const skip = flagValues['skip-conflicts'] ?? false;
   if (skip && !skipConflicts) usage();
   try {
@@ -105,15 +129,16 @@ function overlayArgs(rest, { skipConflicts = false } = {}) {
  * @returns {{ runtime: string, positionals: string[] }}
  */
 function decideArgs(rest) {
-  const runtime = needRuntime();
   /** @type {string[]} */
   let positionals;
+  /** @type {{ name?: string }} */
+  let values;
   try {
-    ({ positionals } = parseArgs({ args: rest, options: {}, strict: true, allowPositionals: true }));
+    ({ positionals, values } = parseArgs({ args: rest, options: { name: { type: 'string' } }, strict: true, allowPositionals: true }));
   } catch {
     usage();
   }
-  return { runtime, positionals };
+  return { runtime: needRuntime(values.name), positionals };
 }
 /** Overlay failure on stderr, exit 1 (`process.exit` is already `never`). @param {unknown} e @returns {never} */
 function fail(e) {
@@ -135,6 +160,24 @@ if (!Object.hasOwn(COMMANDS, /** @type {string} */ (cmd))) usage();
 await COMMANDS[/** @type {keyof typeof COMMANDS} */ (cmd)](args);
 
 /**
+ * Library errors speak of runtimes and agents; for a named sandbox say what
+ * the user can do with the name.
+ *
+ * @param {string|undefined} name the `--name` value
+ * @param {string} msg the error message
+ * @returns {string} message in terms of the sandbox
+ */
+function named(name, msg) {
+  if (name === undefined) return msg;
+  const pid = /is in use by pid (\d+)/.exec(msg);
+  if (pid) return `sandbox ${name} is already running (pid ${pid[1]}): pick another --name, or wait for it to end`;
+  if (msg.includes('uncommitted overlay changes')) {
+    return `sandbox ${name} has uncommitted changes: review with 'sbx diff --name ${name}', then 'sbx commit --name ${name}' or 'sbx rollback --name ${name}'`;
+  }
+  return msg;
+}
+
+/**
  * One sandboxed run in this process. Reports every parked ask from the
  * queue's events (same process, so nothing is polled and no ask is missed),
  * then the agent's exit code.
@@ -147,12 +190,13 @@ async function run(args) {
   if (sep < 0) usage();
   const flags = args.slice(0, sep);
   const command = args.slice(sep + 1);
-  /** @type {{ mode?: string, json?: boolean, overlay?: boolean }} */
+  /** @type {{ name?: string, mode?: string, json?: boolean, overlay?: boolean }} */
   let values;
   try {
     ({ values } = parseArgs({
       args: flags,
       options: {
+        name: { type: 'string' },
         mode: { type: 'string' },
         json: { type: 'boolean' },
         overlay: { type: 'boolean' },
@@ -185,7 +229,11 @@ async function run(args) {
   if (!command.length) usage();
   const json = values.json ?? false;
   const overlay = values.overlay ?? false;
-  const runtime = process.env.SBX_RUNTIME || createRuntime();
+  const name = values.name;
+  if (name !== undefined) {
+    try { assertAgentName(name); } catch (e) { err(e instanceof Error ? e.message : String(e)); process.exit(2); }
+  }
+  const runtime = name !== undefined ? needRuntime(name, true) : (process.env.SBX_RUNTIME || createRuntime());
   const node = hostNode(process.execPath, process.env.HOME || '/root', process.cwd());
   if (node.refused) err(`barebox: not exposing Node at ${node.dir} (${node.refused}); the sandbox uses /usr/bin/node if present`);
   // Agent-controlled bytes, sanitized before they reach a terminal or a JSON consumer.
@@ -194,7 +242,17 @@ async function run(args) {
     for (const k of keys) if (c[k] != null) c[k] = safe(c[k]);
     return c;
   };
+  // A person at this terminal (stdin and stderr are TTYs, not --json) answers
+  // holds here; the file channel stays on, so `sbx approve` still works too.
+  const prompt = !json && process.stdin.isTTY && process.stderr.isTTY
+    ? createTerminalPrompt({
+      input: process.stdin,
+      output: process.stderr,
+      answer: (id, decision, reason) => writeAnswer(runtimePaths(runtime), id, decision, reason),
+    })
+    : null;
   const emitAsk = (h) => {
+    if (prompt?.ask(h)) return;
     const c = clean(h, ['id', 'agent', 'method', 'url', 'rule', 'bodyPreview']);
     if (json) out(JSON.stringify({ ev: 'ask', ...c }));
     else out(`ask ${c.id} ${c.agent} ${c.method} ${c.url} rule=${c.rule}`);
@@ -204,7 +262,9 @@ async function run(args) {
     if (json) out(JSON.stringify({ ev: 'decided', id: c.id, decision: c.decision, reason: c.reason }));
     else out(`decided ${c.id} ${c.decision}${c.reason ? ` (${c.reason})` : ''}`);
   };
-  err(`runtime ${runtime} (answer with: SBX_RUNTIME=${shellQuote(runtime)} sbx approve <id>)`);
+  err(name !== undefined
+    ? `sandbox ${name} (answer from another terminal: sbx approve --name ${name} <id>)`
+    : `runtime ${runtime} (answer with: SBX_RUNTIME=${shellQuote(runtime)} sbx approve <id>)`);
   /** @type {{ exit: number, diff: { path: string }[] } | null} */
   let result = null;
   try {
@@ -213,27 +273,33 @@ async function run(args) {
       .map((s) => s.trim()).filter(Boolean);
     result = await sandboxRun({
       runtime, proj: process.cwd(), command, mode, timeoutMs,
+      ...(name !== undefined ? { agent: name } : {}),
       allowLocal: cfg.localLlm, labels, secrets: cfg.secrets, env: cfg.env,
       ...(cfg.heldBodyMaxMB ? { heldBodyMaxBytes: cfg.heldBodyMaxMB * 1048576 } : {}),
       unsafeTestOnly: { allowLoopback: process.env.SBX_UNSAFE_TEST_ALLOW_LOOPBACK === '1' },
       overlay,
       ...(extraIgnore.length ? { overlayIgnore: ['node_modules', ...extraIgnore] } : {}),
-      onEvent: (e) => { if (e.type === 'ask') emitAsk(e.ask); else emitDecided(e); },
+      onEvent: (e) => {
+        if (e.type === 'ask') emitAsk(e.ask);
+        else { prompt?.decided(e); emitDecided(e); }
+      },
       // With --json stdout is a pure event stream: agent output goes to
       // stderr so a parser never trips over it.
       ...(json ? { stdout: process.stderr, stderr: process.stderr } : {}),
     });
   } catch (e) {
-    err(`run failed: ${e instanceof Error ? e.message : String(e)}`);
+    prompt?.close();
+    err(`run failed: ${named(name, e instanceof Error ? e.message : String(e))}`);
     process.exitCode = 1;
     return;
   }
+  prompt?.close();
   if (json) out(JSON.stringify({ ev: 'done', exit: result.exit }));
   else out(`done exit ${result.exit}`);
   if (overlay) {
     const n = result.diff.length;
     err(n
-      ? `overlay: ${n} change(s) — review with: SBX_RUNTIME=${runtime} sbx diff`
+      ? `overlay: ${n} change(s) — review with: ${name !== undefined ? `sbx diff --name ${name}` : `SBX_RUNTIME=${runtime} sbx diff`}`
       : 'overlay: no changes');
   }
   process.exitCode = result.exit;
@@ -373,16 +439,49 @@ async function answerTarget(rest) {
   return { id, reason: ids.join(' ') || 'denied by user', paths };
 }
 
+/**
+ * The one writer of answer files (`sbx approve`, `sbx deny`, the terminal prompt).
+ * The first answer wins: the file is created exclusively (hard link of a 0600
+ * tmp file), so a second answer for the same id writes nothing.
+ *
+ * @param {ReturnType<typeof runtimePaths>} paths runtime paths
+ * @param {string} id hold id
+ * @param {'allow'|'deny'} decision the answer
+ * @param {string} [reason] deny reason
+ * @returns {boolean} true when written, false when the hold was already answered
+ */
+function writeAnswer(paths, id, decision, reason) {
+  const final = paths.answerFile(id);
+  fs.mkdirSync(path.dirname(final), { recursive: true });
+  const tmp = `${final}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  fs.writeFileSync(tmp, JSON.stringify(decision === 'allow' ? { decision } : { decision, reason }), { mode: 0o600 });
+  try {
+    fs.linkSync(tmp, final);
+    return true;
+  } catch (e) {
+    if (/** @type {NodeJS.ErrnoException} */ (e).code === 'EEXIST') return false;
+    throw e;
+  } finally {
+    fs.unlinkSync(tmp);
+  }
+}
+
+/** @param {string} id hold id @returns {never} */
+function alreadyAnswered(id) {
+  err(`${id} already answered`);
+  process.exit(1);
+}
+
 /** @param {string[]} rest @returns {Promise<void>} */
 async function approve(rest) {
   const { id, paths } = await answerTarget(rest);
-  writeFileAtomic(paths.answerFile(id), JSON.stringify({ decision: 'allow' }));
+  if (!writeAnswer(paths, id, 'allow')) alreadyAnswered(id);
   out(`approved ${id}`);
 }
 
 /** @param {string[]} rest @returns {Promise<void>} */
 async function deny(rest) {
   const { id, reason, paths } = await answerTarget(rest);
-  writeFileAtomic(paths.answerFile(id), JSON.stringify({ decision: 'deny', reason }));
+  if (!writeAnswer(paths, id, 'deny', reason)) alreadyAnswered(id);
   out(`denied ${id}`);
 }

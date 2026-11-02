@@ -57,12 +57,33 @@ export const emptyMatcher = matcherFrom([]);
 export function buildTools(labelTools = {}, localLlm = []) {
   /** @type {Record<string, any>} */
   const models = {};
+  for (const k of modelKeys(localLlm)) models[k] = 'r';
+  return { ...TOOLS, ...models, ...labelTools };
+}
+
+/** @param {string[]} localLlm @returns {Set<string>} every model endpoint's tool key */
+function modelKeys(localLlm) {
+  const keys = new Set();
   const add = (scheme, host, paths) => {
-    for (const p of paths) models[emptyMatcher.match('POST', `${scheme}://${host}${p}`).key] = 'r';
+    for (const p of paths) keys.add(emptyMatcher.match('POST', `${scheme}://${host}${p}`).key);
   };
   for (const [host, paths] of Object.entries(MODEL_PATHS)) add('https', host, paths);
   for (const hp of localLlm) add('http', hp, LOCAL_LLM_PATHS);
-  return { ...TOOLS, ...models, ...labelTools };
+  return keys;
+}
+
+/**
+ * The tool keys that are model calls (they skip the card floor). A label
+ * tool that shares a key wins in `buildTools`, so it is not a model here.
+ *
+ * @param {Record<string, any>} [labelTools] the label files' gate-file tools
+ * @param {string[]} [localLlm] `host:port` pairs of local model servers
+ * @returns {Set<string>} model tool keys
+ */
+export function modelTools(labelTools = {}, localLlm = []) {
+  const keys = modelKeys(localLlm);
+  for (const k of Object.keys(labelTools)) keys.delete(k);
+  return keys;
 }
 
 /**

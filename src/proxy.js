@@ -21,7 +21,7 @@ import { ensureCA, certFor, HOST_RE } from './certs.js';
 import { createCardScanner } from './cardscan.js';
 import { ASK_BODY_LIMIT, DEFAULT_HOLD_MAX_BODY, bodyPreview, createHolds } from './holds.js';
 import { claimRuntime, ensurePrivateDir, runtimePaths } from './runtime.js';
-import { paymentPath, toolFor, buildTools, emptyMatcher } from './policy.js';
+import { paymentPath, toolFor, buildTools, modelTools, emptyMatcher } from './policy.js';
 import { checkUpstream } from './wall.js';
 import { findPlaceholders, urlPlaceholders, applySecrets } from './secrets.js';
 import { Gate } from 'bareguard';
@@ -37,6 +37,8 @@ const WORK_BODY_LIMIT = 65536;
 // Small teams: one proxy serves at most this many agents (the TCP door's
 // 'tcp' agent is not counted); more agents means another proxy.
 const MAX_AGENTS = 40;
+// Agents that browse many hosts must not grow the proxy without limit: one TLS context per host, at most this many.
+const MAX_MITM_CONTEXTS = 256;
 const EMPTY = Buffer.alloc(0);
 const HOP_RESP = new Set(['connection', 'keep-alive', 'proxy-authenticate',
   'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']);
@@ -137,6 +139,7 @@ export function createProxy(opts) {
   // One tools table and one matcher per runtime, shared by every gate.
   const matcher = labels?.matcher ?? emptyMatcher;
   const tools = buildTools(labels?.tools, [...allowLocal]);
+  const models = modelTools(labels?.tools, [...allowLocal]);
   if (!logFile) throw new Error('createProxy: logFile is required');
   if (typeof runtime !== 'string' || !runtime) throw new Error('createProxy: runtime is required');
   // One live proxy per runtime, enforced here: claimed before the hold
@@ -251,6 +254,10 @@ export function createProxy(opts) {
   /** @type {Set<import('node:http').ClientRequest>} */
   const upstreams = new Set();
   const agentServers = new Map();
+  // host -> the MITM SecureContext, built once from the minted cert. Certs are valid 825 days and never
+  // re-minted while their files exist, so an entry cannot go stale within this proxy's life.
+  /** @type {Map<string, import('node:tls').SecureContext>} */
+  const mitmContexts = new Map();
   /** @type {import('node:net').Server|null} */
   let tcp = null;
   let closed = false;
@@ -740,14 +747,16 @@ export function createProxy(opts) {
       const ctx = { agent, method, url: urlStr, headers: { ...creq.headers }, creq, cres, tee,
         hasBody, chunks: [], over: false, freeWork, asked: false, status: null, heldId: null,
         endAsk: null };
+      // A model call is never card-scanned (user decision, Nov 2); the floor keeps every other request.
+      const tool = toolFor(matcher, tools, method, urlStr);
       let cardLike = false;
       if (hasBody) {
         if (await readWorkBody(ctx)) return;
         // Past 64 KB the body streams on unscanned (known gap).
-        if (!ctx.over) cardLike = createCardScanner().push(Buffer.concat(ctx.chunks));
+        if (!ctx.over && !models.has(tool)) cardLike = createCardScanner().push(Buffer.concat(ctx.chunks));
       }
       // The body never goes in the action: bareguard writes the action to its audit file.
-      const action = { type: 'net', tool: toolFor(matcher, tools, method, urlStr), url: urlStr, method, agent,
+      const action = { type: 'net', tool, url: urlStr, method, agent,
         cardLike, paymentPath: paymentPath(urlStr), rid };
       inflightCtx.set(rid, ctx);
       const g = await gateOf(agent);
@@ -963,16 +972,20 @@ export function createProxy(opts) {
     }
     // The cert is minted only for a TLS tunnel. The 200 is already sent, so a
     // failure cannot answer 502: it is logged as the deny it would have been.
-    let creds;
-    try {
-      creds = await certFor(certDir, host);
-    } catch (e) {
-      log({ ev: 'deny', agent: agentOf(sock), code: 502, note: `no cert for ${host}: ${e.message}` });
-      sock.destroy();
-      return;
+    let secureContext = mitmContexts.get(host);
+    if (!secureContext) {
+      try {
+        secureContext = tls.createSecureContext(await certFor(certDir, host));
+      } catch (e) {
+        log({ ev: 'deny', agent: agentOf(sock), code: 502, note: `no cert for ${host}: ${e.message}` });
+        sock.destroy();
+        return;
+      }
+      if (!mitmContexts.has(host) && mitmContexts.size >= MAX_MITM_CONTEXTS) mitmContexts.delete(mitmContexts.keys().next().value);
+      mitmContexts.set(host, secureContext);
     }
     if (closed || sock.destroyed) return;
-    const st = new tls.TLSSocket(sock, { isServer: true, key: creds.key, cert: creds.cert });
+    const st = new tls.TLSSocket(sock, { isServer: true, secureContext });
     st[AGENT] = agent;
     st[SECURE] = true;
     clients.add(st);

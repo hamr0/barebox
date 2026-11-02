@@ -5,7 +5,7 @@
 import { spawn } from 'node:child_process';
 import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative, dirname, delimiter } from 'node:path';
-import { assertAgentName, hostNode, isInside, realPathOf, runtimePaths } from './runtime.js';
+import { assertAgentName, hostNode, isInside, realPathOf, runtimePaths, usrLinks } from './runtime.js';
 import { assertOverlaySupport, setupOverlay } from './overlay.js';
 import { configPath } from './config.js';
 
@@ -137,7 +137,8 @@ export function buildCaBundle(runtime, caFile) {
 }
 
 /**
- * Start one sandboxed agent. The agent sees a read-only `/usr` and `/etc`,
+ * Start one sandboxed agent. The agent sees a read-only `/usr` and `/etc`
+ * (and the host's `/bin`, `/sbin`, `/lib`, `/lib64`, mirrored),
  * its project and home read-only, the locked drawers masked, no network of
  * its own, and a single front door: anything sent to `localhost:<proxyPort>`
  * is carried out through this agent's socket to the proxy. The agent starts
@@ -203,13 +204,14 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   const { bin: nodeBin, bind: nodeBind } = hostNode(nodeExec, home, proj);
   // Every path the sandbox binds in from the host: the locked drawers and mask folders are
   // hidden wherever they sit under one of these.
-  const roots = [home, proj, '/etc', '/usr', ...(nodeBind ? [nodeBind] : [])];
+  const links = usrLinks();
+  const roots = [home, proj, '/etc', '/usr', ...links.bound, ...(nodeBind ? [nodeBind] : [])];
   const args = [
     '--unshare-pid', '--unshare-uts', '--unshare-ipc', '--unshare-net',
     '--die-with-parent',
     '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
     '--ro-bind', '/usr', '/usr',
-    '--symlink', 'usr/lib64', '/lib64',
+    ...links.args,
     '--ro-bind', '/etc', '/etc',
     // The Node install first: a project or runtime inside it must win over it.
     // It never holds $HOME and is never inside $HOME, /usr or the project (then
@@ -292,7 +294,10 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   }
   args.push(
     '--setenv', 'HOME', home,
-    '--setenv', 'PATH', (!nodeBin || SYSTEM_PATH.includes(nodeBin) ? SYSTEM_PATH : [nodeBin, ...SYSTEM_PATH]).join(':'),
+    // ~/.local/bin (where `claude` installs) goes last, so it never shadows a system tool; no new
+    // exposure: the dir is already visible through the read-only $HOME bind.
+    '--setenv', 'PATH', [...(!nodeBin || SYSTEM_PATH.includes(nodeBin) ? [] : [nodeBin]), ...SYSTEM_PATH,
+      ...(existsSync(`${home}/.local/bin`) ? [`${home}/.local/bin`] : [])].join(':'),
     '--setenv', 'HTTP_PROXY', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'HTTPS_PROXY', `http://127.0.0.1:${proxyPort}`,
     '--setenv', 'http_proxy', `http://127.0.0.1:${proxyPort}`,
@@ -316,8 +321,10 @@ export function launch({ runtime, agent, proj, command, proxyPort = 3128,
   for (const [k, v] of Object.entries(env.placeholders ?? {})) args.push('--setenv', k, String(v));
   for (const [k, v] of Object.entries(extraEnv)) args.push('--setenv', k, String(v));
   const door = String(proxyPort);
+  // `-lf /dev/null` drops socat's own log: an early-closed connection prints harmless `E` lines.
+  // Safe because a bridge that failed to start is still caught below by the door probe (exit 99).
   const inner = 'ip link set lo up 2>/dev/null; ' +
-    `socat TCP-LISTEN:${door},bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/sbx/agent.sock & ` +
+    `socat -lf /dev/null TCP-LISTEN:${door},bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:/run/sbx/agent.sock & ` +
     `ok=; for i in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/${door}) 2>/dev/null && { ok=1; break; }; sleep 0.1; done; ` +
     '[ -n "$ok" ] || exit 99; exec "$@"';
   const child = spawn(bwrapBin(), [...args, '/usr/bin/bash', '-c', inner, 'bash', ...command],

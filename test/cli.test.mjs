@@ -171,6 +171,30 @@ describe('sbx approve/deny id validation + pending sanitizing (no sandbox needed
     }
   });
 
+  it('the first answer wins: a second approve/deny exits 1, "already answered", and writes nothing', async () => {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-first-'));
+    const release = claimRuntime(rt);
+    try {
+      mkdirSync(join(rt, 'asks'), { recursive: true });
+      writeFileSync(join(rt, 'asks', 'h1.json'), JSON.stringify({
+        id: 'h1', agent: 'agent', method: 'POST', url: 'http://x/hold', rule: 'r', bodyPreview: 'b',
+      }));
+      const first = await sbxCli(['approve', 'h1'], { SBX_RUNTIME: rt });
+      assert.equal(first.stdout.trim(), 'approved h1');
+      for (const args of [['deny', 'h1', 'too', 'late'], ['approve', 'h1']]) {
+        const e = await sbxCli(args, { SBX_RUNTIME: rt }).then(() => null, (x) => x);
+        assert.equal(e?.code, 1, `${args[0]} after an answer must exit 1`);
+        assert.match(e.stderr, /h1 already answered/);
+        assert.equal(e.stdout, '', 'the loser prints no approved/denied line');
+      }
+      assert.deepEqual(JSON.parse(readFileSync(join(rt, 'answers', 'h1.json'), 'utf8')), { decision: 'allow' });
+      assert.deepEqual(readdirSync(join(rt, 'answers')), ['h1.json'], 'no tmp file left behind');
+    } finally {
+      release();
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
   it('pending and approve refuse stale asks with no live proxy', async () => {
     const rt = mkdtempSync(join(tmpdir(), 'bb-stale-'));
     try {

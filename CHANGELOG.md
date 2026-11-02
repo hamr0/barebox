@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.8.0] - 2026-11-02
+
+### Added
+
+- `sbx run` asks in its own terminal. When stdin and stderr are terminals, a held request prints a plain-language question (what the agent wants to do, why, the URL, a masked body preview) and waits for `y`; anything else denies. A second terminal can still answer; the first answer wins.
+- `sbx run --name <n>` names the sandbox: the agent name and a runtime dir that persists after the run. `sbx pending|approve|deny|diff|commit|rollback --name <n>` address it instead of `SBX_RUNTIME` (giving both is a usage error).
+- `~/.local/bin` is on the agent's inside `PATH` when it exists, after the system dirs, so tools installed there (Claude Code's native `claude`) run by bare name. The dir was already visible through the read-only `$HOME` bind; nothing new is exposed.
+
+### Changed
+
+- The proxy builds one MITM TLS context per host (cached, at most 256, oldest evicted) instead of one per tunnel. Over HTTPS at 40 agents this cut about 37 MB; the budget is now about 205-245 MB in the full HTTPS worst case, quiet to busy machine.
+- Calls to a model endpoint are no longer card-scanned. A card number in the conversation held a Claude Code call and killed the agent, while its larger calls passed unscanned. Every other request keeps the floor, in every mode.
+
+### Fixed
+
+- `sbx approve` and `sbx deny` no longer overwrite an earlier answer: the first answer to a hold wins, and a later one prints `<id> already answered` and exits 1. The terminal prompt prints `answered elsewhere` when it loses.
+- The sandbox bridge no longer prints socat connection errors (`E write(…): Broken pipe`, `Connection reset by peer`) on the agent's stderr when a connection closes early, such as a denied hold.
+- `#!/bin/sh` scripts and Node's `exec` failed inside the sandbox on merged-`/usr` hosts (`/bin`, `/sbin` and `/lib` did not exist; only `/lib64` was recreated). The sandbox now mirrors the host's top-level `/bin`, `/sbin`, `/lib` and `/lib64`. This shipped in 0.7.0 and earlier.
+
 ## [0.7.0] - 2026-11-01
 
 ### Added

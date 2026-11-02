@@ -56,9 +56,25 @@ await proxy.close();
 ## Holds (human approval)
 
 When a request needs a decision (see "Modes and the gate" below), it parks.
-Decide from a second terminal through the file checkpoint (`<runtime>/asks` + `<runtime>/answers`):
+`sbx run` with a terminal (stdin and stderr are TTYs, no `--json`) asks in place:
+the sandbox name, what it wants to do and why, the URL, a masked body
+preview, then `Allow? [y/N] (h3)`. `y` or `yes` allows; anything else, Enter
+included, denies with `denied at the terminal`. A line typed before a question
+appears answers nothing. Name the sandbox with `sbx run --name docs-bot`: the
+name is the agent name and picks the runtime dir
+(`$XDG_RUNTIME_DIR/barebox/<name>`, else `<tmpdir>/sbx-<uid>/<name>`, kept
+after the run), and every other command takes `--name docs-bot` instead of
+`SBX_RUNTIME` (giving both is a usage error).
+
+A second terminal can answer at the same time through the file checkpoint
+(`<runtime>/asks` + `<runtime>/answers`); the first answer wins and the
+prompt says `answered elsewhere`:
 
 ```bash
+npx sbx pending --name docs-bot
+npx sbx approve h1 --name docs-bot
+npx sbx deny h2 "reason here" --name docs-bot
+# or, for a runtime made by the library: SBX_RUNTIME=/tmp/sbx npx sbx pending
 SBX_RUNTIME=/tmp/sbx npx sbx pending
 SBX_RUNTIME=/tmp/sbx npx sbx approve h1
 SBX_RUNTIME=/tmp/sbx npx sbx deny h2 "reason here"
@@ -93,14 +109,15 @@ const { exit, asks, audit, diff, runtime } = await run({
 ```
 
 ```bash
-sbx run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]
+sbx run [--name <n>] [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]
 ```
 
-`sbx run` uses the current directory as the project and `SBX_RUNTIME` as the
-runtime (a short temp dir otherwise, printed on stderr). It prints an `ask`
-line when a request parks and a `decided` line when it ends, then `done`;
-with `--json` stdout carries only JSON lines. Its exit code mirrors the
-agent's.
+`sbx run` uses the current directory as the project and `--name`'s runtime or
+`SBX_RUNTIME` as the runtime (a short temp dir otherwise, printed on stderr). With a
+terminal it asks each held request in place (see above); without one, or with `--json`, it
+prints an `ask` line when a request parks. Either way a `decided` line follows when it ends,
+then `done`; with `--json` stdout carries only JSON lines and nothing is ever prompted.
+Its exit code mirrors the agent's.
 
 `sbx run` reads one optional config file,
 `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, with keys `mode`,
@@ -130,8 +147,9 @@ mode letters, the labels and the floor decide. The floor is two bareguard flags,
 `cardLike` (a body of 64 KB or less holding a card number: 13-19 digits,
 optional single space or dash, first digit 2-6, Luhn-valid) and `paymentPath`
 (`/checkout`, `/payment`, `/orders`, `/purchase`); both ask in every mode,
-`trust` included. Nothing is denied because of a card. Bodies over 64 KB
-stream through unscanned. The body never enters the gate's action.
+`trust` included. Nothing is denied because of a card. One exception: a call
+to a model endpoint (see "Labels and model endpoints") is never card-scanned,
+in any mode. Bodies over 64 KB stream through unscanned. The body never enters the gate's action.
 
 barebox's hold queue is each gate's `humanChannel`: the ask files, `onAsk`
 and `sbx approve|deny` work as above, and the ask carries the gate's `rule`
@@ -227,8 +245,8 @@ hands the real value to the agent.
 
 `<runtime>/gate.jsonl` (`runtimePaths(runtime).audit`; `run()` returns it as
 `audit`) is the only log, one JSON object per line, all in bareguard's shape.
-It is never rotated. `sbx run` without `SBX_RUNTIME` gets a fresh runtime, so a
-fresh log, each run; with a reused `SBX_RUNTIME` the file keeps growing: delete
+It is never rotated. `sbx run` without `SBX_RUNTIME` or `--name` gets a fresh runtime, so a
+fresh log, each run; with a reused `SBX_RUNTIME` or `--name` (its runtime dir is kept) the file keeps growing: delete
 it between runs (no proxy running) to start a new one.
 - Decisions: bareguard's gate lines carry the action (`method`, `url`, `tool`,
   `agent`, `rid`) and an `aid`.
@@ -281,7 +299,9 @@ Model endpoints are `r` (free in every mode): `api.anthropic.com`
 `POST /v1/chat/completions`, `/v1/responses` and `/v1/embeddings`; and on each
 `localLlm` host:port `POST /api/chat`, `/api/generate`, `/api/embed`,
 `/v1/chat/completions` and `/v1/completions` (over http or https). Any other path on
-those hosts is a normal `POST`.
+those hosts is a normal `POST`. Model calls skip the card floor (the
+`paymentPath` mark still applies): a model call carries the whole conversation,
+and a card number in it must not kill the agent.
 
 Label folders are hidden inside the sandbox like the config file, so the agent
 cannot rewrite a letter. `run()` and `createProxy()` take `labels:
@@ -296,10 +316,12 @@ project: the agent sees the real files, every write lands on the upper.
 Review and press it down from the same runtime:
 
 ```bash
-SBX_RUNTIME=/tmp/sbx npx sbx diff [--agent <name>]       # A/M/D, conflicts flagged
-SBX_RUNTIME=/tmp/sbx npx sbx commit [--skip-conflicts]   # refuses on conflicts by default
-SBX_RUNTIME=/tmp/sbx npx sbx rollback                    # throw the paper away
+npx sbx diff --name docs-bot                       # A/M/D, conflicts flagged
+npx sbx commit --name docs-bot [--skip-conflicts]  # refuses on conflicts by default
+npx sbx rollback --name docs-bot                   # throw the paper away
 ```
+
+(Without `--name`: `SBX_RUNTIME=/tmp/sbx npx sbx diff [--agent <name>]`, same for the others.)
 
 A path the project changed after the run started is a conflict: commit
 refuses all of it unless `--skip-conflicts`. `node_modules` is invisible to
@@ -319,12 +341,12 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
   `GIT_SSL_CAINFO`. Without it every HTTPS call from inside fails
   verification. Only `ca.pem` enters the sandbox, never the key.
 - Certificates live in `<runtime>/certs` (`runtime` is required). There is no `certDir` option and no control socket: decisions flow through `<runtime>/asks` + `<runtime>/answers` or `hold.onAsk`. Each minted certificate gets a random 128-bit serial (no shared `ca.srl`), and at most 4 mints run at once.
-- Memory and limits: one proxy serves at most 40 agents, enforced. `addAgent` throws `createProxy: agent limit reached (40 agents per proxy); run another proxy for more`; the TCP door's `tcp` agent does not count, and `removeAgent` frees a place. For more than 40 agents run more proxies. Measured worst case (every agent with 1 parked + 16 waiting + a filled 64 KB body slot): proxy about 100 / 113-120 / 127-133 / 143-172 MB at 10 / 20 / 30 / 40 agents, quiet to busy machine (the budget at 40 agents is the range 145-175 MB; needs bareguard 0.30.0), plus about 8 MB per sandbox (limit 10). Normal use is about 85-120 MB. Audit file size does not move these numbers. barebox is for small teams: free, local and lightweight, built to assist and to connect to many tools, not to run swarms or thousands of agents.
+- Memory and limits: one proxy serves at most 40 agents, enforced. `addAgent` throws `createProxy: agent limit reached (40 agents per proxy); run another proxy for more`; the TCP door's `tcp` agent does not count, and `removeAgent` frees a place. For more than 40 agents run more proxies. Measured worst case (every agent with 1 parked + 16 waiting + a filled 64 KB body slot): proxy about 117 / 133-151 / 177-207 / 207-241 MB at 10 / 20 / 30 / 40 agents with every request in its own HTTPS tunnel, quiet to busy machine (the budget at 40 agents is the range 205-245 MB; needs bareguard 0.30.0), plus about 8 MB per sandbox (limit 10). Normal use is about 95-160 MB over HTTPS with keep-alive tunnels open (about 85-120 MB for plain HTTP). Audit file size does not move these numbers. barebox is for small teams: free, local and lightweight, built to assist and to connect to many tools, not to run swarms or thousands of agents.
 - The TCP door is one agent: every connection through `createProxy`'s TCP `port` counts as the agent `tcp` and shares one hold line. Use `addAgent` sockets (`sbx run` does) for separate lines per agent. `removeAgent(name)` ends that agent's open connections; its held requests end as deny / client gone. `run()` calls it when the sandbox exits, so a request still held then ends as client gone, not `proxy closing`.
 - The upstream wall answers `403` for loopback, link-local (incl. `169.254.169.254`), the host's own addresses, private LAN ranges and unresolvable names. An IPv4 embedded in IPv6 is checked in every spelling: mapped, compat, uncompressed, NAT64 `64:ff9b::/96` (local-use `/48` denied outright) and 6to4 `2002::/16`; NAT64 and 6to4 of public sites stay reachable. Every DNS answer is checked and the dial is pinned to the checked IP; test-only options live under `unsafeTestOnly` (`allowLoopback`, `resolveUpstream`) and production never sets them.
 - `createProxy` throws synchronously on an unopenable `logFile` (a directory, a missing parent, no permission) and releases the runtime. The runtime root, `asks/`, `answers/`, `held/` and `socks/` are owner-only (`0700`) whatever the umask. An existing runtime dir you own is tightened to `0700`; one you don't own (such as `/tmp`) is refused with an error naming the dir and its owner and suggesting a subdir like `/tmp/sbx`. The audit file (`logFile`, `gate.jsonl`) is set to `0600` every time a proxy starts. No request header and no body content is written to it: a body is logged as its length and SHA-256 only. The ask payload's `bodyPreview` (the first 4 KB, card numbers masked except the last 4) lives in the ask file only; other secrets inside a body still show there until bareguard redaction lands. Your `redact` hook shapes the `meta` of barebox's own annotate lines.
 - One proxy per runtime: `createProxy` throws "in use by pid N" (`run()` rejects, `sbx run` exits 1) while a live proxy owns the runtime. The claim is held by the proxy process and the kernel frees it when the process dies, so a crashed proxy never blocks the runtime. Use another `SBX_RUNTIME`, or leave it unset for a fresh one.
-- `launch()` starts the agent in the project dir, in a new session (no controlling terminal). Locked drawers are 21 credential stores (see `LOCKED_PATHS` in `src/launcher.js`); the agent's own model credentials in `~/.claude` stay readable (a known gap: its sign-in tokens refresh themselves, so `secrets` does not cover them). The host environment does not reach the inside: callers that relied on an inherited variable list it in `env.pass` (or pass `launch({ env })` / `extraEnv`). `launch()` finds `bwrap` on your `PATH` but starts it with a fixed `PATH`. The sandbox sees `/usr`, `/etc`, `$HOME` and the project read-only; the Node you run barebox with is visible too: a Node outside those (nvm, a CI toolcache) has its install bound read-only and its dir first on the inside `PATH`, so `node` and global CLIs run inside. A node in a `bin/` dir binds the dir above it; any other layout binds only the node's own dir. It is never bound when that dir is `/`, `$HOME` or above it; then its dir is not on `PATH` either and `sbx run` prints `barebox: not exposing Node at <dir> ...` on stderr (the sandbox uses `/usr/bin/node` if present). `launch({ nodeExec })` overrides `process.execPath`. Locked drawers and `maskDirs` folders are hidden wherever they sit under any of these (`/etc` and the Node install included). So is the runtime tree: a runtime under any of them gets an empty mask, and a runtime that IS `/etc`, `/usr` or the Node install dir throws. A project under the Node install keeps its overlay (the install is bound before it).
+- `launch()` starts the agent in the project dir, in a new session (no controlling terminal). Locked drawers are 21 credential stores (see `LOCKED_PATHS` in `src/launcher.js`); the agent's own model credentials in `~/.claude` stay readable (a known gap: its sign-in tokens refresh themselves, so `secrets` does not cover them). The host environment does not reach the inside: callers that relied on an inherited variable list it in `env.pass` (or pass `launch({ env })` / `extraEnv`). `launch()` finds `bwrap` on your `PATH` but starts it with a fixed `PATH`. The sandbox sees `/usr`, `/etc`, `$HOME` and the project read-only, with the host's `/bin`, `/sbin`, `/lib` and `/lib64` mirrored (symlinks into `/usr` on merged-/usr hosts, so `#!/bin/sh` and Node's `exec` work); the Node you run barebox with is visible too: a Node outside those (nvm, a CI toolcache) has its install bound read-only and its dir first on the inside `PATH`, so `node` and global CLIs run inside. `$HOME/.local/bin`, when it exists, is last on the inside `PATH` (after the system dirs; already visible through the `$HOME` bind), so tools installed there run by bare name. A node in a `bin/` dir binds the dir above it; any other layout binds only the node's own dir. It is never bound when that dir is `/`, `$HOME` or above it; then its dir is not on `PATH` either and `sbx run` prints `barebox: not exposing Node at <dir> ...` on stderr (the sandbox uses `/usr/bin/node` if present). `launch({ nodeExec })` overrides `process.execPath`. Locked drawers and `maskDirs` folders are hidden wherever they sit under any of these (`/etc` and the Node install included). So is the runtime tree: a runtime under any of them gets an empty mask, and a runtime that IS `/etc`, `/usr` or the Node install dir throws. A project under the Node install keeps its overlay (the install is bound before it).
 - `sbx` exits 0 ok, 1 unknown id / refused / no live proxy / run failure, 2 usage; `sbx run` mirrors the agent's exit code.
 - Any listening unix socket under `$HOME` (IDE IPC, rootless-container sockets) is reachable from inside the sandbox: a read-only bind does not block `connect(2)`; the locked-paths list is the lever.
 

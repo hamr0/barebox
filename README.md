@@ -72,8 +72,8 @@ The agent works in your house:
 - **Walls** are [bubblewrap](https://github.com/containers/bubblewrap), unprivileged: separate net/pid/ipc/uts namespaces, read-only binds, tmpfs over locked paths.
 - **Identity** is the socket, not a header the agent could fake. One socket per agent, all into one proxy.
 - **HTTPS inspection** uses a local CA that exists only inside the sandbox; the proxy reads method, URL, headers and body, then forwards.
-- **The doorman's x-rules**, strongest first: card numbers in the body (Luhn) → payment paths (`/checkout`, `/payment`, `/orders`, `/purchase`; a list of payment domains is not built) → rwxmap labels for known APIs → every other request by its letter and the mode (`ask`, `auto`, `trust`; see `barebox.context.md`). The card and payment floor asks in every mode, `trust` included; card numbers are checked in bodies of 64 KB or less.
-- **Approvals** come from a second terminal (`sbx pending`, `sbx approve <id>`, `sbx deny <id>`). Timeout means deny, with a clear `403` reason. One held request per agent at a time: later ones wait in line (16 at most, then `429 hold queue full`), and the deadline counts from arrival.
+- **The doorman's x-rules**, strongest first: card numbers in the body (Luhn) → payment paths (`/checkout`, `/payment`, `/orders`, `/purchase`; a list of payment domains is not built) → rwxmap labels for known APIs → every other request by its letter and the mode (`ask`, `auto`, `trust`; see `barebox.context.md`). The card and payment floor asks in every mode, `trust` included (calls to a model endpoint are not card-scanned); card numbers are checked in bodies of 64 KB or less.
+- **Approvals** are asked in the terminal where you ran `sbx run`, in plain words (`agent wants to SEND data to httpbin.org … Allow? [y/N]`); `y` allows, anything else denies. Name the sandbox (`sbx run --name docs-bot -- <cmd>`) and a second terminal can answer too (`sbx pending --name docs-bot`, `sbx approve <id> --name docs-bot`, `sbx deny <id> --name docs-bot`); the first answer wins. Timeout means deny, with a clear `403` reason. One held request per agent at a time: later ones wait in line (16 at most, then `429 hold queue full`), and the deadline counts from arrival.
 
 ## Keys the agent never holds
 
@@ -97,13 +97,13 @@ Measured, not estimated. Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22.
 | | barebox (measured) | [srt](https://github.com/anthropic-experimental/sandbox-runtime) 0.0.81 (measured) |
 |---|---|---|
 | Memory per sandbox | **7.8 MB** mean, 8.0 MB max | ~100 MB (each sandbox runs its own proxy) |
-| Proxy | one shared: **about 85-120 MB** in normal use; **about 100 / 113-120 / 127-133 / 145-175 MB** at 10 / 20 / 30 / 40 agents in the full worst case (each agent with 1 parked + 16 waiting + a filled body slot). The low end is a quiet machine, the high end a busy one | one per sandbox |
+| Proxy | one shared: **about 95-160 MB** in normal use over HTTPS (10 to 40 agents, keep-alive tunnels open, no holds; plain HTTP alone is about 85-120 MB); **about 117 / 133-151 / 177-207 / 207-241 MB** at 10 / 20 / 30 / 40 agents in the full HTTPS worst case (each agent with 1 parked + 16 waiting + a filled body slot, every request in its own TLS tunnel). The low end is a quiet machine, the high end a busy one. HTTPS costs more because each live TLS session holds about 50 KB of OpenSSL state | one per sandbox |
 | Start + exit | **10 ms** (M0 POC; unmeasured on the rewrite, TODO re-measure) | 1.87-2.05 s |
-| 10 agents | ~180 MB worst case (proxy + 10 x 8 MB) | ~1 GB |
-| 20 agents | ~275-280 MB worst case | ~2 GB |
-| 40 agents | ~465-495 MB worst case | not measured |
+| 10 agents | ~195-200 MB worst case (proxy + 10 x 8 MB) | ~1 GB |
+| 20 agents | ~295-310 MB worst case | ~2 GB |
+| 40 agents | ~525-560 MB worst case | not measured |
 
-barebox is for small teams: free, local and lightweight, built to assist and to connect to many tools, not to run swarms or thousands of agents. Budget: shared proxy about 145-175 MB in the full worst case at 40 agents, each extra sandbox 10 MB or less. 40 agents per proxy is the maximum and it is enforced: `addAgent` refuses the 41st with an error telling you to run another proxy. Above 40, run more proxies. Machine load moves the number. A long audit file does not: 205 MB of audit measured the same as 3 MB. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/logs/findings.md).
+barebox is for small teams: free, local and lightweight, built to assist and to connect to many tools, not to run swarms or thousands of agents. Budget: shared proxy about 205-245 MB in the full HTTPS worst case at 40 agents, each extra sandbox 10 MB or less. 40 agents per proxy is the maximum and it is enforced: `addAgent` refuses the 41st with an error telling you to run another proxy. Above 40, run more proxies. Machine load moves the number. A long audit file does not: 205 MB of audit measured the same as 3 MB. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/logs/findings.md).
 
 ## Roadmap
 

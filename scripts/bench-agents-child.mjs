@@ -8,6 +8,7 @@ import path from 'node:path';
 import { createProxy } from '../src/proxy.js';
 import { loadLabels } from '../src/labels.js';
 import { gateFor } from '../src/policy.js';
+import { loadSecrets } from '../src/secrets.js';
 
 /** @type {any} */
 let proxy;
@@ -16,18 +17,25 @@ let runtime = '';
 const checks = {};
 let labelledAllows = 0;
 const VENDOR = 'bench';
+// Ten HTTPS hosts, all resolved to the local upstream; one secret bound to them.
+const HOSTS = Array.from({ length: 10 }, (_, i) => `h${i}.test`);
 
 /** @type {Record<string, (m: any) => Promise<any>>} */
 const handlers = {
-  async init({ labelsDir, upstreamPort }) {
+  async init({ labelsDir, upstreamPort, secretValue }) {
     runtime = mkdtempSync(path.join(os.tmpdir(), 'bb-ba-rt-'));
     const logFile = path.join(runtime, 'mitm.log');
     const labels = loadLabels({
-      labels: [labelsDir], tenants: { [VENDOR]: [`http://127.0.0.1:${upstreamPort}`] },
+      labels: [labelsDir], tenants: { [VENDOR]: HOSTS.map((h) => `https://${h}:${upstreamPort}`) },
     });
+    const secrets = loadSecrets({ BENCH_KEY: { value: secretValue, hosts: HOSTS } });
+    // No upstreamCa: the parent starts this process with NODE_EXTRA_CA_CERTS, the production trust path.
     proxy = createProxy({
-      runtime, logFile, port: 0, labels,
-      unsafeTestOnly: { allowLoopback: true },
+      runtime, logFile, port: 0, labels, secrets,
+      unsafeTestOnly: {
+        allowLoopback: true,
+        resolveUpstream: async (h) => (/^h\d\.test$/.test(h) ? '127.0.0.1' : null),
+      },
       // The real policy in auto mode, one gate per agent, the runtime's one
       // tools table and audit file. Only `check` is wrapped, to count.
       gateFor: async (agent, { humanChannel, tools }) => {
@@ -44,7 +52,8 @@ const handlers = {
       hold: { timeoutMs: 'never' },
     });
     await proxy.ready;
-    return { runtime, caFile: proxy.caFile, pid: process.pid, tools: Object.keys(labels.tools).length };
+    return { runtime, caFile: proxy.caFile, pid: process.pid, tools: Object.keys(labels.tools).length,
+      placeholder: secrets[0].placeholder };
   },
   async agents({ names }) {
     const socks = {};

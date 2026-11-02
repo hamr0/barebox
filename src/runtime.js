@@ -90,6 +90,27 @@ export function hostNode(execPath, home, proj) {
 }
 
 /**
+ * The host's top-level `/bin`, `/sbin`, `/lib` and `/lib64`, as bwrap args that mirror them
+ * inside the sandbox. On a merged-/usr host they are symlinks into `/usr` (`/bin -> usr/bin`),
+ * recreated as the same links; a real directory (a non-merged distro) is bound read-only;
+ * a missing path is skipped. Without them `#!/bin/sh` scripts and Node's `exec` fail.
+ *
+ * @param {string} [prefix] prepended to each path when looking at the host (tests point it at a fake root); the inside paths are always `/bin` etc.
+ * @returns {{args: string[], bound: string[]}} `args` the bwrap args, to go right after the `/usr` bind; `bound` the real directories bound (they are sandbox roots, so the masks apply under them)
+ */
+export function usrLinks(prefix = '') {
+  const args = [];
+  const bound = [];
+  for (const p of ['/bin', '/sbin', '/lib', '/lib64']) {
+    let st;
+    try { st = fs.lstatSync(prefix + p); } catch { continue; }
+    if (st.isSymbolicLink()) args.push('--symlink', fs.readlinkSync(prefix + p), p);
+    else if (st.isDirectory()) { args.push('--ro-bind', prefix + p, p); bound.push(p); }
+  }
+  return { args, bound };
+}
+
+/**
  * Create a short-lived runtime dir: a short `sbx-` temp dir, keeping unix
  * socket paths under the ~108-char limit.
  *
@@ -97,6 +118,41 @@ export function hostNode(execPath, home, proj) {
  */
 export function createRuntime() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'sbx-'));
+}
+
+/**
+ * The runtime dir of a named sandbox (`sbx run --name <n>`): the name replaces
+ * a `SBX_RUNTIME` path for every command. `$XDG_RUNTIME_DIR/barebox/<n>` when
+ * that variable names an existing dir you own, else
+ * `<tmpdir>/sbx-<uid>/<n>`. The one function that maps a name to a dir.
+ *
+ * @param {string} name sandbox name (the agent-name rules)
+ * @param {NodeJS.ProcessEnv} [env] environment to read `XDG_RUNTIME_DIR` from
+ * @param {{ create?: boolean }} [opts] `create`: make the parent and runtime dirs owner-only (0700); off, nothing is touched
+ * @returns {string} the runtime dir
+ * @throws {Error} on a bad name, a socket path over the 107-byte cap, or a foreign-owned parent
+ */
+export function namedRuntime(name, env = process.env, { create = false } = {}) {
+  assertAgentName(name);
+  const me = /** @type {number} */ (process.getuid?.());
+  const xdg = env.XDG_RUNTIME_DIR;
+  let usable = false;
+  try {
+    usable = !!xdg && path.isAbsolute(xdg) && fs.statSync(xdg).isDirectory() && fs.statSync(xdg).uid === me;
+  } catch {}
+  const parent = usable
+    ? path.join(/** @type {string} */ (xdg), 'barebox')
+    : path.join(os.tmpdir(), `sbx-${me}`);
+  const runtime = path.join(parent, name);
+  const sock = path.join(runtime, 'socks', `${name}.sock`);
+  if (sock.length > MAX_SOCK_PATH) {
+    throw new Error(`sandbox name ${name} makes the socket path too long (${sock.length} > ${MAX_SOCK_PATH}): use a shorter name or a shorter TMPDIR`);
+  }
+  if (create) {
+    ensurePrivateDir(parent);
+    ensurePrivateDir(runtime);
+  }
+  return runtime;
 }
 
 /**

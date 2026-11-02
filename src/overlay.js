@@ -18,7 +18,7 @@ import {
 } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { assertAgentName, hostNode, runtimeTempDir, runtimePaths, safe } from './runtime.js';
+import { assertAgentName, hostNode, runtimeTempDir, runtimePaths, safe, usrLinks } from './runtime.js';
 
 /** One reviewed file change: what the sandbox did at `path`, and whether the project changed underneath it mid-run.
  *
@@ -476,8 +476,8 @@ function bwrapWalk({ lower, upper, work, ignore, scratch, stageDir = null, upper
     // extraction halfway helps nobody.
     // Mount order is the design, stated once here. bwrap applies mounts in
     // argument order, so a later mount lands on top of an earlier one:
-    //   a. host paths at their own paths, read-only — /usr (+ the /lib64
-    //      symlink), srcDir, and nodePrefix when node isn't under /usr;
+    //   a. host paths at their own paths, read-only — /usr (+ the /bin /sbin
+    //      /lib /lib64 links), srcDir, and nodePrefix when node isn't under /usr;
     //   b. then everything the walk creates — the overlay over <merged>,
     //      and the output folders.
     // A host bind placed after the overlay would hide it whenever the
@@ -490,7 +490,7 @@ function bwrapWalk({ lower, upper, work, ignore, scratch, stageDir = null, upper
     // `/` is correct, merely exposing the host read-only to our own walker.
     const res = spawnSync('bwrap',
       ['--die-with-parent', '--unshare-all', '--new-session',
-        '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib64', '/lib64',
+        '--ro-bind', '/usr', '/usr', ...usrLinks().args,
         '--ro-bind', srcDir, srcDir,
         ...(underUsr ? [] : ['--ro-bind', nodePrefix, nodePrefix]),
         '--overlay-src', lower, '--overlay', upper, work, merged,
