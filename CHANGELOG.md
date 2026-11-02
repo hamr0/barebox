@@ -8,7 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `sbx run` asks in its own terminal. When stdin and stderr are terminals, a held request prints a plain-language question (what the agent wants to do, why, the URL, a masked body preview) and waits for `y`; anything else denies. A second terminal can still answer; the first answer wins.
+- `sbx run --name <n>` names the sandbox: the agent name and a runtime dir that persists after the run. `sbx pending|approve|deny|diff|commit|rollback --name <n>` address it instead of `SBX_RUNTIME` (giving both is a usage error).
 - `~/.local/bin` is on the agent's inside `PATH` when it exists, after the system dirs, so tools installed there (Claude Code's native `claude`) run by bare name. The dir was already visible through the read-only `$HOME` bind; nothing new is exposed.
+
+### Changed
+
+- Calls to a model endpoint are no longer card-scanned. A card number in the conversation held a Claude Code call and killed the agent, while its larger calls passed unscanned. Every other request keeps the floor, in every mode.
 
 ### Fixed
 

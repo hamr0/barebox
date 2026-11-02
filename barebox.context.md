@@ -56,9 +56,25 @@ await proxy.close();
 ## Holds (human approval)
 
 When a request needs a decision (see "Modes and the gate" below), it parks.
-Decide from a second terminal through the file checkpoint (`<runtime>/asks` + `<runtime>/answers`):
+`sbx run` with a terminal (stdin and stderr are TTYs, no `--json`) asks in place:
+the sandbox name, what it wants to do and why, the URL, a masked body
+preview, then `Allow? [y/N] (h3)`. `y` or `yes` allows; anything else, Enter
+included, denies with `denied at the terminal`. A line typed before a question
+appears answers nothing. Name the sandbox with `sbx run --name docs-bot`: the
+name is the agent name and picks the runtime dir
+(`$XDG_RUNTIME_DIR/barebox/<name>`, else `<tmpdir>/sbx-<uid>/<name>`, kept
+after the run), and every other command takes `--name docs-bot` instead of
+`SBX_RUNTIME` (giving both is a usage error).
+
+A second terminal can answer at the same time through the file checkpoint
+(`<runtime>/asks` + `<runtime>/answers`); the first answer wins and the
+prompt says `answered elsewhere`:
 
 ```bash
+npx sbx pending --name docs-bot
+npx sbx approve h1 --name docs-bot
+npx sbx deny h2 "reason here" --name docs-bot
+# or, for a runtime made by the library: SBX_RUNTIME=/tmp/sbx npx sbx pending
 SBX_RUNTIME=/tmp/sbx npx sbx pending
 SBX_RUNTIME=/tmp/sbx npx sbx approve h1
 SBX_RUNTIME=/tmp/sbx npx sbx deny h2 "reason here"
@@ -93,11 +109,11 @@ const { exit, asks, audit, diff, runtime } = await run({
 ```
 
 ```bash
-sbx run [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]
+sbx run [--name <n>] [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]
 ```
 
-`sbx run` uses the current directory as the project and `SBX_RUNTIME` as the
-runtime (a short temp dir otherwise, printed on stderr). It prints an `ask`
+`sbx run` uses the current directory as the project and `--name`'s runtime or
+`SBX_RUNTIME` as the runtime (a short temp dir otherwise, printed on stderr). It prints an `ask`
 line when a request parks and a `decided` line when it ends, then `done`;
 with `--json` stdout carries only JSON lines. Its exit code mirrors the
 agent's.
@@ -130,8 +146,9 @@ mode letters, the labels and the floor decide. The floor is two bareguard flags,
 `cardLike` (a body of 64 KB or less holding a card number: 13-19 digits,
 optional single space or dash, first digit 2-6, Luhn-valid) and `paymentPath`
 (`/checkout`, `/payment`, `/orders`, `/purchase`); both ask in every mode,
-`trust` included. Nothing is denied because of a card. Bodies over 64 KB
-stream through unscanned. The body never enters the gate's action.
+`trust` included. Nothing is denied because of a card. One exception: a call
+to a model endpoint (see "Labels and model endpoints") is never card-scanned,
+in any mode. Bodies over 64 KB stream through unscanned. The body never enters the gate's action.
 
 barebox's hold queue is each gate's `humanChannel`: the ask files, `onAsk`
 and `sbx approve|deny` work as above, and the ask carries the gate's `rule`
@@ -281,7 +298,9 @@ Model endpoints are `r` (free in every mode): `api.anthropic.com`
 `POST /v1/chat/completions`, `/v1/responses` and `/v1/embeddings`; and on each
 `localLlm` host:port `POST /api/chat`, `/api/generate`, `/api/embed`,
 `/v1/chat/completions` and `/v1/completions` (over http or https). Any other path on
-those hosts is a normal `POST`.
+those hosts is a normal `POST`. Model calls skip the card floor (the
+`paymentPath` mark still applies): a model call carries the whole conversation,
+and a card number in it must not kill the agent.
 
 Label folders are hidden inside the sandbox like the config file, so the agent
 cannot rewrite a letter. `run()` and `createProxy()` take `labels:
@@ -296,10 +315,12 @@ project: the agent sees the real files, every write lands on the upper.
 Review and press it down from the same runtime:
 
 ```bash
-SBX_RUNTIME=/tmp/sbx npx sbx diff [--agent <name>]       # A/M/D, conflicts flagged
-SBX_RUNTIME=/tmp/sbx npx sbx commit [--skip-conflicts]   # refuses on conflicts by default
-SBX_RUNTIME=/tmp/sbx npx sbx rollback                    # throw the paper away
+npx sbx diff --name docs-bot                       # A/M/D, conflicts flagged
+npx sbx commit --name docs-bot [--skip-conflicts]  # refuses on conflicts by default
+npx sbx rollback --name docs-bot                   # throw the paper away
 ```
+
+(Without `--name`: `SBX_RUNTIME=/tmp/sbx npx sbx diff [--agent <name>]`, same for the others.)
 
 A path the project changed after the run started is a conflict: commit
 refuses all of it unless `--skip-conflicts`. `node_modules` is invisible to

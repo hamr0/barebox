@@ -21,7 +21,7 @@ import { ensureCA, certFor, HOST_RE } from './certs.js';
 import { createCardScanner } from './cardscan.js';
 import { ASK_BODY_LIMIT, DEFAULT_HOLD_MAX_BODY, bodyPreview, createHolds } from './holds.js';
 import { claimRuntime, ensurePrivateDir, runtimePaths } from './runtime.js';
-import { paymentPath, toolFor, buildTools, emptyMatcher } from './policy.js';
+import { paymentPath, toolFor, buildTools, modelTools, emptyMatcher } from './policy.js';
 import { checkUpstream } from './wall.js';
 import { findPlaceholders, urlPlaceholders, applySecrets } from './secrets.js';
 import { Gate } from 'bareguard';
@@ -139,6 +139,7 @@ export function createProxy(opts) {
   // One tools table and one matcher per runtime, shared by every gate.
   const matcher = labels?.matcher ?? emptyMatcher;
   const tools = buildTools(labels?.tools, [...allowLocal]);
+  const models = modelTools(labels?.tools, [...allowLocal]);
   if (!logFile) throw new Error('createProxy: logFile is required');
   if (typeof runtime !== 'string' || !runtime) throw new Error('createProxy: runtime is required');
   // One live proxy per runtime, enforced here: claimed before the hold
@@ -746,14 +747,16 @@ export function createProxy(opts) {
       const ctx = { agent, method, url: urlStr, headers: { ...creq.headers }, creq, cres, tee,
         hasBody, chunks: [], over: false, freeWork, asked: false, status: null, heldId: null,
         endAsk: null };
+      // A model call is never card-scanned (user decision, Nov 2); the floor keeps every other request.
+      const tool = toolFor(matcher, tools, method, urlStr);
       let cardLike = false;
       if (hasBody) {
         if (await readWorkBody(ctx)) return;
         // Past 64 KB the body streams on unscanned (known gap).
-        if (!ctx.over) cardLike = createCardScanner().push(Buffer.concat(ctx.chunks));
+        if (!ctx.over && !models.has(tool)) cardLike = createCardScanner().push(Buffer.concat(ctx.chunks));
       }
       // The body never goes in the action: bareguard writes the action to its audit file.
-      const action = { type: 'net', tool: toolFor(matcher, tools, method, urlStr), url: urlStr, method, agent,
+      const action = { type: 'net', tool, url: urlStr, method, agent,
         cardLike, paymentPath: paymentPath(urlStr), rid };
       inflightCtx.set(rid, ctx);
       const g = await gateOf(agent);

@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createProxy } from '../src/proxy.js';
 import { run } from '../src/run.js';
-import { gateFor as policyGate, MODES } from '../src/policy.js';
+import { gateFor as policyGate, MODES, modelTools } from '../src/policy.js';
 import { runtimePaths } from '../src/runtime.js';
 import { startHttp } from './fixtures/upstream.mjs';
 import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
@@ -54,13 +54,13 @@ after(async () => { await up?.close(); });
  * One proxy on its own runtime. `mode` builds the real policy gates; a
  * `gateFor` option replaces them with a test gate. Torn down after `fn`.
  */
-async function withProxy({ mode = 'auto', gateFor, hold = {} }, fn) {
+async function withProxy({ mode = 'auto', gateFor, hold = {}, proxyOpts = {} }, fn) {
   const rt = mkdtempSync(join(tmpdir(), 'bb-gate-'));
   const paths = runtimePaths(rt);
   const proxy = createProxy({ port: 0, logFile: paths.audit, runtime: rt, clientIdleMs: 5000,
-    unsafeTestOnly: { allowLoopback: true },
-    gateFor: gateFor ?? ((agent, { humanChannel }) =>
-      policyGate({ agent, mode, auditPath: paths.audit, humanChannel })),
+    unsafeTestOnly: { allowLoopback: true }, ...proxyOpts,
+    gateFor: gateFor ?? ((agent, { humanChannel, tools }) =>
+      policyGate({ agent, mode, auditPath: paths.audit, humanChannel, tools })),
     hold: { timeoutMs: 15000, pollMs: 25, ...hold } });
   const { port } = await proxy.ready;
   const t = {
@@ -147,6 +147,50 @@ describe('modes decide through the gate', () => {
       });
     });
   }
+});
+
+describe('model calls skip the card floor', () => {
+  const MODEL = 'v1/chat/completions';
+  const opts = () => ({ allowLocal: [`127.0.0.1:${up.port}`] });
+  for (const mode of MODES) {
+    it(`${mode}: a card in the body of a local-model call forwards with no hold`, { timeout: 20000 }, async () => {
+      await withProxy({ mode, proxyOpts: opts() }, async (t) => {
+        const r = await t.send(MODEL, Buffer.from(`pay ${CARD} now`)).done;
+        assert.equal(r.status, 200);
+        assert.equal(r.body.toString(), `pay ${CARD} now`);
+        assert.equal(t.proxy.pending().length, 0);
+      });
+    });
+  }
+
+  for (const mode of MODES) {
+    it(`${mode}: control, the same body to a non-model path still asks flags.cardLike`, { timeout: 20000 }, async () => {
+      await withProxy({ mode, proxyOpts: opts() }, async (t) => {
+        const { done } = t.send('v1/other', Buffer.from(`pay ${CARD} now`));
+        const [h] = await t.parked();
+        assert.equal(h.rule, 'flags.cardLike');
+        t.answer(h.id, { decision: 'deny' });
+        assert.equal((await done).status, 403);
+      });
+    });
+  }
+
+  it('a payment path on a model host still asks (paymentPath unchanged)', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'trust', proxyOpts: opts() }, async (t) => {
+      const { done } = t.send('v1/chat/completions/checkout', Buffer.from('m=1'));
+      const [h] = await t.parked();
+      assert.equal(h.rule, 'flags.paymentPath');
+      t.answer(h.id, { decision: 'deny' });
+      assert.equal((await done).status, 403);
+    });
+  });
+
+  it('a label tool that shares a model key is not a model', () => {
+    const key = [...modelTools({}, ['h:1'])].find((k) => k.startsWith('h:1.'));
+    assert.ok(key);
+    assert.ok(modelTools({}, ['h:1']).has(key));
+    assert.ok(!modelTools({ [key]: { letter: 'x' } }, ['h:1']).has(key));
+  });
 });
 
 describe('the floor asks in trust mode', () => {

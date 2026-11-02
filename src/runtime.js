@@ -121,6 +121,41 @@ export function createRuntime() {
 }
 
 /**
+ * The runtime dir of a named sandbox (`sbx run --name <n>`): the name replaces
+ * a `SBX_RUNTIME` path for every command. `$XDG_RUNTIME_DIR/barebox/<n>` when
+ * that variable names an existing dir you own, else
+ * `<tmpdir>/sbx-<uid>/<n>`. The one function that maps a name to a dir.
+ *
+ * @param {string} name sandbox name (the agent-name rules)
+ * @param {NodeJS.ProcessEnv} [env] environment to read `XDG_RUNTIME_DIR` from
+ * @param {{ create?: boolean }} [opts] `create`: make the parent and runtime dirs owner-only (0700); off, nothing is touched
+ * @returns {string} the runtime dir
+ * @throws {Error} on a bad name, a socket path over the 107-byte cap, or a foreign-owned parent
+ */
+export function namedRuntime(name, env = process.env, { create = false } = {}) {
+  assertAgentName(name);
+  const me = /** @type {number} */ (process.getuid?.());
+  const xdg = env.XDG_RUNTIME_DIR;
+  let usable = false;
+  try {
+    usable = !!xdg && path.isAbsolute(xdg) && fs.statSync(xdg).isDirectory() && fs.statSync(xdg).uid === me;
+  } catch {}
+  const parent = usable
+    ? path.join(/** @type {string} */ (xdg), 'barebox')
+    : path.join(os.tmpdir(), `sbx-${me}`);
+  const runtime = path.join(parent, name);
+  const sock = path.join(runtime, 'socks', `${name}.sock`);
+  if (sock.length > MAX_SOCK_PATH) {
+    throw new Error(`sandbox name ${name} makes the socket path too long (${sock.length} > ${MAX_SOCK_PATH}): use a shorter name or a shorter TMPDIR`);
+  }
+  if (create) {
+    ensurePrivateDir(parent);
+    ensurePrivateDir(runtime);
+  }
+  return runtime;
+}
+
+/**
  * Create a temp dir inside the runtime tree: `mkdtemp` is a runtime-layout
  * writer, so it lives here, not in `overlay.js`. Used for the merged-view
  * mount (`merged`) and the walker manifest dir (`walk`).
