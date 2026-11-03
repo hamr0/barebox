@@ -21,7 +21,7 @@
 
 Agents need real access to be useful — shell, files, network. Today you pick one of two bad options:
 
-- **Approve everything.** About forty prompts per task. People stop reading them, or switch prompts off.
+- **Approve everything.** A prompt for nearly every command and edit. People stop reading them, or switch prompts off.
 - **Heavy isolation.** Docker or a VM: images, a daemon, root, and the agent can't use your installed toolchain. Most people skip it.
 
 Neither matches where the risk is. Reads are mostly harmless. File writes can be fixed. Only a few actions can't be undone: paying, sending, publishing, pushing. barebox asks about those and nothing else.

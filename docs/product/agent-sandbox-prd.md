@@ -12,7 +12,7 @@ This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Probl
 
 Agents need real access to be useful: shell, files, network. Today a developer picks one of two bad options.
 
-- **Approve everything.** About forty prompts per task. People stop reading them, or switch prompts off.
+- **Approve everything.** A prompt for nearly every command and edit. People stop reading them, or switch prompts off.
 - **Heavy isolation.** Docker or a VM. Images, a daemon, root, and the agent can't use the installed toolchain. Most people skip it.
 
 Neither matches where the risk is. Reads are mostly harmless. File writes can be fixed. Only a few actions can't be undone: paying, sending, publishing, pushing.
@@ -705,7 +705,7 @@ This is a plan, not a result. It shifts as POCs return. Review cap per module: o
 | 7 | Nov 1 | M5 (keys) | |
 | 8 | Nov 2 | M6 numbers. Demo B. | Memory targets measured |
 | 9 | Nov 3 | Demo A, README. Freeze in the evening. | |
-| 10 | Nov 4 | Release 0.6.0 and submission (0.5.0 shipped M3 on Oct 30) | |
+| 10 | Nov 4 | Release 0.9.0 and submission (0.6.0 shipped M5 on Nov 1, 0.8.0 on Nov 2) | |
 | 11 | Nov 5 | Buffer only, before 01:00 Amsterdam time | |
 
 Days 1–3 are results; the rest is a plan. F1 (bareguard `askUnheld`) and F2 (rwxmap `match` entry) land in their own repos and gate M3's `auto`/`ask` modes; if either slips, M3 ships `trust` + floor first.
