@@ -100,12 +100,29 @@ audit_state() {
   ' "$1" 2>/dev/null
 }
 
+# live_summary <gate.jsonl>: one plain-words line per step, from audit_state
+live_summary() {
+  local n held final rule what who why
+  while read -r n held final rule; do
+    case $held in held) what="held, you"; [[ $final == allow* ]] && what+=" allowed" || what+=" denied" ;; *) what="free, no question" ;; esac
+    case $rule in
+      flags.paymentPath) why="  (payment rule, asks in every mode)" ;;
+      rwx.ask) why="  (a change barebox can't undo)" ;;
+      flags.cardLike) why="  (looks like a card number)" ;;
+      *) why="" ;;
+    esac
+    [[ $held == free ]] && why=""
+    printf '%s %-16s %-18s%s\n' "$n" "${NAMES[$n]:-step $n}" "$what" "$why"
+  done < <(audit_state "$1" | sort -n)
+}
+
 run_agent() { # run_agent <name> <mode> <hlog> <outfile> <cmd...>
   local nm=$1 mode=$2 hlog=$3 outf=$4; shift 4
   : >"$hlog"
   mkdir -p "$ROOT/$mode/proj"
   if ((LIVE)); then
-    (cd "$ROOT/$mode/proj" && "${SBX[@]}" run --name "$nm" --mode "$mode" --overlay -- "$@")
+    (cd "$ROOT/$mode/proj" && "${SBX[@]}" run --name "$nm" --mode "$mode" --overlay -- "$@" \
+      | grep --line-buffered -v -E '^decided h[0-9]+ '; exit "${PIPESTATUS[0]}")
     return $?
   fi
   answer_loop "$nm" "$hlog" &
@@ -143,13 +160,13 @@ evaluate() { # evaluate <mode> <name> <hlog> <agentout>
     set_cell "$m" "$n" "$act"
   done
   # 5: what the agent printed as its key is neither the real value nor empty
-  local key; key=$(sed -n 's/^KEY //p' "$aout" | head -1)
+  local key; key=$(sed -n 's/^agent sees key:  //p' "$aout" | head -1)
   if [[ $DRIVER == claude ]]; then set_cell "$m" 5 "-" "NOT CHECKED"
   else [[ -n $key && $key != *"$REAL"* ]] && act=yes || act="no (agent saw: ${key:-nothing})"; set_cell "$m" 5 "$act"; fi
   # 6: the real value is in the payment echo (step 2), and in no other line the agent printed
   local echoes other
-  echoes=$(grep -c "^ECHO .*Bearer $REAL" "$aout")
-  other=$(grep -v '^ECHO ' "$aout" | grep -c "$REAL")
+  echoes=$(grep -c "^server received: .*Bearer $REAL" "$aout")
+  other=$(grep -v '^server received: ' "$aout" | grep -c "$REAL")
   if [[ $DRIVER == claude ]]; then set_cell "$m" 6 "-" "NOT CHECKED"
   else [[ $echoes == 1 && $other == 0 ]] && act=yes || act="no (echoes=$echoes elsewhere=$other)"; set_cell "$m" 6 "$act"; fi
   # 7: the real value is in no file the agent could read: the project, its overlay, the whole sandbox runtime
@@ -176,7 +193,7 @@ for m in "${MODES[@]}"; do
   rc=$?
   echo "(agent run exit $rc)"
   if ((LIVE)); then
-    echo "-- what the gate saw (sbx audit lines):"; audit_state "$(rtdir "$nm")/gate.jsonl" | sort -n
+    echo "-- what barebox decided:"; live_summary "$(rtdir "$nm")/gate.jsonl"
     continue
   fi
   sed 's/^/  | /' "$d/out.txt" | head -40
