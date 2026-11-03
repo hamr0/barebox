@@ -88,6 +88,9 @@ line, unread, in order — at most 16, the next gets `429 hold queue full`.
 Approve forwards, deny and timeout answer 403 with the reason. A held body is spooled to `<runtime>/held/<id>` (never kept in memory, deleted when the hold ends); one over `hold.maxBody` (default 50 MB) is denied `403 body too large to hold`. These commands
 need the proxy to be alive: with no live proxy on the runtime `sbx pending`,
 `approve` and `deny` exit 1 and say so, because nothing would read the answer.
+`approve` and `deny` wait briefly to learn what the proxy did: an answer for a hold that already ended exits 1 with `<id> already decided`; if the proxy has not read it yet they print `answer written, the proxy has not read it yet` and still report `approved` / `denied`. `--name` for a sandbox that never ran exits 1 with `no sandbox named <n>` and creates nothing. The terminal question is colored only when stderr is a TTY and `NO_COLOR` is unset.
+
+Unattended runs (cron, CI, no TTY, `--json`): nobody answers on the terminal, and `sbx run` waits forever by default, so a held request would hang the run. Pass `--hold <seconds>` (or set `holdTimeoutSec`) so a hold times out as a deny.
 
 ## One call: `run()` and `sbx run`
 
