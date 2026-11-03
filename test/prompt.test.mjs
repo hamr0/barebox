@@ -21,7 +21,7 @@ describe('questionLines', () => {
       "   Why:  a change barebox can't undo",
       '   URL:  POST https://httpbin.org/post?step=7',
       '   Data: step=7&stolen=ssh:',
-      '   Allow? [y/N] (h3)  — no answer in 120 s means No',
+      '   Allow? [y/N] (hold h3)  — no answer in 120 s means No',
     ]);
   });
 
@@ -103,14 +103,16 @@ describe('createTerminalPrompt', () => {
     assert.deepEqual(answers, [['h2', 'deny', 'denied at the terminal']]);
   });
 
-  it('a half-typed line from before the question does not join the answer', async () => {
+  it('a half-typed line from a question that ended does not join the next answer', async () => {
     const { input, p, answers } = setup();
-    input.write('ye'); // no newline, nothing open
-    await tick();
     p.ask(ask({ id: 'h1' }));
+    input.write('ye'); // typed into h1, no newline
+    await tick();
+    p.decided({ id: 'h1', decision: 'deny', reason: 'hold timeout' });
+    p.ask(ask({ id: 'h2' }));
     input.write('s\n');
     await tick();
-    assert.deepEqual(answers, [['h1', 'deny', 'denied at the terminal']], '"s" is not yes');
+    assert.deepEqual(answers, [['h2', 'deny', 'denied at the terminal']], '"s" is not yes: "ye" must be gone');
   });
 
   it('a second ask while one is open is refused (false) and never answered here', async () => {
@@ -188,5 +190,60 @@ describe('createTerminalPrompt', () => {
     assert.equal(input.listenerCount('data'), 0);
     assert.equal(input.isPaused(), true);
     p.ask(ask()); // after close: ignored, no throw
+  });
+});
+
+describe('color', () => {
+  const B = '\x1b[1m', D = '\x1b[2m', R = '\x1b[31m', G = '\x1b[32m', Y = '\x1b[33m', C = '\x1b[36m', X = '\x1b[0m';
+  const now = Date.parse('2026-11-02T10:00:00Z');
+  const a = ask({ expiresAt: '2026-11-02T10:02:00Z' });
+
+  it('color on: yellow header with a bold name, bold labels, cyan URL, dim data and id', () => {
+    assert.deepEqual(questionLines(a, now, true), [
+      `${Y}⏸  ${B}docs-bot\x1b[22m wants to SEND data to httpbin.org${X}`,
+      `   ${B}Why:${X}  a change barebox can't undo`,
+      `   ${B}URL:${X}  ${C}POST https://httpbin.org/post?step=7${X}`,
+      `   ${B}Data:${X} ${D}step=7&stolen=ssh:${X}`,
+      `   ${B}Allow? [y/N]${X} ${D}(hold h3)  — no answer in 120 s means No${X}`,
+    ]);
+  });
+
+  it('color off (the default) is byte-for-byte the plain block', () => {
+    assert.deepEqual(questionLines(a, now), questionLines(a, now, false));
+    assert.ok(!questionLines(a, now).join('').includes('\x1b'));
+  });
+
+  it('an escape in the url, body, agent or id never reaches the output, color on', () => {
+    const evil = '\x1b[31mRED';
+    const lines = questionLines(ask({ url: `https://h.test/${evil}`, bodyPreview: evil, agent: evil, id: evil }), now, true).join('\n');
+    const raw = lines.replace(/\x1b\[(?:0|1|2|22|31|32|33|36)m/g, (m, off) => `<${off}>`);
+    assert.equal((lines.match(/\x1b\[31m/g) ?? []).length, 0, 'no red escape from agent bytes (red is never used in a question)');
+    assert.ok(!/\x1b\[31mRED/.test(lines));
+    assert.ok(!raw.includes('\x1b'), 'only the known paint sequences are present');
+  });
+
+  it('allowed is bold green, denied bold red; timed out / agent gone red; elsewhere plain', async () => {
+    const input = new PassThrough();
+    const chunks = [];
+    const p = createTerminalPrompt({ input, output: { write: (s) => { chunks.push(s); } }, answer: () => {}, color: true });
+    const seen = () => chunks.join('');
+    p.ask(ask({ id: 'h1' })); input.write('y\n'); await tick();
+    assert.ok(seen().includes(`${G}${B}✓ allowed${X}\n`), seen());
+    p.ask(ask({ id: 'h2' })); input.write('n\n'); await tick();
+    assert.ok(seen().includes(`${R}${B}✗ denied${X}\n`), seen());
+    p.ask(ask({ id: 'h3' })); p.decided({ id: 'h3', decision: 'deny', reason: 'hold timeout' });
+    assert.ok(seen().includes(`${R}timed out: deny${X}\n`), seen());
+    p.ask(ask({ id: 'h4' })); p.decided({ id: 'h4', decision: 'deny', reason: 'client gone' });
+    assert.ok(seen().includes(`${R}agent gone: deny${X}\n`), seen());
+    p.ask(ask({ id: 'h5' })); p.decided({ id: 'h5', decision: 'allow', reason: 'cli' });
+    assert.ok(seen().includes('\nanswered elsewhere: allow (cli)\n'), seen());
+  });
+
+  it('decided text from the agent is sanitized with color on', () => {
+    const chunks = [];
+    const p = createTerminalPrompt({ input: new PassThrough(), output: { write: (s) => { chunks.push(s); } }, answer: () => {}, color: true });
+    p.ask(ask({ id: 'h1' }));
+    p.decided({ id: 'h1', decision: 'allow', reason: '\x1b[31mevil' });
+    assert.ok(!chunks.join('').includes('\x1b[31mevil'));
   });
 });

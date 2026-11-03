@@ -1,0 +1,51 @@
+{
+  "vendor": "baseten",
+  "servers": [
+    "https://inference.baseten.co/"
+  ],
+  "counts": {
+    "rows": 1,
+    "byLetter": {
+      "r": 0,
+      "w": 0,
+      "x": 1
+    },
+    "byMarker": {
+      "tight": 1,
+      "loose": 0,
+      "settled": 0
+    },
+    "byEvidence": {
+      "floor": 1,
+      "list": 0,
+      "jev": 0
+    }
+  },
+  "rows": [
+    {
+      "key": "baseten.createChatCompletion",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "letter": "x",
+      "marker": "tight",
+      "evidence": "floor",
+      "destructive": false
+    }
+  ],
+  "review": [
+    {
+      "key": "baseten.createChatCompletion",
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "letter": "x",
+      "marker": "tight",
+      "evidence": "floor",
+      "destructive": false
+    }
+  ],
+  "destructiveSuggestions": {
+    "note": "SUGGESTION FOR THE OPERATOR, NOT CONFIG. These rows classify as x and look like they remove something. rwxmap does not write bareguard deny rules and never will: denial is your call at grant time, and bareguard's deny mechanism (the `flags` primitive) lives in your own gate config, not in bareguard.rwx.json and not on a tool entry. Read this list, decide for yourself, and write any deny rule by hand.",
+    "rows": []
+  },
+  "collisions": []
+}

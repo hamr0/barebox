@@ -334,7 +334,7 @@ export function shellQuote(s) {
  * Every path in a runtime dir. The one place that names them.
  *
  * @param {string} runtime runtime dir
- * @returns {{ socket: (agent: string) => string, asksDir: string, answersDir: string, askFile: (id: string) => string, answerFile: (id: string) => string, heldDir: string, heldFile: (id: string) => string, certsDir: string, caBundle: string, audit: string, owner: string, overlay: (agent: string) => { base: string, upper: string, work: string, manifest: string } }} layout
+ * @returns {{ socket: (agent: string) => string, asksDir: string, answersDir: string, askFile: (id: string) => string, answerFile: (id: string) => string, staleFile: (id: string) => string, heldDir: string, heldFile: (id: string) => string, certsDir: string, caBundle: string, audit: string, owner: string, overlay: (agent: string) => { base: string, upper: string, work: string, manifest: string } }} layout
  */
 export function runtimePaths(runtime) {
   const asksDir = path.join(runtime, 'asks');
@@ -346,6 +346,8 @@ export function runtimePaths(runtime) {
     answersDir,
     askFile: (id) => path.join(asksDir, `${id}.json`),
     answerFile: (id) => path.join(answersDir, `${id}.json`),
+    // The proxy's note that an answer for `id` arrived after the hold settled; written before the answer is consumed.
+    staleFile: (id) => path.join(answersDir, `${id}.stale`),
     heldDir,
     // A held request's body, spooled to disk while it waits for a decision.
     heldFile: (id) => path.join(heldDir, id),

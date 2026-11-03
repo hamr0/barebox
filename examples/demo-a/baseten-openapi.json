@@ -1,0 +1,15 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "Baseten model inference (chat completions)", "version": "1.0.0" },
+  "servers": [{ "url": "https://inference.baseten.co" }],
+  "paths": {
+    "/v1/chat/completions": {
+      "post": {
+        "operationId": "createChatCompletion",
+        "summary": "Create a chat completion",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object" } } } },
+        "responses": { "200": { "description": "A chat completion" } }
+      }
+    }
+  }
+}

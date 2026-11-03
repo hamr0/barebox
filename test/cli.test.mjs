@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import net from 'node:net';
 import { createProxy } from '../src/proxy.js';
 import { claimRuntime } from '../src/runtime.js';
-import { writeFileAtomic } from '../src/holds.js';
+import { writeFileAtomic, createHolds } from '../src/holds.js';
 import { ensureCA, certFor } from '../src/certs.js';
 import { startHttps, startHttp } from './fixtures/upstream.mjs';
 import { pathGate } from './fixtures/gates.mjs';
@@ -31,6 +31,21 @@ for (const v of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
 const execA = promisify(execFileCb);
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = join(ROOT, 'src/cli.js');
+
+describe('sbx --name on a sandbox that never ran', () => {
+  const root = mkdtempSync('/tmp/bb-nn-');
+  after(() => rmSync(root, { recursive: true, force: true }));
+  const env = { PATH: process.env.PATH, HOME: root, TMPDIR: root };
+  for (const args of [['pending'], ['approve', 'h1'], ['diff']]) {
+    it(`${args[0]} --name typo exits 1 with "no sandbox named", creates nothing`, async () => {
+      const err = await execA('node', [CLI, ...args, '--name', 'typo'], { encoding: 'utf8', env }).then(() => null, (e) => e);
+      assert.ok(err, 'must fail');
+      assert.equal(err.code, 1, err.stderr);
+      assert.match(err.stderr, /^no sandbox named typo \(start one with 'sbx run --name typo -- …'\)/);
+      assert.equal(readdirSync(root).length, 0, 'a typo makes no dir');
+    });
+  }
+});
 
 describe('sbx usage (no runtime needed)', () => {
   const run = (args, env = {}) => execA('node', [CLI, ...args],
@@ -190,6 +205,65 @@ describe('sbx approve/deny id validation + pending sanitizing (no sandbox needed
       assert.deepEqual(JSON.parse(readFileSync(join(rt, 'answers', 'h1.json'), 'utf8')), { decision: 'allow' });
       assert.deepEqual(readdirSync(join(rt, 'answers')), ['h1.json'], 'no tmp file left behind');
     } finally {
+      release();
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
+  it('a late approve/deny of a hold that was already settled says "already decided" (exit 1), not "approved"', { timeout: 30000 }, async () => {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-late-'));
+    const release = claimRuntime(rt);
+    const logs = [];
+    const events = [];
+    const q = createHolds({ log: (o) => logs.push(o), runtime: rt, timeoutMs: 20000, pollMs: 10,
+      onEvent: (e) => events.push(e), onApprove: () => {}, onDeny: () => {} });
+    const until = async (cond, what) => {
+      for (const t0 = Date.now(); !cond(); await new Promise((r) => setTimeout(r, 10))) {
+        if (Date.now() - t0 > 5000) throw new Error(`timed out: ${what}`);
+      }
+    };
+    try {
+      for (const args of [['approve', 'h1'], ['deny', 'h2', 'nope']]) {
+        const id = args[1];
+        const held = q.add({ agent: 'a', method: 'POST', url: 'http://x/hold', headers: {}, preview: 'm=1', bodyBytes: 3, sock: {}, cres: {}, note: 'test hold' });
+        assert.equal(held, id);
+        await until(() => events.some((e) => e.type === 'ask' && e.ask.id === id), `ask ${id}`);
+        const askText = readFileSync(join(rt, 'asks', `${id}.json`), 'utf8');
+        // Settle it through the files API (another answer wins) ...
+        writeFileSync(join(rt, 'answers', `${id}.tmp`), JSON.stringify({ decision: 'allow' }));
+        renameSync(join(rt, 'answers', `${id}.tmp`), join(rt, 'answers', `${id}.json`));
+        await until(() => events.some((e) => e.type === 'decided' && e.id === id), `decided ${id}`);
+        // ... then the CLI's view is the instant before the settle: the ask file is still there.
+        writeFileSync(join(rt, 'asks', `${id}.json`), askText);
+        const e = await sbxCli(args, { SBX_RUNTIME: rt }).then(() => null, (x) => x);
+        assert.ok(e, `${args[0]} of a settled hold must fail`);
+        assert.equal(e.code, 1);
+        assert.match(e.stderr, new RegExp(`${id} already decided`));
+        assert.equal(e.stdout, '', 'no approved/denied line');
+        assert.ok(logs.some((l) => l.ev === 'stale-answer' && l.id === id), 'the proxy saw the late answer as stale');
+        assert.deepEqual(readdirSync(join(rt, 'answers')), [], 'no answer or marker left behind');
+      }
+    } finally {
+      q.close();
+      release();
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
+  it('a timely approve of a live hold still prints "approved" (exit 0)', { timeout: 30000 }, async () => {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-live-'));
+    const release = claimRuntime(rt);
+    const events = [];
+    const q = createHolds({ log: () => {}, runtime: rt, timeoutMs: 20000, pollMs: 10,
+      onEvent: (e) => events.push(e), onApprove: () => {}, onDeny: () => {} });
+    try {
+      q.add({ agent: 'a', method: 'POST', url: 'http://x/hold', headers: {}, preview: 'm=1', bodyBytes: 3, sock: {}, cres: {}, note: 'test hold' });
+      const r = await sbxCli(['approve', 'h1'], { SBX_RUNTIME: rt });
+      assert.equal(r.stdout.trim(), 'approved h1');
+      assert.equal(r.stderr, '');
+      assert.ok(events.some((e) => e.type === 'decided' && e.decision === 'allow'));
+    } finally {
+      q.close();
       release();
       rmSync(rt, { recursive: true, force: true });
     }

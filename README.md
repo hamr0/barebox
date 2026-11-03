@@ -9,7 +9,7 @@
 ```
 
 > An agent runs on your machine with your real tools, every write is undoable, and nothing leaves the machine without passing a doorman. You're asked only when something irreversible is about to happen.
-> No root, no daemon, no image. One shared proxy, many thin sandboxes: ~8 MB each, 10 ms to start (M0 POC figure — unmeasured on the rewritten code, TODO re-measure).
+> No root, no daemon, no image. One shared proxy, many thin sandboxes: ~8 MB each, about 0.7 s from `sbx run` to exit with the proxy included.
 
 <p align="center">
   <img src="https://img.shields.io/github/package-json/v/hamr0/barebox?label=version&color=2a4f8c" alt="version (auto from package.json)">
@@ -21,7 +21,7 @@
 
 Agents need real access to be useful — shell, files, network. Today you pick one of two bad options:
 
-- **Approve everything.** About forty prompts per task. People stop reading them, or switch prompts off.
+- **Approve everything.** A prompt for nearly every command and edit. People stop reading them, or switch prompts off.
 - **Heavy isolation.** Docker or a VM: images, a daemon, root, and the agent can't use your installed toolchain. Most people skip it.
 
 Neither matches where the risk is. Reads are mostly harmless. File writes can be fixed. Only a few actions can't be undone: paying, sending, publishing, pushing. barebox asks about those and nothing else.
@@ -72,8 +72,8 @@ The agent works in your house:
 - **Walls** are [bubblewrap](https://github.com/containers/bubblewrap), unprivileged: separate net/pid/ipc/uts namespaces, read-only binds, tmpfs over locked paths.
 - **Identity** is the socket, not a header the agent could fake. One socket per agent, all into one proxy.
 - **HTTPS inspection** uses a local CA that exists only inside the sandbox; the proxy reads method, URL, headers and body, then forwards.
-- **The doorman's x-rules**, strongest first: card numbers in the body (Luhn) → payment paths (`/checkout`, `/payment`, `/orders`, `/purchase`; a list of payment domains is not built) → rwxmap labels for known APIs → every other request by its letter and the mode (`ask`, `auto`, `trust`; see `barebox.context.md`). The card and payment floor asks in every mode, `trust` included (calls to a model endpoint are not card-scanned); card numbers are checked in bodies of 64 KB or less.
-- **Approvals** are asked in the terminal where you ran `sbx run`, in plain words (`agent wants to SEND data to httpbin.org … Allow? [y/N]`); `y` allows, anything else denies. Name the sandbox (`sbx run --name docs-bot -- <cmd>`) and a second terminal can answer too (`sbx pending --name docs-bot`, `sbx approve <id> --name docs-bot`, `sbx deny <id> --name docs-bot`); the first answer wins. Timeout means deny, with a clear `403` reason. One held request per agent at a time: later ones wait in line (16 at most, then `429 hold queue full`), and the deadline counts from arrival.
+- **The doorman's x-rules**, strongest first: card numbers in the body (Luhn) → payment paths (`/checkout`, `/payment`, `/orders`, `/purchase`; a list of payment domains is not built) → rwxmap labels for known APIs → every other request by its letter and the mode (`ask`, `auto`, `trust`; see `barebox.context.md`). The card and payment floor asks in every mode, `trust` included (calls to the built-in model endpoints, Anthropic and OpenAI, and to a `localLlm` server are not card-scanned; a model API you label `r` yourself still is); card numbers are checked in bodies of 64 KB or less.
+- **Approvals** are asked in the terminal where you ran `sbx run`, in plain words (`agent wants to SEND data to httpbin.org … Allow? [y/N]`); `y` allows, anything else denies. Name the sandbox (`sbx run --name docs-bot -- <cmd>`) and a second terminal can answer too (`sbx pending --name docs-bot`, `sbx approve <id> --name docs-bot`, `sbx deny <id> --name docs-bot`); the first answer wins. A hold waits until you answer by default; `sbx run --hold 120 -- <cmd>` (or the `holdTimeoutSec` config key) sets a deadline, and a timeout means deny, with a clear `403` reason. One held request per agent at a time: later ones wait in line (16 at most, then `429 hold queue full`), and any deadline counts from arrival. Unattended runs (cron, CI, no terminal) have nobody to answer, so pass `--hold <seconds>` or the first held request waits forever.
 
 ## Keys the agent never holds
 
@@ -98,10 +98,20 @@ Measured, not estimated. Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22.
 |---|---|---|
 | Memory per sandbox | **7.8 MB** mean, 8.0 MB max | ~100 MB (each sandbox runs its own proxy) |
 | Proxy | one shared: **about 95-160 MB** in normal use over HTTPS (10 to 40 agents, keep-alive tunnels open, no holds; plain HTTP alone is about 85-120 MB); **about 117 / 133-151 / 177-207 / 207-241 MB** at 10 / 20 / 30 / 40 agents in the full HTTPS worst case (each agent with 1 parked + 16 waiting + a filled body slot, every request in its own TLS tunnel). The low end is a quiet machine, the high end a busy one. HTTPS costs more because each live TLS session holds about 50 KB of OpenSSL state | one per sandbox |
-| Start + exit | **10 ms** (M0 POC; unmeasured on the rewrite, TODO re-measure) | 1.87-2.05 s |
+| Start + exit | **0.70 s** median for `sbx run -- true`, proxy start to teardown (0.80 s with `--overlay`; 11 runs, quiet machine). The sandbox alone (bwrap) is 6 ms; Node's own start is 0.16 s of it | 1.87-2.05 s |
+| One real agent | Claude Code peaks at **248 MB** inside vs 249 MB bare: barebox does not change the agent. barebox itself adds **about 91 MB** for the first agent (the `sbx` process with its proxy 83 MB, plus 8 MB of walls), then about 11 MB per further agent | not measured |
 | 10 agents | ~195-200 MB worst case (proxy + 10 x 8 MB) | ~1 GB |
 | 20 agents | ~295-310 MB worst case | ~2 GB |
 | 40 agents | ~525-560 MB worst case | not measured |
+
+**What the demos show** (scripts in `examples/`, run by hand, every cell asserted):
+
+![Demo A: a real agent books a trip inside barebox. Reads and model calls go out free, a payment waits for a yes and only then gets the real key, a no never leaves the machine](assets/demo-a.gif)
+
+The full 92-second take, captioned: [assets/demo-a.webm](assets/demo-a.webm).
+
+- **Demo A, a real agent books a trip.** Meta's muse model (via Baseten) planned and booked a trip inside barebox in a recorded, unedited live run: 31 requests, **23 went out with no question** (3 searches, weather, exchange rate, and 18 model calls, one of them to a second model) and **8 stopped for a person** (payments, a hotel order, a car, a calendar entry, a chat message, a `DELETE`, an email). The real Stripe-style key reached the server once, after a yes; the agent only ever held a placeholder. Log, timing and captions: `docs/logs/m7-muse-runs/`.
+- **Demo B, a prompt-injected agent.** In every mode (`ask`, `auto`, `trust`) all three exfiltration attempts fail: `~/.ssh` reads empty, the POST to the attacker's host is refused, a direct socket has no route. The good edits are committed and the injected agent's edits rolled back.
 
 barebox is for small teams: free, local and lightweight, built to assist and to connect to many tools, not to run swarms or thousands of agents. Budget: shared proxy about 205-245 MB in the full HTTPS worst case at 40 agents, each extra sandbox 10 MB or less. 40 agents per proxy is the maximum and it is enforced: `addAgent` refuses the 41st with an error telling you to run another proxy. Above 40, run more proxies. Machine load moves the number. A long audit file does not: 205 MB of audit measured the same as 3 MB. Bypass attempts (`--noproxy`, unset proxy env, direct IP, host localhost) all fail closed, and a red-team script breaks each wall on purpose to prove the checks can fail. Setup, dead ends and why: [findings](docs/logs/findings.md).
 

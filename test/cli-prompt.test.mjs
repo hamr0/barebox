@@ -9,7 +9,7 @@ for (const v of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, execFile } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -74,12 +74,12 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       if (root) rmSync(root, { recursive: true, force: true });
     });
 
-    const viaPty = (typed, marker, name, flags = []) => new Promise((resolve, reject) => {
+    const viaPty = (typed, marker, name, flags = [], extraEnv = { NO_COLOR: '1' }) => new Promise((resolve, reject) => {
       const curl = `curl -s -w '\\nHTTP:%{http_code}\\n' --max-time 20 --data m=${marker} http://127.0.0.1:${up.port}/hold`;
       const child = spawn('python3', ['-I', '-c', DRIVER, typed, process.execPath, CLI, 'run', ...flags, '--name', name, '--', 'bash', '-c', curl], {
         cwd: proj,
         env: { PATH: process.env.PATH, HOME: join(root, 'home'), XDG_CONFIG_HOME: join(root, 'xdg'),
-          TMPDIR: join(root, 'tmp'), SBX_UNSAFE_TEST_ALLOW_LOOPBACK: '1', TERM: 'xterm' },
+          TMPDIR: join(root, 'tmp'), SBX_UNSAFE_TEST_ALLOW_LOOPBACK: '1', TERM: 'xterm', ...extraEnv },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let out = '', err = '';
@@ -94,11 +94,22 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.equal(r.code, 0, r.out + r.err);
       assert.match(r.out, /pty-yes wants to SEND data to 127\.0\.0\.1:\d+/);
       assert.match(r.out, /Data: m=PTYYES/);
-      assert.match(r.out, /Allow\? \[y\/N\] \(h\d+\)  — no answer in 1\d\d s means No/);
+      assert.match(r.out, /Allow\? \[y\/N\] \(hold h\d+\)$/m);
+      assert.ok(!/means No/.test(r.out), 'the default waits: no countdown');
       assert.match(r.out, /✓ allowed/);
       assert.match(r.out, /HTTP:200/);
       assert.ok(!/ask h\d/.test(r.out), 'the question replaces the ask line');
       assert.match(r.out, /decided h\d+ allow/);
+    });
+
+    it('on a terminal with NO_COLOR unset the question is colored; with NO_COLOR=1 there is no escape', { timeout: 120000 }, async () => {
+      const on = await viaPty('y\n', 'PTYCOL', 'pty-col', [], {});
+      assert.equal(on.code, 0, on.out + on.err);
+      assert.ok(on.out.includes('\x1b[1mpty-col\x1b[22m wants to SEND data to'), on.out);
+      assert.ok(on.out.includes('\x1b[32m\x1b[1m✓ allowed\x1b[0m'), on.out);
+      const off = await viaPty('y\n', 'PTYNOCOL', 'pty-nocol', [], { NO_COLOR: '1' });
+      assert.equal(off.code, 0, off.out + off.err);
+      assert.ok(!off.out.includes('\x1b'), JSON.stringify(off.out));
     });
 
     it('typing n denies it (403, "denied at the terminal")', { timeout: 60000 }, async () => {
@@ -135,5 +146,61 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.ok(!/Allow\?/.test(out), `--json must not prompt: ${out}`);
       assert.match(out, /\{"ev":"decided","id":"h1","decision":"allow"/);
       assert.match(out, /HTTP:200/);
+    });
+
+    // Run --json, read the ask file's expiresAt while the hold is open, then deny it.
+    const expiryOf = async (name, flags, xdgJson) => {
+      const xdg = join(root, 'xdg');
+      const cfg = join(xdg, 'barebox', 'config.json');
+      if (xdgJson) { mkdirSync(join(xdg, 'barebox'), { recursive: true }); writeFileSync(cfg, xdgJson); }
+      try {
+        const ask = join(root, 'tmp', `sbx-${process.getuid()}`, name, 'asks', 'h1.json');
+        const env = { PATH: process.env.PATH, HOME: join(root, 'home'), XDG_CONFIG_HOME: xdg, TMPDIR: join(root, 'tmp') };
+        const run = viaPty('', `EXP${name}`, name, ['--json', ...flags]);
+        const end = Date.now() + 30000;
+        while (!existsSync(ask)) {
+          if (Date.now() > end) throw new Error('the ask file never appeared');
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        const rec = JSON.parse(readFileSync(ask, 'utf8'));
+        await new Promise((resolve) => execFile(process.execPath, [CLI, 'deny', 'h1', 'test', '--name', name], { cwd: proj, env, timeout: 20000 }, () => resolve()));
+        await run;
+        return rec.expiresAt;
+      } finally {
+        rmSync(cfg, { force: true });
+      }
+    };
+
+    it('--hold 1 denies the held request "hold timeout" in about a second', { timeout: 60000 }, async () => {
+      const t0 = Date.now();
+      const r = await viaPty('', 'HOLD1', 'pty-hold1', ['--json', '--hold', '1']);
+      assert.ok(Date.now() - t0 < 15000, 'fast');
+      assert.match(r.out, /\{"ev":"decided","id":"h1","decision":"deny"[^\n]*hold timeout/);
+      assert.match(r.out, /HTTP:403/);
+    });
+
+    it('no flag and no config key: the hold has no deadline (expiresAt null)', { timeout: 60000 }, async () => {
+      assert.equal(await expiryOf('pty-hnone', []), null);
+    });
+
+    it('--hold 5 beats a config holdTimeoutSec of 60 (expiresAt about 5 s out)', { timeout: 60000 }, async () => {
+      const exp = await expiryOf('pty-h5', ['--hold', '5'], '{"holdTimeoutSec":60}');
+      assert.ok(exp, 'has a deadline');
+      const left = (Date.parse(exp) - Date.now()) / 1000;
+      assert.ok(left < 10, `deadline ${left}s out, not the config 60`);
+    });
+  });
+
+  describe('sbx run --hold validation (no sandbox needed)', () => {
+    it('--hold soon exits 2 and names --hold', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'bb-holdbad-'));
+      try {
+        for (const bad of ['soon', '0', '1.5']) {
+          const r = await new Promise((resolve) => execFile(process.execPath, [CLI, 'run', '--hold', bad, '--', 'true'],
+            { env: { PATH: process.env.PATH, HOME: dir, XDG_CONFIG_HOME: dir, TMPDIR: dir } }, (e, stdout, stderr) => resolve({ code: e?.code, stderr })));
+          assert.equal(r.code, 2, bad);
+          assert.match(r.stderr, /--hold/, bad);
+        }
+      } finally { rmSync(dir, { recursive: true, force: true }); }
     });
   });
