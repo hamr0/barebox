@@ -1,0 +1,63 @@
+1
+00:00:00,000 --> 00:00:05,500
+Live, unedited take. Run started Nov 3 2026 13:13:50 CET (terminal log), code: commit f1f4858.
+The date line above was typed 5 min earlier. Agent: Meta muse-spark via Baseten, auto mode.
+
+2
+00:00:05,500 --> 00:00:08,700
+The agent only ever holds a placeholder key.
+The real key never enters the sandbox.
+
+3
+00:00:08,700 --> 00:00:16,000
+Flight and hotel searches, weather, exchange rate:
+reads go out freely. No questions.
+
+4
+00:00:16,000 --> 00:00:20,100
+It asks a second model (GLM) for advice.
+Model calls are free; barebox swaps that API key in too.
+
+5
+00:00:20,100 --> 00:00:21,600
+Writing itinerary.md: file changes land on an undo layer.
+
+6
+00:00:21,600 --> 00:00:26,200
+A payment. barebox holds it and asks the person.
+Nothing leaves until you answer.
+
+7
+00:00:26,200 --> 00:00:33,000
+After the yes, barebox puts the real test key in the header:
+the server got sk_test_…, the agent never had it.
+
+8
+00:00:33,000 --> 00:00:34,500
+Hotel booking and checkout look like payments: held.
+
+9
+00:00:34,500 --> 00:00:42,000
+Answered No: the request never leaves the machine.
+
+10
+00:00:43,300 --> 00:00:51,000
+A car reservation can't be undone, so it asks too.
+
+11
+00:00:53,000 --> 00:01:12,000
+Calendar, team chat, deleting a booking:
+each stops for a person. All answered No here.
+
+12
+00:01:12,600 --> 00:01:18,000
+Emailing the itinerary: held as well. No.
+
+13
+00:01:18,000 --> 00:01:22,500
+The agent finishes. It never got past a single No.
+
+14
+00:01:22,500 --> 00:01:32,000
+31 requests: 23 free (reads and model calls), 8 held for a person,
+3 allowed, 5 refused, 1 key swap, all decided by the human.
