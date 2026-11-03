@@ -1,0 +1,48 @@
+{
+  "rwxmapVersion": "0.8.0",
+  "source": "examples/demo-a/baseten-openapi.json",
+  "vendor": "baseten",
+  "bareguard": {
+    "tools": {
+      "baseten.createChatCompletion": {
+        "letter": "r",
+        "marker": "tight"
+      }
+    }
+  },
+  "mcp": {
+    "POST /v1/chat/completions": {
+      "operationId": "createChatCompletion",
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true
+      },
+      "_meta": {
+        "io.github.hamr0.rwxmap/class": "x",
+        "io.github.hamr0.rwxmap/destructive": false,
+        "io.github.hamr0.rwxmap/evidence": "floor",
+        "io.github.hamr0.rwxmap/review": "tight"
+      }
+    }
+  },
+  "webmcp": {
+    "POST /v1/chat/completions": {
+      "annotations": {
+        "readOnlyHint": false,
+        "consequentialHint": true
+      }
+    }
+  },
+  "jev": {
+    "mode": "off",
+    "model": null,
+    "sent": 0,
+    "answered": 0,
+    "failed": 0,
+    "changed": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0
+    }
+  }
+}
