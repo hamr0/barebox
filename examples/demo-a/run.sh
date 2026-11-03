@@ -200,12 +200,12 @@ live_summary_muse() {
       ((f)) && txt+=", "
       if ((d)); then txt+="$h held: $a allowed, ${R}$d denied${X}"; else txt+="$h held: $a allowed"; fi
     fi
-    if ((d)); then printf '%-16s %s%s\n' "$nm" "$txt" "${note:+ ${D}${note}${X}}"
-    else printf '%-16s %s%s%s%s\n' "$nm" "$G" "$txt" "$X" "${note:+ ${D}${note}${X}}"; fi
+    if ((d)); then printf '%-34s %s%s\n' "$nm" "$txt" "${note:+ ${D}${note}${X}}"
+    else printf '%-34s %s%s%s%s\n' "$nm" "$G" "$txt" "$X" "${note:+ ${D}${note}${X}}"; fi
   }
   local tn=$(( tf + ta + td ))
-  if ((td)); then printf '%-16s %s requests to the network: %s free, %s held for you (%s allowed, %s%s denied%s) %s\n' total "$tn" "$tf" "$((ta + td))" "$ta" "$R" "$td" "$X" "${D}(model calls included)${X}"
-  else printf '%-16s %s%s requests to the network: %s free, %s held for you (%s allowed, %s denied)%s %s\n' total "$G" "$tn" "$tf" "$((ta + td))" "$ta" "$td" "$X" "${D}(model calls included)${X}"; fi
+  if ((td)); then printf '%-34s %s requests to the network: %s free, %s held for you (%s allowed, %s%s denied%s) %s\n' total "$tn" "$tf" "$((ta + td))" "$ta" "$R" "$td" "$X" "${D}(model calls included)${X}"
+  else printf '%-34s %s%s requests to the network: %s free, %s held for you (%s allowed, %s denied)%s %s\n' total "$G" "$tn" "$tf" "$((ta + td))" "$ta" "$td" "$X" "${D}(model calls included)${X}"; fi
   for g in "${order[@]}"; do
     [[ -n ${seen[$g]:-} ]] || continue
     if [[ $g == model ]]; then grp_line "model calls" "${fr[model]:-0}" 0 0 "(labelled read-only)"
@@ -217,11 +217,11 @@ live_summary_muse() {
   sw=$(grep -c '"verdict":"secret".*"name":"STRIPE_API_KEY".*"swapped":true' "$1")
   nosw=$(grep -c '"verdict":"secret".*"name":"STRIPE_API_KEY".*"swapped":false' "$1")
   if ((sw)); then
-    printf '%-16s %s%s%s %s\n' "key swaps" "$G" "$sw" "$X" "${D}(the real test key went into the header only after your yes; the agent only ever had the placeholder)${X}"
+    printf '%-34s %s%s%s %s\n' "key swaps" "$G" "$sw" "$X" "${D}(the real test key went into the header only after your yes; the agent only ever had the placeholder)${X}"
   else
-    printf '%-16s %s%s%s %s\n' "key swaps" "$R" "0" "$X" "${D}(no key left the machine; the agent only ever had the placeholder)${X}"
+    printf '%-34s %s%s%s %s\n' "key swaps" "$R" "0" "$X" "${D}(no key left the machine; the agent only ever had the placeholder)${X}"
   fi
-  ((nosw)) && printf '%-16s %s%s%s\n' "" "$R" "$nosw request(s) carrying the placeholder were refused or denied: no key sent" "$X"
+  ((nosw)) && printf '%-34s %s%s%s\n' "" "$R" "$nosw request(s) carrying the placeholder were refused or denied: no key sent" "$X"
   return 0
 }
 
