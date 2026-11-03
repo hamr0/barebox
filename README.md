@@ -106,7 +106,9 @@ Measured, not estimated. Fedora, kernel 7.2, bubblewrap 0.12.0, Node 22.
 
 **What the demos show** (scripts in `examples/`, run by hand, every cell asserted):
 
-![Demo A: a real agent books a trip inside barebox. Reads and model calls go out free, a payment waits for a yes and only then gets the real key, a no never leaves the machine](docs/demo-a.gif)
+![Demo A: a real agent books a trip inside barebox. Reads and model calls go out free, a payment waits for a yes and only then gets the real key, a no never leaves the machine](assets/demo-a.gif)
+
+The full 92-second take, captioned: [assets/demo-a.webm](assets/demo-a.webm).
 
 - **Demo A, a real agent books a trip.** Meta's muse model (via Baseten) planned and booked a trip inside barebox in a recorded, unedited live run: 31 requests, **23 went out with no question** (3 searches, weather, exchange rate, and 18 model calls, one of them to a second model) and **8 stopped for a person** (payments, a hotel order, a car, a calendar entry, a chat message, a `DELETE`, an email). The real Stripe-style key reached the server once, after a yes; the agent only ever held a placeholder. Log, timing and captions: `docs/logs/m7-muse-runs/`.
 - **Demo B, a prompt-injected agent.** In every mode (`ask`, `auto`, `trust`) all three exfiltration attempts fail: `~/.ssh` reads empty, the POST to the attacker's host is refused, a direct socket has no route. The good edits are committed and the injected agent's edits rolled back.
