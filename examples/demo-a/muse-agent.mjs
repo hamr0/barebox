@@ -11,6 +11,34 @@ const MAX_TURNS = 25;
 const prompt = process.argv[1]; // run inline: node -e "$(cat muse-agent.mjs)" -- "<task>" puts the task at argv[1]
 if (!KEY || !prompt) { console.error('usage: BASETEN_API_KEY=... node --input-type=module -e "$(cat muse-agent.mjs)" -- "<task>"'); process.exit(2); }
 
+// results(stdout) -> [{kind, text, pos}] sorted by pos: one per httpbin JSON echo and one per barebox refusal.
+// An echo is httpbin's pretty-printed top-level object: its own "headers" block, then its own "url"/"method".
+// Its Authorization is read inside that block only, so a second echo or a trailer never leaks into it.
+function results(so) {
+  const out = [], spans = [];
+  const hs = [...so.matchAll(/^  "headers":\s*\{([^{}]*)\}/gm)];
+  hs.forEach((h, i) => {
+    const end = i + 1 < hs.length ? hs[i + 1].index : so.length;
+    const rest = so.slice(h.index + h[0].length, end);
+    const au = /"Authorization":\s*"([^"]*)"/i.exec(h[1]);
+    const um = /^  "url":\s*"([^"]*)"/m.exec(rest), mm = /^  "method":\s*"([^"]*)"/m.exec(rest);
+    spans.push([Math.max(0, so.lastIndexOf('\n{', h.index) + 1), h.index + h[0].length + (um ? um.index + um[0].length : 0)]);
+    let text;
+    if (au && /^Bearer sk_test_/.test(au[1])) text = `server received: Authorization: ${au[1]}`;
+    else if (au) text = 'server received: Authorization: (the agent masked the key in its own output; the audit below has the swap)';
+    else {
+      let path = um?.[1] ?? '?'; try { path = new URL(path).pathname; } catch { /* keep raw */ }
+      text = `server received: ${mm?.[1] ?? '?'} ${path} (no key in it)`;
+    }
+    out.push({ kind: 'echo', text, pos: h.index });
+  });
+  for (const d of so.matchAll(/denied: [^\n"\\]*/g)) {
+    if (spans.some(([a, b]) => d.index >= a && d.index < b)) continue;
+    out.push({ kind: 'denied', text: `server received: nothing (the request never left; barebox said "${d[0]}")`, pos: d.index });
+  }
+  return out.sort((x, y) => x.pos - y.pos);
+}
+
 const tools = [{
   type: 'function',
   function: {
@@ -60,18 +88,8 @@ for (let turn = 0; turn < MAX_TURNS; turn++) {
     console.log(`TOOL ${n} ${cmd.split('\n')[0].slice(0, 120)}`);
     const p = cmd ? spawnSync('bash', ['-c', cmd], { encoding: 'utf8', timeout: 60000 }) : null;
     const out = p ? `${p.stdout ?? ''}${p.stderr ?? ''}` : 'error: no command';
-    // the key moment: what the server saw as the Authorization header (httpbin echoes it)
-    // Only httpbin's own reply on stdout counts: its JSON echo lists the headers it got
-    // ("Authorization": "..."), whatever else the agent's command prints around it.
-    // "Never left" is said only when barebox's refusal ("denied: ...") is in the reply.
-    if (cmd.includes('httpbin.org')) {
-      const so = p?.stdout ?? '';
-      const auth = /^\s*"Authorization":\s*"([^"]*)"/im.exec(so);
-      const denied = /denied: [^\n"]*/.exec(so);
-      if (auth && /^Bearer sk_test_/.test(auth[1])) console.log(`server received: Authorization: ${auth[1]}`);
-      else if (auth) console.log(`server received: Authorization: (the agent masked the key in its own output; the audit below has the swap)`);
-      else if (denied) console.log(`server received: nothing (the request never left; barebox said "${denied[0]}")`);
-    }
+    // the key moment: what the server saw. One line per request result in stdout, in order.
+    if (cmd.includes('httpbin.org')) for (const r of results(p?.stdout ?? '')) console.log(r.text);
     messages.push({ role: 'tool', tool_call_id: tc.id, content: out.slice(0, 4096) });
   }
   if (turn === MAX_TURNS - 1) final = `stopped at ${MAX_TURNS} turns`;

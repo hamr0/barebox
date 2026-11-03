@@ -179,15 +179,38 @@ live_summary() {
 
 # live_summary_muse <gate.jsonl>: no ?step= markers, so classify by URL kind (audit_kinds)
 live_summary_muse() {
-  local k held final label what c models=0
+  local k held final label g
+  local -A fr=() al=() de=() seen=()
+  local -a order=(search pay email)
   while read -r k held final label; do
-    if [[ $k == model ]]; then ((models++)); continue; fi
-    case $held in held) what="held, you"; [[ $final == allow* ]] && what+=" allowed" || what+=" denied" ;; *) what="free, no question" ;; esac
-    c=$G; [[ $what == *denied ]] && c=$R
-    [[ $k == other ]] && k=$label
-    printf '%-16s %s%s%s\n' "$k" "$c" "$what" "$X"
+    [[ $k == other ]] && { k=${label/_httpbin.org/ }; k=${k//_/ }; }
+    if [[ -z ${seen[$k]:-} ]]; then seen[$k]=1; [[ $k != model && $k != search && $k != pay && $k != email ]] && order+=("$k"); fi
+    if [[ $held != held ]]; then fr[$k]=$(( ${fr[$k]:-0} + 1 ))
+    elif [[ $final == allow* ]]; then al[$k]=$(( ${al[$k]:-0} + 1 ))
+    else de[$k]=$(( ${de[$k]:-0} + 1 )); fi
   done < <(audit_kinds "$1")
-  printf '%-16s %s%s%s\n' "model calls" "$G" "$models, free (labelled read-only)" "$X"
+  order+=(model)
+  local tf=0 ta=0 td=0
+  for g in "${order[@]}"; do tf=$((tf + ${fr[$g]:-0})); ta=$((ta + ${al[$g]:-0})); td=$((td + ${de[$g]:-0})); done
+  # one line: counts plain, "N denied" red when any, whole line green when none
+  grp_line() { # grp_line <name> <free> <allowed> <denied> <note>
+    local nm=$1 f=$2 a=$3 d=$4 note=${5:-} h=$(( $3 + $4 )) txt=""
+    ((f)) && txt="$f free"
+    if ((h)); then
+      ((f)) && txt+=", "
+      if ((d)); then txt+="$h held: $a allowed, ${R}$d denied${X}"; else txt+="$h held: $a allowed"; fi
+    fi
+    if ((d)); then printf '%-16s %s%s\n' "$nm" "$txt" "${note:+ ${D}${note}${X}}"
+    else printf '%-16s %s%s%s%s\n' "$nm" "$G" "$txt" "$X" "${note:+ ${D}${note}${X}}"; fi
+  }
+  local tn=$(( tf + ta + td ))
+  if ((td)); then printf '%-16s %s requests to the network: %s free, %s held for you (%s allowed, %s%s denied%s) %s\n' total "$tn" "$tf" "$((ta + td))" "$ta" "$R" "$td" "$X" "${D}(model calls included)${X}"
+  else printf '%-16s %s%s requests to the network: %s free, %s held for you (%s allowed, %s denied)%s %s\n' total "$G" "$tn" "$tf" "$((ta + td))" "$ta" "$td" "$X" "${D}(model calls included)${X}"; fi
+  for g in "${order[@]}"; do
+    [[ -n ${seen[$g]:-} ]] || continue
+    if [[ $g == model ]]; then grp_line "model calls" "${fr[model]:-0}" 0 0 "(labelled read-only)"
+    else grp_line "$g" "${fr[$g]:-0}" "${al[$g]:-0}" "${de[$g]:-0}"; fi
+  done
   # The key swap, from barebox's own audit (the agent can mask its output, not this):
   # one `secret` line per request that carried the Stripe placeholder.
   local sw nosw
