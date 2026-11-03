@@ -4,11 +4,20 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.9.0] - 2026-11-03
+
+### Added
+
+- `sbx run --hold <seconds|never>` sets how long a held request waits, per run, overriding the `holdTimeoutSec` config key.
+- Terminal colors in the `sbx run` question and answers, only when stderr is a terminal and `NO_COLOR` is unset: yellow header with the agent name in bold, bold labels, cyan URL, dim data and hold id, green for allowed, red for denied or timed out. `--json` and piped output stay plain.
+- The hold id shows in the question as `(hold hN)`.
+- `sbx approve` and `sbx deny` on a hold that already ended print `<id> already decided` and exit 1; when the answer is written but the proxy has not read it yet, they print `<id>: answer written, the proxy has not read it yet`.
+- `--name` for a sandbox that never ran exits 1 with `no sandbox named <n>` and creates nothing.
+- Demo A (`examples/demo-a`): a scripted flight-booking run in ask, auto and trust modes, and a live driver (`--driver muse`) where you answer the holds. The README carries the measured numbers and a captioned demo.
 
 ### Changed
 
-- `sbx run` waits for your answer by default (was 120 s); `--hold <seconds|never>` sets a deadline per run, and the `holdTimeoutSec` config key sets one for all runs. The library's `createHolds`/`createProxy` default stays 120 s.
+- `sbx run` waits for your answer by default (was 120 s); `--hold <seconds|never>` sets a deadline per run, and the `holdTimeoutSec` config key sets one for all runs. The library's `createHolds`/`createProxy` default stays 120 s. Unattended runs need `--hold <seconds>`.
 
 ## [0.8.0] - 2026-11-02
 
