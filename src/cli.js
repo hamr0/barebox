@@ -39,6 +39,7 @@ import { loadLabels } from './labels.js';
 import { MODES } from './policy.js';
 import { run as sandboxRun } from './run.js';
 import { createTerminalPrompt } from './prompt.js';
+import { DEFAULT_POLL_MS } from './holds.js';
 import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
 import { assertAgentName, createRuntime, namedRuntime, hostNode, runtimePaths, runtimeLive, safe, shellQuote } from './runtime.js';
 
@@ -78,12 +79,18 @@ function needRuntime(name, create = false) {
       err('give --name or SBX_RUNTIME, not both');
       process.exit(2);
     }
+    let dir;
     try {
-      return namedRuntime(name, process.env, { create });
+      dir = namedRuntime(name, process.env, { create });
     } catch (e) {
       err(e instanceof Error ? e.message : String(e));
       process.exit(2);
     }
+    if (!create && !fs.existsSync(dir)) {
+      err(`no sandbox named ${name} (start one with 'sbx run --name ${name} -- …')`);
+      process.exit(1);
+    }
+    return dir;
   }
   const runtime = process.env.SBX_RUNTIME;
   if (!runtime) usage();
@@ -472,16 +479,57 @@ function alreadyAnswered(id) {
   process.exit(1);
 }
 
+/**
+ * After our answer is linked, learn what the proxy did with it. The proxy
+ * writes `answers/<id>.stale` before it consumes an answer for a hold it no
+ * longer has, so once our answer file is gone the marker is the whole truth.
+ * Bounded at 4 poll intervals; a proxy that has not read it by then is
+ * reported, not guessed at.
+ *
+ * @param {ReturnType<typeof runtimePaths>} paths runtime paths
+ * @param {string} id hold id
+ * @returns {Promise<'settled'|'stale'|'unread'>} the outcome
+ */
+async function outcomeOf(paths, id) {
+  const end = Date.now() + 4 * DEFAULT_POLL_MS;
+  while (fs.existsSync(paths.answerFile(id))) {
+    if (Date.now() > end) return 'unread';
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  try {
+    fs.unlinkSync(paths.staleFile(id));
+    return 'stale';
+  } catch {
+    return 'settled';
+  }
+}
+
+/**
+ * @param {ReturnType<typeof runtimePaths>} paths runtime paths
+ * @param {string} id hold id
+ * @param {'allow'|'deny'} decision the answer
+ * @param {string} [reason] deny reason
+ * @returns {Promise<void>} resolves when the answer settled the hold (or the proxy has not read it yet); exits 1 otherwise
+ */
+async function answerHold(paths, id, decision, reason) {
+  if (!writeAnswer(paths, id, decision, reason)) alreadyAnswered(id);
+  const outcome = await outcomeOf(paths, id);
+  if (outcome === 'stale') {
+    err(`${id} already decided`);
+    process.exit(1);
+  }
+  if (outcome === 'unread') err(`${id}: answer written, the proxy has not read it yet`);
+  out(`${decision === 'allow' ? 'approved' : 'denied'} ${id}`);
+}
+
 /** @param {string[]} rest @returns {Promise<void>} */
 async function approve(rest) {
   const { id, paths } = await answerTarget(rest);
-  if (!writeAnswer(paths, id, 'allow')) alreadyAnswered(id);
-  out(`approved ${id}`);
+  await answerHold(paths, id, 'allow');
 }
 
 /** @param {string[]} rest @returns {Promise<void>} */
 async function deny(rest) {
   const { id, reason, paths } = await answerTarget(rest);
-  if (!writeAnswer(paths, id, 'deny', reason)) alreadyAnswered(id);
-  out(`denied ${id}`);
+  await answerHold(paths, id, 'deny', reason);
 }

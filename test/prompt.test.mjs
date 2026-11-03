@@ -103,14 +103,16 @@ describe('createTerminalPrompt', () => {
     assert.deepEqual(answers, [['h2', 'deny', 'denied at the terminal']]);
   });
 
-  it('a half-typed line from before the question does not join the answer', async () => {
+  it('a half-typed line from a question that ended does not join the next answer', async () => {
     const { input, p, answers } = setup();
-    input.write('ye'); // no newline, nothing open
-    await tick();
     p.ask(ask({ id: 'h1' }));
+    input.write('ye'); // typed into h1, no newline
+    await tick();
+    p.decided({ id: 'h1', decision: 'deny', reason: 'hold timeout' });
+    p.ask(ask({ id: 'h2' }));
     input.write('s\n');
     await tick();
-    assert.deepEqual(answers, [['h1', 'deny', 'denied at the terminal']], '"s" is not yes');
+    assert.deepEqual(answers, [['h2', 'deny', 'denied at the terminal']], '"s" is not yes: "ye" must be gone');
   });
 
   it('a second ask while one is open is refused (false) and never answered here', async () => {

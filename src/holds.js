@@ -487,6 +487,11 @@ export function createHolds({ log, timeoutMs = 120000,
     for (const name of names) {
       if (!name.endsWith('.json')) continue;
       const id = name.slice(0, -'.json'.length);
+      // Not held: say so (the marker `sbx approve` reads) before the answer
+      // is consumed, so "answer gone" always means the marker is already there.
+      if (!queue.has(id)) {
+        try { writeFileAtomic(paths.staleFile(id), ''); } catch {}
+      }
       const text = consumeFile(paths.answerFile(id));
       if (text === null) continue;
       const norm = normalizeDecision(parseAnswer(text), { approveAlias: true });

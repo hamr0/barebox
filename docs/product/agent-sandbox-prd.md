@@ -675,6 +675,12 @@ Findings from the real-agent run (not fixed in M6):
 - Answering a hold from a second terminal (env var, temp path, `rule=` codes) was too technical. `sbx run` now asks in its own terminal, in plain words (`⏸ <name> wants to SEND data to <host>`, why, URL, masked data, `Allow? [y/N]`), when stdin and stderr are terminals and `--json` is off. A key typed before a question opens never answers it. A second terminal (`sbx approve/deny`) still works, and the first answer wins. Both write through the one answer writer.
 - One `sbx run` is one sandbox with one agent, so the user names the sandbox: `sbx run --name <n>` sets the agent name and a fixed runtime dir (`$XDG_RUNTIME_DIR/barebox/<n>`, else `<tmpdir>/sbx-<uid>/<n>`), and every other command takes `--name` instead of `SBX_RUNTIME` (giving both is an error).
 - Demo B is `examples/demo-b/run.sh`: one 10-step workflow under ask, auto and trust, asserting every cell, plus two agents at once for commit and rollback. The scripted driver is the proof. The `claude -p` driver is best effort: the API's own safeguards (`[cyber]`) refuse the injection text, so a real agent runs only the legitimate steps.
+
+**Decisions (user, Nov 3), Demo A and M7 scope:**
+- Demo A is `examples/demo-a/run.sh`, built like Demo B: run by hand, not in `npm test` or the tarball. The scripted driver asserts every step and exits 1 on any FAIL. `--driver claude` is best effort, and `--live` lets the user answer the prompts.
+- Steps: search, pay, email. The search is `GET httpbin /anything/search` and runs free. The payment is `POST /anything/v1/payment_intents`: its path holds `/payment`, so the floor holds it, and the key appears in httpbin's echo only after approval. The itinerary email is a second hold.
+- Modes: all three, chosen at start with `--mode ask|auto|trust|all`, as in Demo B. Expected: search free in every mode; payment held in every mode (floor); email held in ask and auto (`x`), free in trust.
+- Scope: Demo A, the README numbers, and four fix-ledger items (user, Nov 3): a late `sbx approve` prints "approved" for an already-decided hold; a mistyped `--name` says "nothing held"; a stale half-typed answer can approve the next hold (its test misses it); the README's Node-location sentences are stale.
 | Estimate | 1.5 days. |
 
 ### Total

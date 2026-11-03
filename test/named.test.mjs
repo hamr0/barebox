@@ -112,8 +112,8 @@ describe('sbx --name (CLI)', () => {
 
   it('commands on a name that never ran create nothing (a typo makes no dir)', async () => {
     const r = await sbx(['pending', '--name', 'typo']);
-    assert.equal(r.code, 0, r.stderr);
-    assert.match(r.stdout, /nothing held/);
+    assert.equal(r.code, 1, r.stderr);
+    assert.match(r.stderr, /no sandbox named typo/);
     assert.ok(!existsSync(join(root, 'tmp', `sbx-${UID}`, 'typo')));
   });
 
