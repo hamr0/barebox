@@ -58,7 +58,7 @@ await proxy.close();
 When a request needs a decision (see "Modes and the gate" below), it parks.
 `sbx run` with a terminal (stdin and stderr are TTYs, no `--json`) asks in place:
 the sandbox name, what it wants to do and why, the URL, a masked body
-preview, then `Allow? [y/N] (h3)`. `y` or `yes` allows; anything else, Enter
+preview, then `Allow? [y/N] (hold h3)`. `y` or `yes` allows; anything else, Enter
 included, denies with `denied at the terminal`. A line typed before a question
 appears answers nothing. Name the sandbox with `sbx run --name docs-bot`: the
 name is the agent name and picks the runtime dir
@@ -80,7 +80,7 @@ SBX_RUNTIME=/tmp/sbx npx sbx approve h1
 SBX_RUNTIME=/tmp/sbx npx sbx deny h2 "reason here"
 ```
 
-Held requests wait (default 120 s, `never` supported), counting from arrival:
+Held requests wait, counting from arrival, until a deadline: the library's default is 120 s (`createHolds`/`createProxy`; `'never'` supported), while `sbx run` waits until answered by default (`holdTimeoutSec` `"never"`; `--hold <seconds|never>` or the config key sets a deadline):
 time spent in line and reading the body counts too, and a request past its
 deadline is denied `hold timeout` whether waiting, sending, or parked. Each
 agent holds at most one request being read or parked; later ones wait in
@@ -109,7 +109,7 @@ const { exit, asks, audit, diff, runtime } = await run({
 ```
 
 ```bash
-sbx run [--name <n>] [--mode ask|auto|trust] [--json] [--overlay] -- <cmd> [...]
+sbx run [--name <n>] [--mode ask|auto|trust] [--hold <seconds|never>] [--json] [--overlay] -- <cmd> [...]
 ```
 
 `sbx run` uses the current directory as the project and `--name`'s runtime or
@@ -121,7 +121,7 @@ Its exit code mirrors the agent's.
 
 `sbx run` reads one optional config file,
 `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, with keys `mode`,
-`holdTimeoutSec` (positive integer or `"never"`), `heldBodyMaxMB`
+`holdTimeoutSec` (positive integer or `"never"`; default `"never"`, overridden per run by `--hold`), `heldBodyMaxMB`
 (positive integer) and `localLlm` (array of `"host:port"`). A flag beats the file, the file beats the default; an
 unknown key, bad value or bad JSON exits 2 naming the file and key. The file
 is hidden inside the sandbox wherever it resolves. The library does not read it.

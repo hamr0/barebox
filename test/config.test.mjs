@@ -35,12 +35,21 @@ describe('config file', () => {
 
   it('no file means the defaults', () => {
     const { XDG_CONFIG_HOME } = xdg();
-    assert.deepEqual(loadConfig({ XDG_CONFIG_HOME }), { mode: 'auto', holdTimeoutSec: 120, localLlm: [], labels: [], tenants: {} });
+    assert.deepEqual(loadConfig({ XDG_CONFIG_HOME }), { mode: 'auto', holdTimeoutSec: 'never', localLlm: [], labels: [], tenants: {} });
   });
 
   it('the file\'s mode and holdTimeoutSec are used', () => {
     const { XDG_CONFIG_HOME } = xdg('{"mode":"ask","holdTimeoutSec":"never"}');
     assert.deepEqual(resolveConfig({}, { XDG_CONFIG_HOME }), { mode: 'ask', holdTimeoutSec: 'never', localLlm: [], labels: [], tenants: {} });
+  });
+
+  it('a CLI --hold beats the file key; "never" and positive integers pass, anything else names --hold', () => {
+    const { XDG_CONFIG_HOME } = xdg('{"holdTimeoutSec":60}');
+    assert.equal(resolveConfig({ hold: '5' }, { XDG_CONFIG_HOME }).holdTimeoutSec, 5);
+    assert.equal(resolveConfig({ hold: 'never' }, { XDG_CONFIG_HOME }).holdTimeoutSec, 'never');
+    for (const bad of ['0', '1.5', 'soon', '-3', '']) {
+      assert.throws(() => resolveConfig({ hold: bad }, { XDG_CONFIG_HOME }), /--hold/, bad);
+    }
   });
 
   it('a CLI --mode beats the file; the file still beats the default for the rest', () => {

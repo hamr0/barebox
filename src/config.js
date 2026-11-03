@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { MODES } from './policy.js';
 
-const DEFAULTS = { mode: 'auto', holdTimeoutSec: 120, localLlm: [], labels: [], tenants: {} };
+const DEFAULTS = { mode: 'auto', holdTimeoutSec: 'never', localLlm: [], labels: [], tenants: {} };
 
 /** One `host:port` (host without a colon, port 1-65535). @param {unknown} v @returns {boolean} */
 const isHostPort = (v) => {
@@ -137,11 +137,22 @@ export function loadConfig(env = process.env) {
  *
  * @param {object} [flags] values given on the command line
  * @param {string} [flags.mode] `--mode`
+ * @param {string} [flags.hold] `--hold` (`"never"` or a positive integer of seconds, as typed)
  * @param {NodeJS.ProcessEnv} [env] environment to read (default `process.env`)
  * @returns {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number, env?: { pass?: string[], set?: Record<string, string> }, secrets?: Record<string, { fromEnv?: string, value?: string, hosts: string[] }> }} effective settings (`heldBodyMaxMB` absent means the library default)
  * @throws {Error} as {@link loadConfig}
  */
 export function resolveConfig(flags = {}, env = process.env) {
   const cfg = loadConfig(env);
-  return { ...cfg, ...(flags.mode !== undefined ? { mode: flags.mode } : {}) };
+  let hold;
+  if (flags.hold !== undefined) {
+    hold = flags.hold === 'never' ? 'never' : /^\d+$/.test(flags.hold) ? Number(flags.hold) : flags.hold;
+    const bad = KEYS.holdTimeoutSec(hold);
+    if (bad) throw new Error(`--hold ${bad}`);
+  }
+  return {
+    ...cfg,
+    ...(flags.mode !== undefined ? { mode: flags.mode } : {}),
+    ...(hold !== undefined ? { holdTimeoutSec: hold } : {}),
+  };
 }

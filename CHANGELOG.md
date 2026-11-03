@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+
+- `sbx run` waits for your answer by default (was 120 s); `--hold <seconds|never>` sets a deadline per run, and the `holdTimeoutSec` config key sets one for all runs. The library's `createHolds`/`createProxy` default stays 120 s.
+
 ## [0.8.0] - 2026-11-02
 
 ### Added

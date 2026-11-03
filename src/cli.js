@@ -13,7 +13,7 @@
 // `--name <n>` names the sandbox (agent name + runtime dir, runtime.js namedRuntime) and every
 // command takes `--name` instead of SBX_RUNTIME (both together: exit 2).
 //
-// sbx run [--mode ask|auto|trust] [--name <n>] [--json] [--overlay] -- <cmd> [...]
+// sbx run [--mode ask|auto|trust] [--hold <seconds|never>] [--name <n>] [--json] [--overlay] -- <cmd> [...]
 // Runs one sandboxed agent start-to-finish in this process (project = cwd).
 // The runtime is SBX_RUNTIME when set, else a short temp dir (printed to
 // stderr so a second terminal can approve from it). With --json, stdout
@@ -38,12 +38,12 @@ import { resolveConfig } from './config.js';
 import { loadLabels } from './labels.js';
 import { MODES } from './policy.js';
 import { run as sandboxRun } from './run.js';
-import { createTerminalPrompt } from './prompt.js';
+import { createTerminalPrompt, paint, ANSI } from './prompt.js';
 import { DEFAULT_POLL_MS } from './holds.js';
 import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
 import { assertAgentName, createRuntime, namedRuntime, hostNode, runtimePaths, runtimeLive, safe, shellQuote } from './runtime.js';
 
-const USAGE = 'usage: sbx [--help] | run [--mode ask|auto|trust] [--name <n>] [--json] [--overlay] -- <cmd> [...] | pending|diff|rollback [--name <n>] | approve <id> [--name <n>] | deny <id> [reason] [--name <n>] | commit [--name <n>] [--skip-conflicts]  (--name replaces SBX_RUNTIME; --agent stays for diff/commit/rollback)';
+const USAGE = 'usage: sbx [--help] | run [--mode ask|auto|trust] [--hold <seconds|never>] [--name <n>] [--json] [--overlay] -- <cmd> [...] | pending|diff|rollback [--name <n>] | approve <id> [--name <n>] | deny <id> [reason] [--name <n>] | commit [--name <n>] [--skip-conflicts]  (--name replaces SBX_RUNTIME; --agent stays for diff/commit/rollback)';
 
 /** Hold ids the CLI accepts: `h<n>` only. Anything else is a usage error, never a path. */
 const HOLD_ID_RE = /^h\d+$/;
@@ -197,7 +197,7 @@ async function run(args) {
   if (sep < 0) usage();
   const flags = args.slice(0, sep);
   const command = args.slice(sep + 1);
-  /** @type {{ name?: string, mode?: string, json?: boolean, overlay?: boolean }} */
+  /** @type {{ name?: string, mode?: string, hold?: string, json?: boolean, overlay?: boolean }} */
   let values;
   try {
     ({ values } = parseArgs({
@@ -205,6 +205,7 @@ async function run(args) {
       options: {
         name: { type: 'string' },
         mode: { type: 'string' },
+        hold: { type: 'string' },
         json: { type: 'boolean' },
         overlay: { type: 'boolean' },
       },
@@ -218,7 +219,7 @@ async function run(args) {
   /** @type {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number, env?: { pass?: string[], set?: Record<string, string> }, secrets?: Record<string, { fromEnv?: string, value?: string, hosts: string[] }> }} */
   let cfg;
   try {
-    cfg = resolveConfig({ mode: values.mode });
+    cfg = resolveConfig({ mode: values.mode, hold: values.hold });
   } catch (e) {
     err(e instanceof Error ? e.message : String(e));
     process.exit(2);
@@ -251,10 +252,12 @@ async function run(args) {
   };
   // A person at this terminal (stdin and stderr are TTYs, not --json) answers
   // holds here; the file channel stays on, so `sbx approve` still works too.
+  const errColor = !!process.stderr.isTTY && !process.env.NO_COLOR;
   const prompt = !json && process.stdin.isTTY && process.stderr.isTTY
     ? createTerminalPrompt({
       input: process.stdin,
       output: process.stderr,
+      color: errColor,
       answer: (id, decision, reason) => writeAnswer(runtimePaths(runtime), id, decision, reason),
     })
     : null;
@@ -269,7 +272,11 @@ async function run(args) {
     if (json) out(JSON.stringify({ ev: 'decided', id: c.id, decision: c.decision, reason: c.reason }));
     else out(`decided ${c.id} ${c.decision}${c.reason ? ` (${c.reason})` : ''}`);
   };
-  err(name !== undefined
+  if (name !== undefined && errColor) {
+    // Colored line: only the dynamic name is sanitized; `err` would strip the escapes.
+    const n = safe(name);
+    console.error(`sandbox ${paint(true, ANSI.bold, n)}${ANSI.dim} (answer from another terminal: sbx approve --name ${n} <id>)${ANSI.reset}`);
+  } else err(name !== undefined
     ? `sandbox ${name} (answer from another terminal: sbx approve --name ${name} <id>)`
     : `runtime ${runtime} (answer with: SBX_RUNTIME=${shellQuote(runtime)} sbx approve <id>)`);
   /** @type {{ exit: number, diff: { path: string }[] } | null} */
