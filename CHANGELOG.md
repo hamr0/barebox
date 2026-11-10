@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.10.0] - 2026-11-10
+
+Docs only; no code or behaviour changes.
+
+### Changed
+
+- README rewritten: what barebox is and its scope (up to 40 agents per proxy), how it works (one proxy for HTTP and HTTPS, one gate, one `gate.jsonl` audit file you can stream), how letters `r`/`w`/`x` are assigned and what each of the three modes lets through, what it blocks by default, real output samples (the terminal question, a run summary, an audit line), one table of measured numbers, known limits, and how to replay Demo A and Demo B from a clone. The roadmap section is removed.
+- The PRD is split into a current spec and four reference pages (built modules M0-M7, evidence and memory budget, the hackathon plan, scope and questions); the previous version is archived unchanged. The spec now carries the post-hackathon build order (M8-M16) and the known gaps it closes.
+
 ## [0.9.0] - 2026-11-03
 
 ### Added

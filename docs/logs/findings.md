@@ -455,3 +455,19 @@ After 3600 allows over HTTPS, keep-alive tunnels open, before any holds (quiet /
 - **Recorded take.** 31 requests: 23 free (3 searches, weather, exchange rate, 18 model calls incl. one to GLM), 8 asked (3 allowed, 5 denied), 1 key swap. Log, timing and captions in `docs/logs/m7-muse-runs/`; the `date` line in the video was typed 5 min before the run (13:13:50, 5 s after commit f1f4858).
 - **Leaks found** (PRD section 10): data in a GET query leaves free in `ask` (reproduced with httpbin, 0 asks); DNS resolves before the gate (code-verified); model endpoints open with any key; labelled model APIs still card-scanned. Checked and fine: no Docker socket, session bus or X11 socket is visible inside (`/run` holds only barebox's own dir).
 
+
+## Post-hackathon feedback (Nov 4-5)
+
+Two pieces of public feedback after the 0.9.0 release and the hackathon submission. Both set the order of work; the plan is in the PRD, section 9, "Next: post-hackathon feedback".
+
+**Feedback 1:** "Forcing payments and emails to always prompt for confirmation is a must-have safety feature."
+- Today: payments ask in every mode only through the floor (a card number in a body of 64 KB or less, or `/checkout`, `/payment`, `/orders`, `/purchase` in the path). Payment API hosts on other paths are decided by letter and mode. Emails and messages are plain `x`: held in `ask` and `auto`, free in `trust`. In Demo A the email was held because the run was in `auto`.
+- Decision (user, Nov 5): strengthen it. Pay and send join the floor in every mode, with the exact recipient and amount in the question (PRD, "Next", a1-a4).
+
+**Feedback 2:** the risky bucket for an agent is often `r`, not `x`: a prompt injection can turn a read into exfiltration through a GET query (OWASP LLM Top 10, LLM01 prompt injection and LLM02 sensitive information disclosure). Point by point, what holds today:
+- Egress: no allowlist. The sandbox has no network of its own; the proxy denies non-HTTP and UDP, refuses private and loopback addresses after resolving (IPv4 inside IPv6 spellings included) and fails closed on names that do not resolve. A read reaches any public host. Reproduced Nov 3 (PRD section 10).
+- Who sets the letter: never the agent. Config only: the HTTP method, rwxmap labels from the API's OpenAPI spec, the built-in model endpoint list. Identity is the agent's unix socket, not a header. Marks (card, payment path) only add an ask.
+- Undo: local files only (overlay). Remote side effects cannot be rolled back, which is why every unlabelled `POST`/`PUT`/`PATCH`/`DELETE` is `x` and held before it leaves. A network `w` exists only where a label says the vendor's API can reverse it.
+- Approval prompt: built from the request bytes (method, full URL, masked 4 KB body preview); the "Why" line is barebox's rule, not model text. Recipient and amount are not pulled out yet (a3).
+- Secrets: per-run placeholder, swapped after the gate, bound hosts only, HTTPS only, headers only, each swap logged without the value. Scope is per host, not per tool.
+- Decision (user, Nov 5): fix the read channel after the floor work, in order: DNS after the gate, URL data check, first-contact host ask, an optional egress allowlist key, and a README sentence on what is not covered yet (PRD, "Next", b1-b5).
