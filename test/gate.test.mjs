@@ -222,6 +222,16 @@ describe('model endpoint names', () => {
     assert.equal(other.outcome, 'ask');
   });
 
+  it('a localLlm host on a default port works: the port is dropped from the URL host', () => {
+    for (const [hp, host, scheme] of [['localhost:80', 'localhost', 'http'], ['127.0.0.1:443', '127.0.0.1', 'https']]) {
+      const list = modelList([hp]);
+      const tools = buildTools({}, [hp]);
+      const name = `${host}.POST /api/chat`;
+      assert.equal(toolFor(emptyMatcher, tools, 'POST', `${scheme}://${hp}/api/chat`, list), name);
+      assert.equal(toolFor(emptyMatcher, tools, 'POST', `${scheme}://${host}/api/chat`, list), name);
+    }
+  });
+
   it('toolFor without a model list throws instead of returning http.POST', () => {
     assert.throws(() => toolFor(emptyMatcher, buildTools(), 'POST', 'https://api.anthropic.com/v1/messages'));
   });

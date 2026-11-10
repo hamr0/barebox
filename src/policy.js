@@ -51,7 +51,7 @@ const LOCAL_LLM_PATHS = ['/api/chat', '/api/generate', '/api/embed',
 /** @param {string[]} localLlm `host:port` pairs @returns {string[]} every model endpoint entry */
 function modelEntries(localLlm) {
   const entries = [...MODEL_PATHS];
-  for (const hp of localLlm) for (const p of LOCAL_LLM_PATHS) entries.push(`POST ${hp.toLowerCase()}${p}`);
+  for (const hp of localLlm) for (const p of LOCAL_LLM_PATHS) entries.push(`POST ${hp.toLowerCase().replace(/:(80|443)$/, '')}${p}`);
   return entries;
 }
 
