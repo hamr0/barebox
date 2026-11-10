@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadLabels } from '../src/labels.js';
-import { buildTools, toolFor, gateFor as policyGate, emptyMatcher } from '../src/policy.js';
+import { buildTools, toolFor, modelList, gateFor as policyGate, emptyMatcher } from '../src/policy.js';
 import { createProxy } from '../src/proxy.js';
 import { runtimePaths } from '../src/runtime.js';
 import { startHttp } from './fixtures/upstream.mjs';
@@ -50,7 +50,7 @@ const editJson = (f, fn) => { const j = JSON.parse(readFileSync(f, 'utf8')); fn(
 /** One gate decision for a request, through the real policy gate. @returns {Promise<{tool: string, outcome: 'allow'|'deny'|'ask', rule?: string}>} `ask` means the gate asked the human */
 async function decide({ mode, labels, localLlm = [], method, url }) {
   const tools = buildTools(labels?.tools, localLlm);
-  const tool = toolFor(labels?.matcher ?? emptyMatcher, tools, method, url);
+  const tool = toolFor(labels?.matcher ?? emptyMatcher, tools, method, url, modelList(localLlm));
   const asks = [];
   const gate = await policyGate({ agent: 'a', mode,
     humanChannel: async (e) => { asks.push(e.rule); return { decision: 'deny', reason: 'asked' }; },
@@ -106,10 +106,19 @@ describe('the tool for a request', () => {
     const d = copyLabels();
     const withT = loadLabels({ labels: [d], tenants: TENANTS });
     const tools = buildTools(withT.tools);
-    assert.equal(toolFor(withT.matcher, tools, 'PUT', ISSUE), 'jira.editIssue');
+    assert.equal(toolFor(withT.matcher, tools, 'PUT', ISSUE, modelList()), 'jira.editIssue');
     const noT = loadLabels({ labels: [d] });
-    assert.equal(toolFor(noT.matcher, buildTools(noT.tools), 'PUT', ISSUE), 'http.PUT');
-    assert.equal(toolFor(noT.matcher, tools, 'PUT', 'ftp://x/y'), 'http.PUT');
+    assert.equal(toolFor(noT.matcher, buildTools(noT.tools), 'PUT', ISSUE, modelList()), 'http.PUT');
+    assert.equal(toolFor(noT.matcher, tools, 'PUT', 'ftp://x/y', modelList()), 'http.PUT');
+    assert.equal(toolFor(noT.matcher, tools, 'PUT', 'not a url', modelList()), 'http.PUT');
+  });
+
+  it('a host written with a trailing dot gets the same label key as without it', () => {
+    const l = loadLabels({ labels: [copyLabels()], tenants: TENANTS });
+    const tools = buildTools(l.tools);
+    const dotted = ISSUE.replace('acme.atlassian.net', 'acme.atlassian.net.');
+    assert.equal(toolFor(l.matcher, tools, 'PUT', dotted, modelList()), toolFor(l.matcher, tools, 'PUT', ISSUE, modelList()));
+    assert.equal(toolFor(l.matcher, tools, 'PUT', dotted, modelList()), 'jira.editIssue');
   });
 
   it('the gate file wins: a letter edited to "x" asks in auto, the original w passes', async () => {

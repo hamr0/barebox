@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - bareguard 0.34.0 and rwxmap 0.11.1, pinned exactly; no behaviour change in barebox.
 
+### Fixed
+
+- A host written with a trailing dot (`api.anthropic.com.`) now matches its labels and the built-in model endpoints; before, it fell back to the method's letter.
+
 ## [0.10.0] - 2026-11-10
 
 Docs only; no code or behaviour changes.

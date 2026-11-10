@@ -302,7 +302,8 @@ Model endpoints are `r` (free in every mode): `api.anthropic.com`
 `POST /v1/chat/completions`, `/v1/responses` and `/v1/embeddings`; and on each
 `localLlm` host:port `POST /api/chat`, `/api/generate`, `/api/embed`,
 `/v1/chat/completions` and `/v1/completions` (over http or https). Any other path on
-those hosts is a normal `POST`. Model calls skip the card floor (the
+those hosts is a normal `POST`. A host written with a trailing dot
+(`api.anthropic.com.`) is the same host for labels and model endpoints. Model calls skip the card floor (the
 `paymentPath` mark still applies): a model call carries the whole conversation,
 and a card number in it must not kill the agent.
 

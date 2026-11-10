@@ -13,6 +13,8 @@
 // is `flags`: it asks in every mode, trust included.
 import { Gate } from 'bareguard';
 import { matcherFrom } from 'rwxmap/match';
+import { requestKey } from 'rwxmap/discover';
+import { endpointList, normalizeUrl } from './lists.js';
 
 /** The mode names, in the order the CLI and config list them. */
 export const MODES = ['ask', 'auto', 'trust'];
@@ -34,21 +36,47 @@ const TOOLS = {
   'http.DELETE': 'x',
 };
 
-/** Model-call endpoints per host (`host[:port]`); each is `POST` and reads (`r`). */
-const MODEL_PATHS = {
-  'api.anthropic.com': ['/v1/messages', '/v1/messages/count_tokens'],
-  'api.openai.com': ['/v1/chat/completions', '/v1/responses', '/v1/embeddings'],
-};
+/** Built-in model-call endpoints (`POST`, `r`), as endpoint-list entries. */
+const MODEL_PATHS = [
+  'POST api.anthropic.com/v1/messages',
+  'POST api.anthropic.com/v1/messages/count_tokens',
+  'POST api.openai.com/v1/chat/completions',
+  'POST api.openai.com/v1/responses',
+  'POST api.openai.com/v1/embeddings',
+];
+/** The endpoints of one local model server (`host:port`), as list entries. */
 const LOCAL_LLM_PATHS = ['/api/chat', '/api/generate', '/api/embed',
   '/v1/chat/completions', '/v1/completions'];
+
+/** @param {string[]} localLlm `host:port` pairs @returns {string[]} every model endpoint entry */
+function modelEntries(localLlm) {
+  const entries = [...MODEL_PATHS];
+  for (const hp of localLlm) for (const p of LOCAL_LLM_PATHS) entries.push(`POST ${hp.toLowerCase()}${p}`);
+  return entries;
+}
+
+/** @param {string} entry `"POST host/path"` @returns {string} the model tool name for it (`<host>.POST <path>`) */
+function modelToolName(entry) {
+  const sp = entry.indexOf(' ');
+  return requestKey(entry.slice(0, sp), `https://${entry.slice(sp + 1)}`);
+}
+
+/**
+ * The model endpoints as one endpoint list (the built-ins plus each local server).
+ *
+ * @param {string[]} [localLlm] `host:port` pairs of local model servers
+ * @returns {{ match: (method: string, url: string) => string | null }} matches to the entry string
+ */
+export function modelList(localLlm = []) {
+  return endpointList(modelEntries(localLlm));
+}
 
 /** The matcher used when no label files are loaded: every request is request-only. */
 export const emptyMatcher = matcherFrom([]);
 
 /**
  * The one tools table of a runtime: the `http.*` tools, the model endpoints
- * (`r`) and the label tools. Model keys come from `matcher.match()` itself so
- * there is no second key builder.
+ * (`r`) and the label tools. Model keys come from rwxmap's `requestKey`.
  *
  * @param {Record<string, any>} [labelTools] the label files' gate-file tools (`{ key: { letter, marker } }`)
  * @param {string[]} [localLlm] `host:port` pairs of local model servers
@@ -63,13 +91,7 @@ export function buildTools(labelTools = {}, localLlm = []) {
 
 /** @param {string[]} localLlm @returns {Set<string>} every model endpoint's tool key */
 function modelKeys(localLlm) {
-  const keys = new Set();
-  const add = (scheme, host, paths) => {
-    for (const p of paths) keys.add(emptyMatcher.match('POST', `${scheme}://${host}${p}`).key);
-  };
-  for (const [host, paths] of Object.entries(MODEL_PATHS)) add('https', host, paths);
-  for (const hp of localLlm) add('http', hp, LOCAL_LLM_PATHS);
-  return keys;
+  return new Set(modelEntries(localLlm).map(modelToolName));
 }
 
 /**
@@ -87,22 +109,33 @@ export function modelTools(labelTools = {}, localLlm = []) {
 }
 
 /**
- * The tool name for one request. A spec key (a label file documents it) is
- * used as is, even if the gate file lacks it (then the gate denies it:
- * fail closed). A request-only key is used only when it is a known model
- * endpoint; everything else is `http.<METHOD>`. Never the matcher's letter.
+ * The tool name for one request, in order: a spec key (a label file documents
+ * it) is used as is, even if the gate file lacks it (then the gate denies it:
+ * fail closed); else a model endpoint's name when the tools table has it; else
+ * `http.<METHOD>`. Never the matcher's letter. The host is normalised once
+ * (`normalizeUrl`).
  *
  * @param {{ match: (method: string, url: string) => { key: string, source: string } }} matcher
  * @param {Record<string, any>} tools the runtime's tools table
  * @param {string} method HTTP method
  * @param {string} url full request URL
+ * @param {{ match: (method: string, url: string) => string | null }} models the runtime's model list (`modelList(localLlm)`); required, no default
  * @returns {string} the tool name
  */
-export function toolFor(matcher, tools, method, url) {
+export function toolFor(matcher, tools, method, url, models) {
+  let norm;
   try {
-    const r = matcher.match(method, url);
-    if (r.source === 'spec' || Object.hasOwn(tools, r.key)) return r.key;
-  } catch { /* not an http(s) URL: fall through */ }
+    norm = normalizeUrl(url);
+  } catch { return `http.${method}`; } // not a URL
+  // rwxmap's match() throws on a non-http(s) URL (ftp://...), so it is checked here, not caught.
+  if (!/^https?:/.test(norm)) return `http.${method}`;
+  const r = matcher.match(method, norm);
+  if (r.source === 'spec') return r.key;
+  const entry = models.match(method, norm);
+  if (entry !== null) {
+    const name = modelToolName(entry);
+    if (Object.hasOwn(tools, name)) return name;
+  }
   return `http.${method}`;
 }
 
