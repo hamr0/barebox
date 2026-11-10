@@ -1,6 +1,6 @@
 ---
 title: barebox PRD
-description: The current barebox spec. Problem and goal, how the rwx gate and modes work, signed-off decisions, the M8-M15 reliability plan, the post-hackathon feedback items, and known gaps.
+description: The current barebox spec. Problem and goal, how the rwx gate and modes work, signed-off decisions, the M8-M16 build order, the post-hackathon feedback items, and known gaps.
 ---
 
 # barebox PRD
@@ -121,26 +121,34 @@ Signed off by the user (docs/archive/agent-sandbox-prd.md:292).
 
 Memory is priority 1, and the per-sandbox proxy is the cost. The walls are a launcher of about 50 lines. srt stays as prior art. Ideas borrowed from it: an async per-request filter, credential masking, and `node-forge` for certificates (which must pass the dependency checklist) (docs/archive/agent-sandbox-prd.md:325-329). The cost: barebox owns the walls code and its upkeep (docs/archive/agent-sandbox-prd.md:331).
 
-## 9. Later: reliability modules M8-M15 (order decided Nov 10)
+## 9. Later: build order M8-M16 (decided Nov 10, by dependency)
 
-Goal: as few holes as possible for the same scope (a solo developer or small team, up to 40 agents per proxy, lightweight, quick to spawn). The order follows what each module needs from the one before, then how widely the hole leaks: a hole open in every mode comes before one open only in `trust`. Each module runs the usual way: POC on its riskiest assumption, tests shown red then green, full suite 3x, bench, a real `sbx run`. The feedback items a1-a4 and b1-b5 map onto these modules (docs/archive/agent-sandbox-prd.md:715-717).
+Goal: as few holes as possible for the same scope (a solo developer or small team, up to 40 agents per proxy, lightweight, quick to spawn). The order is by dependency, like building blocks: a module comes after every block it stands on, and a block several modules share is built once, first, with one owner. Each module runs the usual way: POC on its riskiest assumption, tests shown red then green, full suite 3x, bench, a real `sbx run`. It replaces the earlier Nov 10 ranking and the Nov 5 "(a) goes first" note.
 
-| Module | What | Needs | Closes |
+**Base and shared blocks first.** Three pieces are needed by more than one module, so they come before any feature:
+
+| Module | Block | Stands on | Used by |
 |---|---|---|---|
-| M8. Upstream bump | bareguard 0.30.0 to 0.34.0, rwxmap 0.8.0 to 0.11.1, read both changelogs first; pinned exactly. | nothing | Starts every later module on current upstream, so its tests are not redone after a bump. |
-| M9. Decide before resolve | DNS only after the gate decides; for CONNECT, after the first request in the tunnel is decided (b1). | M8 | Data in a hostname leaking even when the request is denied, in every mode. Every egress rule below depends on it. |
-| M10. Egress: hosts allowlist and first-contact ask | See "M10 design" below (b3, b4). | M9 | Data in a GET to a host you never chose, in every mode. |
-| M11. URL data check | A long query or path, or a long base64/hex run, asks in every mode, thresholds sized from real traffic first (b2). | M10 | Bulk data in a GET to a host you did allow. A backstop for M10, not the main fix. |
-| M12. Model calls | A model endpoint passes free only with the run's own secret placeholder, else `x`. | M9 | Model APIs as an open channel with any key, an attacker's included, in every mode. |
-| M13. Pay and send always ask | The floor gains a `sendLike` mark (email and messaging send endpoints) and payment API hosts on any path; the question names recipient, amount and currency from the request body (a1-a4). | M8 | Emails and messages free in `trust`; payment hosts off the four path fragments. |
-| M14. Floor gaps | Card scan in gzip bodies; a model API labelled `r` skips the card scan like the built-in ones. | M13 | Small floor gaps (section 10). |
-| M15. Letter accuracy | rwxlite as the classifier; see "M15 open question" below. | M8 | Wrong letters for APIs without a label: `POST` reads that ask, `GET` actions that write. Does not close a leak. |
+| **M8. Upstream bump** | bareguard 0.30.0 to 0.34.0, rwxmap 0.8.0 to 0.11.1, read both changelogs first, pinned exactly. Marks, flags and the matcher all live upstream, so every later test runs on the final versions. | nothing | everything |
+| **M9. Endpoint and host lists** | One owner for "which requests match a list": exact endpoints (host + method + path, the way the built-in model endpoints are matched today in `src/policy.js`, through rwxmap's matcher) and host patterns with `*.domain`. Lists load from the one config file. Reuse check first: rwxmap's matcher for endpoints, bareguard's `net` domain matching for host patterns, before writing new code. | M8 | M11 (send and payment endpoints), M12 (model endpoints), M14 (hosts allow and deny) |
+| **M10. Body view** | Inside the existing 64 KB working slot: decode `gzip`/`deflate` bodies, and read named fields from JSON and form bodies. One owner; the card scan moves onto it. | M8 | M11 (recipient, amount and currency in the question; card scan in gzip bodies) |
 
-(docs/archive/agent-sandbox-prd.md:719-728)
+**Then the features, each on its blocks:**
 
-Then the fix ledger goes through `/refactor`: a Node install dir containing the runtime, `--hold` missing from `sbx run --help` for unattended runs, and the rest (docs/archive/agent-sandbox-prd.md:730).
+| Module | What | Stands on | Closes |
+|---|---|---|---|
+| **M11. Pay and send always ask** | The floor gains a `sendLike` mark (email and messaging send endpoints) and payment API hosts on any path (a1, a2); a floor question names recipient, amount and currency read from the body (a3); cards are found in gzip bodies; a model API labelled `r` skips the card scan like the built-in ones; proof per a4. | M9, M10 | Emails and messages free in `trust`; payment hosts off the four path fragments; floor gaps of section 10. |
+| **M12. Model calls need the run's key** | A model endpoint passes free only with the run's own secret placeholder, else `x`. | M9 | Model APIs as an open channel with any key, an attacker's included, in every mode. |
+| **M13. Decide before resolve** | DNS only after the gate decides; for CONNECT, after the first request in the tunnel is decided (b1). Proxy socket code, the riskiest change in the list. | M8 | Data in a hostname leaking even when the request is denied, in every mode. |
+| **M14. Hosts allow and deny, first-contact ask** | The M14 design below (b3, b4): `deny` before DNS, `allow` skips the first-contact ask, an unknown host asks with allow once / allow always / deny. Adds a third answer to the ask channel and one config writer for "allow always". | M9, M13 | Data in a GET to a host you never chose, in every mode. |
+| **M15. URL data check** | A long query or path, or a long base64/hex run, asks in every mode (b2). Thresholds sized from real traffic with M14 in place. | M14 | Bulk data in a GET to a host you did allow. A backstop for M14. |
+| **M16. Letter accuracy** | rwxlite as the classifier; see "M16 open question" below. | M8 | Wrong letters for APIs without a label. Does not close a leak. |
 
-### M10 design (decided Nov 10, user)
+Not ordered, any time: b5, the README sentence on what is not covered yet (docs only). After M16 the fix ledger goes through `/refactor`: a Node install dir containing the runtime, `--hold` missing from `sbx run --help` for unattended runs, and the rest.
+
+Why this order: the floor (M11) stands only on the two shared blocks, so the must-have pay-and-send ask comes early without waiting for socket work. M13 is the one block the egress modules need and nothing else does, so it sits right before them. M15 is measured last among the leaks, on top of the allowlist it backs up.
+
+### M14 design (decided Nov 10, user)
 
 - Hosts live in the one config file under `hosts`, Claude-style (docs/archive/agent-sandbox-prd.md:733-740):
 
@@ -157,7 +165,7 @@ Then the fix ledger goes through `/refactor`: a Node install dir containing the 
 - Open: which default hosts, if any, ship in `hosts.allow` (docs/archive/agent-sandbox-prd.md:744).
 - Open: whether `x` and floor asks also offer "allow always". Proposed: no. A floor ask is never remembered, and an `x` ask offers allow once or deny only, so a remembered answer can never turn a send or a payment free (docs/archive/agent-sandbox-prd.md:745).
 
-### M15 open question (Nov 10)
+### M16 open question (Nov 10)
 
 rwxlite is a small classifier (0.3.1 on npm, 132 KB, no dependencies) that letters an API operation from its spec text (docs/archive/agent-sandbox-prd.md:747). Two ways to use it:
 
@@ -165,7 +173,7 @@ rwxlite is a small classifier (0.3.1 on npm, 132 KB, no dependencies) that lette
 - (b) On its own: barebox calls rwxlite per request and drops rwxmap. This changes the runtime dependency rule. rwxlite reported (Nov 3) that it reads only spec operation text, never live URLs or bodies; lettering from method plus path alone is untested (docs/archive/agent-sandbox-prd.md:749).
 - POC before deciding: letter the same requests both ways (Demo A, Demo B, a real Claude Code run) and compare against hand labels, plus the per-request cost in ms (docs/archive/agent-sandbox-prd.md:750).
 
-### Not sorted into the M8-M15 order
+### Not sorted into the M8-M16 order
 
 | Item | Note |
 |---|---|
@@ -191,12 +199,12 @@ rwxlite is a small classifier (0.3.1 on npm, 132 KB, no dependencies) that lette
 
 ## Next: post-hackathon feedback (decided Nov 5)
 
-Build order is the M8-M15 table above (docs/archive/agent-sandbox-prd.md:773). Two pieces of public feedback (Nov 4-5, recorded in `docs/logs/findings.md`) set the order of work (docs/archive/agent-sandbox-prd.md:775):
+Build order is the M8-M16 table above (docs/archive/agent-sandbox-prd.md:773). Two pieces of public feedback (Nov 4-5, recorded in `docs/logs/findings.md`) set the order of work (docs/archive/agent-sandbox-prd.md:775):
 
 - **(a) Strengthen the floor.** "Forcing payments and emails to always prompt for confirmation is a must-have safety feature", so pay and send ask in every mode.
 - **(b) Fix the read channel.** For an agent the risky bucket is often `r`, not `x`; a prompt injection can turn a GET into exfiltration.
 
-(a) goes first because it extends a mechanism that exists (marks). (b) needs proxy work (docs/archive/agent-sandbox-prd.md:775).
+Build order for both: section 9, M8-M16 (by dependency).
 
 ### (a) Pay and send always ask (the floor)
 
@@ -220,7 +228,7 @@ In order, because each depends on the one before (docs/archive/agent-sandbox-prd
 | b1 | DNS after the gate | Resolve only after the gate decides; for CONNECT, after the first request in the tunnel is decided (section 10). Without it, b3 still leaks a hostname before the ask. |
 | b2 | URL data check | A long query or path, or a long base64/hex run, asks in every mode. Thresholds sized from real traffic first (spec in the "Not sorted" table above). |
 | b3 | First-contact host ask | The first request to a host new in this run asks, an allowlist built as you go. |
-| b4 | Egress allowlist | Superseded Nov 10 by the M10 design above: the list lives under the `hosts` config key (`allow` and `deny`), and a host on neither list gets the first-contact ask instead of a deny (docs/archive/agent-sandbox-prd.md:733-746, 793). |
+| b4 | Egress allowlist | Superseded Nov 10 by the M14 design above: the list lives under the `hosts` config key (`allow` and `deny`), and a host on neither list gets the first-contact ask instead of a deny (docs/archive/agent-sandbox-prd.md:733-746, 793). |
 | b5 | Say what is not covered | README Known limits gains one plain sentence: until b1-b3 land, injected instructions that only read and send data out through URLs are not covered in any mode. Docs only; can ship before the code. |
 
 (docs/archive/agent-sandbox-prd.md:788-794)
