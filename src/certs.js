@@ -4,7 +4,7 @@
 // CONNECT. Nothing is pre-generated: a fresh runtime dir works on any host.
 // Minting shells out to `openssl` (the PRD decision: no JS crypto for X.509).
 import { execFile } from 'node:child_process';
-import { mkdirSync, chmodSync, existsSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdirSync, chmodSync, existsSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
@@ -54,23 +54,27 @@ export async function ensureCA(dir) {
   const keyPath = join(dir, 'ca.key');
   const certPath = join(dir, 'ca.pem');
   if (existsSync(certPath)) return { keyPath, certPath };
-  await sh('openssl', ['genrsa', '-out', keyPath, '2048']);
-  chmodSync(keyPath, 0o600);
+  // Write to temp names, then rename key first and cert last: ca.pem exists
+  // only when the pair is complete, so a crash never leaves a CA that is trusted but broken.
+  const keyTmp = `${keyPath}.tmp`;
+  const certTmp = `${certPath}.tmp`;
+  const csr = join(dir, 'ca.csr.tmp');
   const ext = join(dir, 'ca.ext.tmp');
-  writeFileSync(ext,
-    'basicConstraints=critical,CA:true\n' +
-    'keyUsage=critical,keyCertSign,cRLSign,digitalSignature\n' +
-    'subjectKeyIdentifier=hash\n' +
-    'authorityKeyIdentifier=keyid:always,issuer\n');
   try {
-    await sh('openssl', ['req', '-new', '-key', keyPath, '-out', join(dir, 'ca.csr.tmp'),
-      '-subj', '/CN=barebox-ca']);
-    await sh('openssl', ['x509', '-req', '-in', join(dir, 'ca.csr.tmp'),
-      '-signkey', keyPath, '-sha256', '-days', '825',
-      '-out', certPath, '-extfile', ext]);
+    await sh('openssl', ['genrsa', '-out', keyTmp, '2048']);
+    chmodSync(keyTmp, 0o600);
+    writeFileSync(ext,
+      'basicConstraints=critical,CA:true\n' +
+      'keyUsage=critical,keyCertSign,cRLSign,digitalSignature\n' +
+      'subjectKeyIdentifier=hash\n' +
+      'authorityKeyIdentifier=keyid:always,issuer\n');
+    await sh('openssl', ['req', '-new', '-key', keyTmp, '-out', csr, '-subj', '/CN=barebox-ca']);
+    await sh('openssl', ['x509', '-req', '-in', csr, '-signkey', keyTmp, '-sha256', '-days', '825',
+      '-out', certTmp, '-extfile', ext]);
+    renameSync(keyTmp, keyPath);
+    renameSync(certTmp, certPath);
   } finally {
-    rmSync(join(dir, 'ca.csr.tmp'), { force: true });
-    rmSync(ext, { force: true });
+    for (const f of [csr, ext, keyTmp, certTmp]) rmSync(f, { force: true });
   }
   return { keyPath, certPath };
 }
@@ -89,10 +93,11 @@ export async function certFor(dir, host) {
   const { readFileSync } = await import('node:fs');
   const keyPath = join(dir, `${host}.key`);
   const certPath = join(dir, `${host}.pem`);
-  if (existsSync(keyPath) && existsSync(certPath)) {
+  // In-flight first: while a mint runs, nothing is read from disk.
+  let p = inflight.get(host);
+  if (!p && existsSync(keyPath) && existsSync(certPath)) {
     return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
   }
-  let p = inflight.get(host);
   if (!p) {
     p = withMintSlot(() => mint(dir, host, keyPath, certPath)).finally(() => { inflight.delete(host); });
     inflight.set(host, p);
@@ -106,24 +111,29 @@ async function mint(dir, host, keyPath, certPath) {
   // A crashed mint must not leave half a pair behind that later reads as valid.
   rmSync(keyPath, { force: true });
   rmSync(certPath, { force: true });
-  await sh('openssl', ['genrsa', '-out', keyPath, '2048']);
-  chmodSync(keyPath, 0o600);
+  // Temp names, then rename key first and cert last: the final names exist
+  // only as a complete pair.
+  const keyTmp = `${keyPath}.tmp`;
+  const certTmp = `${certPath}.tmp`;
   const san = /^\d+\.\d+\.\d+\.\d+$/.test(host) ? `IP:${host}` : `DNS:${host}`;
   const ext = join(dir, `${host}.ext.tmp`);
   const csr = join(dir, `${host}.csr.tmp`);
-  writeFileSync(ext,
-    'basicConstraints=CA:false\n' +
-    'keyUsage=digitalSignature,keyEncipherment\n' +
-    'extendedKeyUsage=serverAuth\n' +
-    `subjectAltName=${san}\n`);
-  const { keyPath: caKey, certPath: caCert } = await ensureCA(dir);
   try {
-    await sh('openssl', ['req', '-new', '-key', keyPath, '-out', csr, '-subj', `/CN=${host}`]);
+    await sh('openssl', ['genrsa', '-out', keyTmp, '2048']);
+    chmodSync(keyTmp, 0o600);
+    writeFileSync(ext,
+      'basicConstraints=CA:false\n' +
+      'keyUsage=digitalSignature,keyEncipherment\n' +
+      'extendedKeyUsage=serverAuth\n' +
+      `subjectAltName=${san}\n`);
+    const { keyPath: caKey, certPath: caCert } = await ensureCA(dir);
+    await sh('openssl', ['req', '-new', '-key', keyTmp, '-out', csr, '-subj', `/CN=${host}`]);
     await sh('openssl', ['x509', '-req', '-in', csr, '-CA', caCert, '-CAkey', caKey,
-      '-set_serial', '0x' + randomBytes(16).toString('hex'), '-days', '825', '-sha256', '-out', certPath, '-extfile', ext]);
+      '-set_serial', '0x' + randomBytes(16).toString('hex'), '-days', '825', '-sha256', '-out', certTmp, '-extfile', ext]);
+    renameSync(keyTmp, keyPath);
+    renameSync(certTmp, certPath);
   } finally {
-    rmSync(csr, { force: true });
-    rmSync(ext, { force: true });
+    for (const f of [csr, ext, keyTmp, certTmp]) rmSync(f, { force: true });
   }
   return { key: readFileSync(keyPath), cert: readFileSync(certPath) };
 }

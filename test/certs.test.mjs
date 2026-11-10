@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, chmodSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import tls from 'node:tls';
 import { ensureCA, certFor } from '../src/certs.js';
 
 const T = { timeout: 60_000 };
@@ -54,5 +55,63 @@ describe('certs: serials and mint cap', () => {
     let live = 0, max = 0;
     for (const e of events) { live += e.kind === 'start' ? 1 : -1; max = Math.max(max, live); }
     assert.ok(max <= 4, `max overlapping openssl runs was ${max}`);
+  });
+});
+
+describe('certs: files are read only when complete', () => {
+  let root;
+  before(() => { root = mkdtempSync(join(tmpdir(), 'sbx-certs-atomic-')); });
+  after(() => { rmSync(root, { recursive: true, force: true }); });
+
+  it('new same-host calls while a mint runs never read a half-written pair', T, async () => {
+    const rounds = 5;
+    for (let r = 0; r < rounds; r++) {
+      const dir = join(root, `race${r}`);
+      const host = `race${r}.test`;
+      let done = false;
+      const tries = [];
+      const first = certFor(dir, host).finally(() => { done = true; });
+      // A new, unawaited call every 0.5 ms until the first mint resolves.
+      await new Promise((resolve) => {
+        const t = setInterval(() => {
+          if (done) { clearInterval(t); resolve(undefined); return; }
+          tries.push(certFor(dir, host).then((c) => { tls.createSecureContext(c); return null; }, (e) => e));
+        }, 0.5);
+      });
+      tls.createSecureContext(await first);
+      const errs = (await Promise.all(tries)).filter(Boolean);
+      assert.equal(errs.length, 0, `round ${r}: ${errs.length}/${tries.length} failed, e.g. ${errs[0]?.message.split('\n')[0]}`);
+    }
+  });
+
+  it('a CA write killed mid-cert leaves no ca.pem; the next start makes a good CA', T, async () => {
+    const dir = join(root, 'crash');
+    const real = execFileSync('sh', ['-c', 'command -v openssl'], { encoding: 'utf8' }).trim();
+    const bin = join(root, 'crashshim');
+    mkdirSync(bin);
+    // x509 writes a partial cert to its -out file and dies, like a kill mid-write.
+    writeFileSync(join(bin, 'openssl'),
+      '#!/bin/bash\nif [ "$1" = x509 ]; then\n' +
+      '  while [ $# -gt 0 ]; do [ "$1" = -out ] && out="$2"; shift; done\n' +
+      '  printf -- "-----BEGIN CERTIFICATE-----\\nMIIB" > "$out"\n  exit 137\nfi\n' +
+      `exec ${real} "$@"\n`);
+    chmodSync(join(bin, 'openssl'), 0o755);
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${bin}:${oldPath}`;
+    try { await assert.rejects(ensureCA(dir)); } finally { process.env.PATH = oldPath; }
+    assert.equal(existsSync(join(dir, 'ca.pem')), false, 'a partial cert must not sit at ca.pem');
+    const ca = await ensureCA(dir);
+    tls.createSecureContext({ key: readFileSync(ca.keyPath), cert: readFileSync(ca.certPath) });
+    const leaf = await certFor(dir, 'after-crash.test');
+    tls.createSecureContext(leaf);
+  });
+
+  it('a dir with ca.key and a partial ca.pem.tmp but no ca.pem gets a fresh CA', T, async () => {
+    const dir = join(root, 'leftover');
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'ca.key'), 'not a key');
+    writeFileSync(join(dir, 'ca.pem.tmp'), '-----BEGIN CERTIFICATE-----\nMIIB');
+    const ca = await ensureCA(dir);
+    tls.createSecureContext({ key: readFileSync(ca.keyPath), cert: readFileSync(ca.certPath) });
   });
 });

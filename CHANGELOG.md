@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Fixed
 
 - A host written with a trailing dot (`api.anthropic.com.`) now matches its labels and the built-in model endpoints; before, it fell back to the method's letter.
+- Parallel first connections to a new host no longer lose some tunnels to a half-written certificate, and a crash while creating the CA no longer leaves a broken CA.
 
 ## [0.10.0] - 2026-11-10
 
