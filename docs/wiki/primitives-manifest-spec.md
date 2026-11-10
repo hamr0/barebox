@@ -11,7 +11,7 @@
 | bareguard | `scripts/primitives-core.mjs` (402 lines), `scripts/primitives-core.hashes.json`, `scripts/gen-primitives.mjs`, `primitives.config.mjs`, `test/primitives-core.test.mjs`, `package.json`, `.github/workflows/ci.yml`, `primitives.json` (28 entries), `src/gate.js`, `src/primitives/classify.js`, `bareguard.context.md`, `README.md` |
 | bareagent (upstream of the core) | `scripts/*`, `primitives.config.mjs`, `docs/product/prd.md` (section "Primitives manifest"), `docs/wiki/decisions-log.md`, `README.md`, `src/` (tool-call code) |
 | litectx | `package.json`, `scripts/*`, `primitives.config.mjs`, `test/primitives-core.test.mjs` |
-| barebox | `README.md`, `AGENTS.md`, `CLAUDE.md`, `docs/product/agent-sandbox-prd.md`, `package.json`, `tsconfig.json`, git log |
+| barebox | `README.md`, `AGENTS.md`, `CLAUDE.md`, `docs/archive/agent-sandbox-prd.md`, `package.json`, `tsconfig.json`, git log |
 
 ---
 
@@ -446,7 +446,7 @@ The bare-suite boundary, stated plainly: **the floor and the permissions are use
 | Fact | Source |
 |---|---|
 | Status: POC. "The npm package is a name reservation — the API lands with the graduation rewrite next." Published `0.1.0` is "the reservation scaffold — nothing to import yet." | `README.md`, status line and Install section |
-| Latest commit `f6122c4` "Sync status to rewrite-next, record API surface decision" added one row to the PRD decisions table: **"API surface: CLI for sure plus programmatic APIs for spawning sandboxed workflows (goal: spawn workflows in a sandbox easily)."** | `docs/product/agent-sandbox-prd.md:224`, commit diff |
+| Latest commit `f6122c4` "Sync status to rewrite-next, record API surface decision" added one row to the PRD decisions table: **"API surface: CLI for sure plus programmatic APIs for spawning sandboxed workflows (goal: spawn workflows in a sandbox easily)."** | `docs/archive/agent-sandbox-prd.md:224`, commit diff |
 | CLI verbs named: `sbx pending`, `sbx approve <id>`, `sbx deny <id>`, `sbx diff`, `sbx commit`, `sbx rollback`. `sbx` is a placeholder name (open question 6). | PRD lines 217, 303, 327, 423 |
 | Stack: Node; bareguard and rwxmap run in-process in the proxy. | PRD line 213 |
 | Package state: `"type":"module"`, `engines.node >=22`, scripts `typecheck`/`build:types`/`prepack`; **no `exports`, no `main`, no `src/`** yet. | `package.json`; `ls` |

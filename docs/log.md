@@ -9,3 +9,7 @@
 ## [2026-10-29] index-flat | 29 row(s) (3 product, 26 logs, 0 archive)
 ## [2026-11-01] index-flat | 38 row(s) (3 product, 35 logs, 0 archive)
 ## [2026-11-02] index-flat | 44 row(s) (3 product, 41 logs, 0 archive)
+## [2026-11-10] validate | PASS — 0 gate failure(s)
+## [2026-11-10] validate | PASS — 0 gate failure(s)
+## [2026-11-10] archive | docs/product/agent-sandbox-prd.md -> docs/archive/agent-sandbox-prd.md, 349 link(s) rewritten
+## [2026-11-10] index-flat | 57 row(s) (7 product, 49 logs, 1 archive)
