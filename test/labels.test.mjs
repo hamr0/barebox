@@ -1,5 +1,5 @@
 // M3 B2a: API labels and model endpoints. Label files come from the real
-// rwxmap CLI (Jev off, no network) run in a temp dir. Gate decisions use the
+// rwxmap CLI (rwxlite off, no network) run in a temp dir. Gate decisions use the
 // real policy gates; the socket test rides the real proxy with its own timeout.
 for (const v of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
   'FTP_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'ftp_proxy']) {
@@ -30,10 +30,10 @@ before(() => {
   root = mkdtempSync(join(tmpdir(), 'bb-lbl-'));
   base = join(root, 'base');
   mkdirSync(base);
-  const r = spawnSync(process.execPath, [RWXMAP, SPEC, '-o', base, '--vendor', 'jira'],
+  const r = spawnSync(process.execPath, [RWXMAP, SPEC, '-o', base, '--vendor', 'jira', '--engine', 'mechanical'],
     { cwd: root, encoding: 'utf8', env: { ...process.env, JEV_KEY: '' } });
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout + r.stderr, /Jev: off/);
+  assert.match(r.stdout + r.stderr, /rwxlite: off \(mechanical\)\n/);
 });
 after(() => { rmSync(root, { recursive: true, force: true }); });
 

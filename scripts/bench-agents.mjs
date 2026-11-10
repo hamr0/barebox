@@ -104,10 +104,10 @@ function makeLabels(/** @type {string} */ root) {
   const cli = path.join(here, '..', 'node_modules', 'rwxmap', 'src', 'cli.js');
   const env = { ...process.env };
   delete env.JEV_KEY; delete env.RWXMAP_JEV_KEY;
-  const r = spawnSync(process.execPath, [cli, spec, '-o', out, '--vendor', 'bench'],
+  const r = spawnSync(process.execPath, [cli, spec, '-o', out, '--vendor', 'bench', '--engine', 'mechanical'],
     { cwd: root, encoding: 'utf8', env });
   if (r.status !== 0) throw new Error(`rwxmap failed: ${r.stderr}`);
-  if (!/Jev: off/.test(r.stdout + r.stderr)) throw new Error('rwxmap did not report "Jev: off"');
+  if (!/rwxlite: off \(mechanical\)\n/.test(r.stdout + r.stderr)) throw new Error('rwxmap did not report "rwxlite: off (mechanical)"');
   return out;
 }
 
