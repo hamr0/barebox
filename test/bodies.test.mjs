@@ -18,6 +18,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import v8 from 'node:v8';
+import zlib from 'node:zlib';
 import vm from 'node:vm';
 import { createProxy } from '../src/proxy.js';
 import { startHttp } from './fixtures/upstream.mjs';
@@ -435,6 +436,44 @@ describe('held bodies are not kept in memory', () => {
       const total = AGENTS * PER * SIZE;
       console.log(`held-body memory: arrayBuffers grew ${grew} B of ${total} B body total`);
       assert.ok(grew < total / 10, `arrayBuffers grew ${grew} B; bodies total ${total} B`);
+      for (const s of socks) s.destroy();
+    });
+  });
+
+  it('68 held gzip bodies (64000 B decoded each) keep only the 4 KB decoded previews after gc', { timeout: 60000 }, async (tc) => {
+    if (!(await unixSocketsOk())) { tc.skip('unix socket bind blocked here'); return; }
+    v8.setFlagsFromString('--expose-gc');
+    const gc = vm.runInNewContext('gc');
+    const settle = async () => { for (let i = 0; i < 3; i++) { gc(); await nap(50); } };
+    const AGENTS = 4;
+    const PER = 17;
+    await withProxy({}, async (t) => {
+      await settle();
+      const before = process.memoryUsage().arrayBuffers;
+      const socks = [];
+      let compressed = 0;
+      for (let a = 0; a < AGENTS; a++) {
+        const sockPath = t.proxy.addAgent(`gz${a}`);
+        for (let i = 0; i < PER; i++) {
+          let text = '';
+          while (text.length < 64000) text += `{"id":${crypto.randomInt(1e9)},"v":"${crypto.randomBytes(6).toString('hex')}"},`;
+          const gz = zlib.gzipSync(Buffer.from(text.slice(0, 64000)));
+          compressed += gz.length;
+          const s = net.connect(sockPath);
+          s.on('error', () => {});
+          await once(s, 'connect');
+          s.write(`POST http://127.0.0.1:${up.port}/hold HTTP/1.1\r\nHost: 127.0.0.1:${up.port}\r\nContent-Encoding: gzip\r\nContent-Length: ${gz.length}\r\n\r\n`);
+          s.write(gz);
+          socks.push(s);
+        }
+      }
+      await waitFor(() => t.heldFiles().length === AGENTS * PER, 'all 68 bodies spooled', 30000);
+      await settle();
+      const grew = process.memoryUsage().arrayBuffers - before;
+      // Each held request keeps two 4 KB heads: the raw tee.head and the decoded preview copy (decodedHead).
+      const limit = 2 * AGENTS * PER * 4096 + compressed / 10;
+      console.log(`held gzip-body memory: arrayBuffers grew ${grew} B, limit ${limit} B (compressed total ${compressed} B)`);
+      assert.ok(grew < limit, `arrayBuffers grew ${grew} B; limit ${limit} B`);
       for (const s of socks) s.destroy();
     });
   });

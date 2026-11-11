@@ -20,6 +20,7 @@ import path from 'node:path';
 import { ensureCA, certFor, HOST_RE } from './certs.js';
 import { createCardScanner } from './cardscan.js';
 import { ASK_BODY_LIMIT, DEFAULT_HOLD_MAX_BODY, bodyPreview, createHolds } from './holds.js';
+import { viewBody } from './bodyview.js';
 import { claimRuntime, ensurePrivateDir, runtimePaths } from './runtime.js';
 import { paymentPath, toolFor, buildTools, modelTools, modelList, emptyMatcher } from './policy.js';
 import { checkUpstream } from './wall.js';
@@ -502,6 +503,7 @@ export function createProxy(opts) {
    * @property {number|null} status HTTP status the channel wants for a denial (null: 403)
    * @property {string|null} heldId id of the held body file, once spooled
    * @property {((reason: string) => void)|null} endAsk end a not-yet-parked ask as a denial
+   * @property {Buffer|null} decodedHead copy of the first 4 KB of a gzip/deflate body, decoded (the ask preview)
    */
 
   /**
@@ -608,7 +610,7 @@ export function createProxy(opts) {
           // Parked: the tunnel stays open until the ask channel decides.
           // null: the reservation already expired and onExpire refused.
           parked = queue.add({ agent, method: ctx.method, url: ctx.url,
-            preview: bodyPreview(ctx.tee.head), bodyBytes: ctx.tee.bytes,
+            preview: bodyPreview(ctx.decodedHead ?? ctx.tee.head), bodyBytes: ctx.tee.bytes,
             sock, note: event.rule ?? 'ask', letter: event.rwxLetter, finish,
             slot, arrivedAt: slot.arrivedAt }) !== null;
         };
@@ -747,14 +749,16 @@ export function createProxy(opts) {
       /** @type {RequestCtx} */
       const ctx = { agent, method, url: urlStr, headers: { ...creq.headers }, creq, cres, tee,
         hasBody, chunks: [], over: false, freeWork, asked: false, status: null, heldId: null,
-        endAsk: null };
+        endAsk: null, decodedHead: null };
       // A model call is never card-scanned (user decision, Nov 2); the floor keeps every other request.
       const tool = toolFor(matcher, tools, method, urlStr, modelEndpoints);
       let cardLike = false;
       if (hasBody) {
         if (await readWorkBody(ctx)) return;
         // Past 64 KB the body streams on unscanned (known gap).
-        if (!ctx.over && !models.has(tool)) cardLike = createCardScanner().push(Buffer.concat(ctx.chunks));
+        if (!ctx.over && !models.has(tool)) {
+          cardLike = await scanBody(ctx);
+        }
       }
       // The body never goes in the action: bareguard writes the action to its audit file.
       const action = { type: 'net', tool, url: urlStr, method, agent,
@@ -848,6 +852,23 @@ export function createProxy(opts) {
     ctx.chunks = r.chunks;
     ctx.over = r.over;
     return false;
+  }
+
+  /**
+   * Scan the working slice of the body for card numbers and keep a copy of the
+   * decoded head as the ask preview. Its own frame, so no reference to the
+   * body or its decoded view outlives the scan (same reason as `readWorkBody`).
+   *
+   * @param {RequestCtx} ctx request context, chunks already read
+   * @returns {Promise<boolean>} true when the body looks like a card number
+   */
+  async function scanBody(ctx) {
+    const body = Buffer.concat(ctx.chunks);
+    const view = await viewBody(body, ctx.headers);
+    // A copy, never a subarray: a subarray would keep the whole decoded buffer alive.
+    if (view.state === 'decoded' || view.state === 'truncated') ctx.decodedHead = Buffer.from(view.text.subarray(0, ASK_BODY_LIMIT));
+    // The raw bytes are always scanned; decoded output is scanned as well (one scanner per buffer).
+    return createCardScanner().push(body) || (view.text !== body && createCardScanner().push(view.text));
   }
 
   /**
