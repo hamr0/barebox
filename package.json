@@ -1,6 +1,6 @@
 {
   "name": "barebox",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Lightweight local sandbox for AI agents: every write undoable, nothing leaves the machine without passing the doorman.",
   "license": "Apache-2.0",
   "repository": {
@@ -50,7 +50,7 @@
     "typescript": "5"
   },
   "dependencies": {
-    "bareguard": "0.30.0",
-    "rwxmap": "0.8.0"
+    "bareguard": "0.34.0",
+    "rwxmap": "0.11.1"
   }
 }

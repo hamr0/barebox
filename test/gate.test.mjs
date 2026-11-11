@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createProxy } from '../src/proxy.js';
 import { run } from '../src/run.js';
-import { gateFor as policyGate, MODES, modelTools } from '../src/policy.js';
+import { gateFor as policyGate, MODES, modelTools, modelList, buildTools, toolFor, emptyMatcher } from '../src/policy.js';
 import { runtimePaths } from '../src/runtime.js';
 import { startHttp } from './fixtures/upstream.mjs';
 import { bwrapUsable, hasBin } from './fixtures/probes.mjs';
@@ -190,6 +190,73 @@ describe('model calls skip the card floor', () => {
     assert.ok(key);
     assert.ok(modelTools({}, ['h:1']).has(key));
     assert.ok(!modelTools({ [key]: { letter: 'x' } }, ['h:1']).has(key));
+  });
+});
+
+describe('model endpoint names', () => {
+  /** One gate decision through the real policy gate. @returns {Promise<{tool: string, outcome: string}>} */
+  async function decideModel({ mode, localLlm = [], method, url }) {
+    const tools = buildTools({}, localLlm);
+    const tool = toolFor(emptyMatcher, tools, method, url, modelList(localLlm));
+    const dir = mkdtempSync(join(tmpdir(), 'bb-mod-'));
+    try {
+      const asks = [];
+      const gate = await policyGate({ agent: 'a', mode, tools, auditPath: join(dir, 'a.jsonl'),
+        humanChannel: async (e) => { asks.push(e.rule); return { decision: 'deny' }; } });
+      const d = await gate.check({ type: 'net', tool, url, method, agent: 'a' });
+      return { tool, outcome: asks.length ? 'ask' : d.outcome };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }
+
+  it('ask: a model URL with a trailing-dot host is the model tool and is allowed', async () => {
+    const r = await decideModel({ mode: 'ask', method: 'POST', url: 'https://api.anthropic.com./v1/messages' });
+    assert.deepEqual(r, { tool: 'api.anthropic.com.POST /v1/messages', outcome: 'allow' });
+  });
+
+  it('a local model server\'s paths are not models on another host (one sidecar per host)', async () => {
+    const localLlm = ['127.0.0.1:11434'];
+    const own = await decideModel({ mode: 'ask', localLlm, method: 'POST', url: 'http://127.0.0.1:11434/api/chat' });
+    assert.equal(own.tool, '127.0.0.1:11434.POST /api/chat');
+    const other = await decideModel({ mode: 'ask', localLlm, method: 'POST', url: 'https://api.anthropic.com/api/chat' });
+    assert.equal(other.tool, 'http.POST');
+    assert.equal(other.outcome, 'ask');
+  });
+
+  it('a localLlm host on a default port works: the port is dropped from the URL host', () => {
+    for (const [hp, host, scheme] of [['localhost:80', 'localhost', 'http'], ['127.0.0.1:443', '127.0.0.1', 'https']]) {
+      const list = modelList([hp]);
+      const tools = buildTools({}, [hp]);
+      const name = `${host}.POST /api/chat`;
+      assert.equal(toolFor(emptyMatcher, tools, 'POST', `${scheme}://${hp}/api/chat`, list), name);
+      assert.equal(toolFor(emptyMatcher, tools, 'POST', `${scheme}://${host}/api/chat`, list), name);
+    }
+  });
+
+  it('toolFor without a model list throws instead of returning http.POST', () => {
+    assert.throws(() => toolFor(emptyMatcher, buildTools(), 'POST', 'https://api.anthropic.com/v1/messages'));
+  });
+
+  it('no model tool name moved', () => {
+    const expected = [
+      'api.anthropic.com.POST /v1/messages',
+      'api.anthropic.com.POST /v1/messages/count_tokens',
+      'api.openai.com.POST /v1/chat/completions',
+      'api.openai.com.POST /v1/responses',
+      'api.openai.com.POST /v1/embeddings',
+      '127.0.0.1:11434.POST /api/chat',
+      '127.0.0.1:11434.POST /api/generate',
+      '127.0.0.1:11434.POST /api/embed',
+      '127.0.0.1:11434.POST /v1/chat/completions',
+      '127.0.0.1:11434.POST /v1/completions',
+    ];
+    assert.deepEqual([...modelTools({}, ['127.0.0.1:11434'])].sort(), [...expected].sort());
+    const tools = buildTools({}, ['127.0.0.1:11434']);
+    const list = modelList(['127.0.0.1:11434']);
+    for (const name of expected) {
+      const i = name.indexOf('.POST ');
+      const url = `${name.startsWith('127') ? 'http' : 'https'}://${name.slice(0, i)}${name.slice(i + 6)}`;
+      assert.equal(toolFor(emptyMatcher, tools, 'POST', url, list), name);
+    }
   });
 });
 

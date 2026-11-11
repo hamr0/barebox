@@ -35,7 +35,7 @@ describe('primitives completeness', () => {
       const out = join(root, 'out');
       mkdirSync(out);
       const r = spawnSync(process.execPath, [join(ROOT, 'node_modules/rwxmap/src/cli.js'),
-        join(ROOT, 'test/fixtures/jira-mini.json'), '-o', out, '--vendor', 'jira'],
+        join(ROOT, 'test/fixtures/jira-mini.json'), '-o', out, '--vendor', 'jira', '--engine', 'mechanical'],
         { cwd: root, encoding: 'utf8', env: { ...process.env, JEV_KEY: '' } });
       assert.equal(r.status, 0, r.stderr);
       const got = loadLabels({ labels: [out] });

@@ -1,5 +1,5 @@
 // M3 B2a: API labels and model endpoints. Label files come from the real
-// rwxmap CLI (Jev off, no network) run in a temp dir. Gate decisions use the
+// rwxmap CLI (rwxlite off, no network) run in a temp dir. Gate decisions use the
 // real policy gates; the socket test rides the real proxy with its own timeout.
 for (const v of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
   'FTP_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'ftp_proxy']) {
@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadLabels } from '../src/labels.js';
-import { buildTools, toolFor, gateFor as policyGate, emptyMatcher } from '../src/policy.js';
+import { buildTools, toolFor, modelList, gateFor as policyGate, emptyMatcher } from '../src/policy.js';
 import { createProxy } from '../src/proxy.js';
 import { runtimePaths } from '../src/runtime.js';
 import { startHttp } from './fixtures/upstream.mjs';
@@ -30,10 +30,10 @@ before(() => {
   root = mkdtempSync(join(tmpdir(), 'bb-lbl-'));
   base = join(root, 'base');
   mkdirSync(base);
-  const r = spawnSync(process.execPath, [RWXMAP, SPEC, '-o', base, '--vendor', 'jira'],
+  const r = spawnSync(process.execPath, [RWXMAP, SPEC, '-o', base, '--vendor', 'jira', '--engine', 'mechanical'],
     { cwd: root, encoding: 'utf8', env: { ...process.env, JEV_KEY: '' } });
   assert.equal(r.status, 0, r.stderr);
-  assert.match(r.stdout + r.stderr, /Jev: off/);
+  assert.match(r.stdout + r.stderr, /rwxlite: off \(mechanical\)\n/);
 });
 after(() => { rmSync(root, { recursive: true, force: true }); });
 
@@ -50,7 +50,7 @@ const editJson = (f, fn) => { const j = JSON.parse(readFileSync(f, 'utf8')); fn(
 /** One gate decision for a request, through the real policy gate. @returns {Promise<{tool: string, outcome: 'allow'|'deny'|'ask', rule?: string}>} `ask` means the gate asked the human */
 async function decide({ mode, labels, localLlm = [], method, url }) {
   const tools = buildTools(labels?.tools, localLlm);
-  const tool = toolFor(labels?.matcher ?? emptyMatcher, tools, method, url);
+  const tool = toolFor(labels?.matcher ?? emptyMatcher, tools, method, url, modelList(localLlm));
   const asks = [];
   const gate = await policyGate({ agent: 'a', mode,
     humanChannel: async (e) => { asks.push(e.rule); return { decision: 'deny', reason: 'asked' }; },
@@ -106,10 +106,19 @@ describe('the tool for a request', () => {
     const d = copyLabels();
     const withT = loadLabels({ labels: [d], tenants: TENANTS });
     const tools = buildTools(withT.tools);
-    assert.equal(toolFor(withT.matcher, tools, 'PUT', ISSUE), 'jira.editIssue');
+    assert.equal(toolFor(withT.matcher, tools, 'PUT', ISSUE, modelList()), 'jira.editIssue');
     const noT = loadLabels({ labels: [d] });
-    assert.equal(toolFor(noT.matcher, buildTools(noT.tools), 'PUT', ISSUE), 'http.PUT');
-    assert.equal(toolFor(noT.matcher, tools, 'PUT', 'ftp://x/y'), 'http.PUT');
+    assert.equal(toolFor(noT.matcher, buildTools(noT.tools), 'PUT', ISSUE, modelList()), 'http.PUT');
+    assert.equal(toolFor(noT.matcher, tools, 'PUT', 'ftp://x/y', modelList()), 'http.PUT');
+    assert.equal(toolFor(noT.matcher, tools, 'PUT', 'not a url', modelList()), 'http.PUT');
+  });
+
+  it('a host written with a trailing dot gets the same label key as without it', () => {
+    const l = loadLabels({ labels: [copyLabels()], tenants: TENANTS });
+    const tools = buildTools(l.tools);
+    const dotted = ISSUE.replace('acme.atlassian.net', 'acme.atlassian.net.');
+    assert.equal(toolFor(l.matcher, tools, 'PUT', dotted, modelList()), toolFor(l.matcher, tools, 'PUT', ISSUE, modelList()));
+    assert.equal(toolFor(l.matcher, tools, 'PUT', dotted, modelList()), 'jira.editIssue');
   });
 
   it('the gate file wins: a letter edited to "x" asks in auto, the original w passes', async () => {
