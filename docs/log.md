@@ -13,3 +13,7 @@
 ## [2026-11-10] validate | PASS — 0 gate failure(s)
 ## [2026-11-10] archive | docs/product/agent-sandbox-prd.md -> docs/archive/agent-sandbox-prd.md, 349 link(s) rewritten
 ## [2026-11-10] index-flat | 57 row(s) (7 product, 49 logs, 1 archive)
+## [2026-11-11] index-flat | 67 row(s) (7 product, 59 logs, 1 archive)
+## [2026-11-11] index-flat | 67 row(s) (7 product, 59 logs, 1 archive)
+## [2026-11-11] apply-reorg | moved 0, skipped 0, 0 oversized split candidate(s), 0 link(s) rewritten, 0 sync failure(s), 0 empty dir(s) removed, CLAUDE.md updated: true
+## [2026-11-11] reorg | discover+apply-reorg+lint over 62 doc(s), due reported

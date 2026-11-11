@@ -165,7 +165,7 @@ Why this order: the floor (M11) stands only on the two shared blocks, so the mus
 - A host on neither list gets a first-contact ask with three answers: allow once, allow always (the host is added to `hosts.allow`, so later runs skip the ask), or deny. The config folder is masked inside the sandbox, so the agent can neither read nor write the list (docs/archive/agent-sandbox-prd.md:743).
 - With no `hosts` key, the first-contact ask still runs. There is no default allow list beyond the model endpoints and secret-bound hosts, which never ask on first contact (docs/archive/agent-sandbox-prd.md:744).
 - Open: which default hosts, if any, ship in `hosts.allow` (docs/archive/agent-sandbox-prd.md:744).
-- Open: whether `x` and floor asks also offer "allow always". Proposed: no. A floor ask is never remembered, and an `x` ask offers allow once or deny only, so a remembered answer can never turn a send or a payment free (docs/archive/agent-sandbox-prd.md:745).
+- Decided (Nov 11, user): `x` and floor asks never offer "allow always". A floor ask is never remembered, and an `x` ask offers allow once or deny only, so a remembered answer can never turn a send or a payment free (docs/archive/agent-sandbox-prd.md:745).
 
 ### M16 open question (Nov 10)
 
@@ -245,6 +245,7 @@ Also noted from the feedback, not scheduled: scope a secret per tool (rwxmap ope
 - **Held requests can time out on the server side.** Holding happens before forwarding, so only the agent's client waits (docs/archive/agent-sandbox-prd.md:806).
 - **Card numbers in bodies over 64 KB are not checked.** Such bodies stream through with the normal letter and mode decision. Checking and denying them would break large uploads, because random 16-digit ids pass Luhn about 1 time in 10 (docs/archive/agent-sandbox-prd.md:807).
 - **`br` and `zstd` request bodies are not decoded; a card inside one is not found** (backlog, section 9).
+- **Stacked encodings (`gzip, gzip`, `gzip, br`) are not decoded; a card inside one is not found.** The body is scanned as sent, so only the compressed outer layer is checked, while the server decodes every layer. Only a deliberate sender stacks encodings (decided Nov 11: no decode, gzip and deflate only).
 - **A gzip body with bytes after its member (trailing garbage) is not decoded by Node's zlib; it is scanned as sent, so a card inside the compressed member is not found.** Only a deliberate sender makes such a body.
 - **Raw deflate sent as `deflate` is not decoded** (removed Nov 11 after it misread plain JSON). A body without the zlib header fails to decode and is scanned as sent, so a card inside a genuine raw-deflate body is not found. Only old or broken clients send raw deflate under that label.
 - **API keys or passwords inside a body still appear in the 4 KB preview** (ask file only; the audit file holds no preview). Card numbers are masked. bareguard's redaction covers common token shapes once it lands. barebox builds no scrubber of its own (docs/archive/agent-sandbox-prd.md:808).
