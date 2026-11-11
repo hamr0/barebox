@@ -97,28 +97,19 @@ describe('the one-decoder queue', () => {
   });
 });
 
-describe('the queue covers the raw-deflate retry', () => {
-  it('20 concurrent raw-deflate bombs never run more than one decoder', { timeout: 20000 }, async () => {
-    const origs = { createInflate: zlib.createInflate, createInflateRaw: zlib.createInflateRaw };
-    const st = { live: 0, peak: 0 };
-    for (const [name, orig] of Object.entries(origs)) {
-      Object.defineProperty(zlib, name, { configurable: true, writable: true, value: (...a) => {
-        const z = orig(...a);
-        st.live++;
-        st.peak = Math.max(st.peak, st.live);
-        z.on('close', () => { st.live--; });
-        return z;
-      } });
-    }
-    try {
-      const b = zlib.deflateRawSync(Buffer.alloc(64e6));
-      const views = await Promise.all(Array.from({ length: 20 }, () => viewBody(b, { 'content-encoding': 'deflate' })));
-      assert.ok(views.every((v) => v.state === 'truncated'));
-      assert.equal(st.peak, 1);
-      assert.equal(st.live, 0);
-    } finally {
-      for (const [name, orig] of Object.entries(origs)) Object.defineProperty(zlib, name, { configurable: true, writable: false, value: orig });
-    }
+describe('raw deflate is not decoded (known gap)', () => {
+  it('a plain JSON body with a false deflate label is unread, text is the body', async () => {
+    const body = Buffer.from('{\n  "card": "4111111111111111"\n}');
+    const v = await viewBody(body, { 'content-encoding': 'deflate' });
+    assert.equal(v.state, 'unread');
+    assert.ok(v.text.equals(body));
+  });
+
+  it('a genuine raw deflate body sent as deflate is unread, text is the raw body', async () => {
+    const body = zlib.deflateRawSync(Buffer.from('pay 4111111111111111 now'));
+    const v = await viewBody(body, { 'content-encoding': 'deflate' });
+    assert.equal(v.state, 'unread');
+    assert.ok(v.text.equals(body));
   });
 });
 

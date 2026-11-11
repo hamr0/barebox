@@ -5,7 +5,7 @@
 //
 // The rule: decoding only adds to what is scanned. The raw bytes as sent are
 // always scanned by the caller; any decoded output (full, truncated, partial
-// before an error, or from the raw-inflate retry) is scanned as well, and the
+// before an error) is scanned as well, and the
 // card floor fires if either scan finds a card. No decode outcome can then
 // check a labelled body less than an unlabelled one.
 //
@@ -16,7 +16,8 @@
 // throws instead of truncating, and without destroy() a bomb keeps inflating.
 // A body that does not decode is viewed as sent (partial output first); a gzip
 // member followed by garbage is not decoded by Node's zlib, a known gap (PRD
-// section 10).
+// section 10). Raw deflate (no zlib header) sent as `deflate` is not decoded
+// either: it is viewed as sent, a known gap.
 import zlib from 'node:zlib';
 
 const CAP = 65536;
@@ -38,11 +39,11 @@ const MAKE = { gzip: 'createGunzip', 'x-gzip': 'createGunzip', deflate: 'createI
  *
  * @param {Buffer} buf compressed body
  * @param {string} factory zlib factory name
- * @returns {Promise<{ text: Buffer, state: 'decoded'|'truncated'|'unread', produced: boolean }>} decode result
+ * @returns {Promise<{ text: Buffer, state: 'decoded'|'truncated'|'unread' }>} decode result
  */
 function decodeRaw(buf, factory) {
-  const run = (/** @type {string} */ make) => new Promise((resolve) => {
-    const z = /** @type {import('node:zlib').Gunzip} */ (zlib[/** @type {'createGunzip'} */ (make)]());
+  return new Promise((resolve) => {
+    const z = /** @type {import('node:zlib').Gunzip} */ (zlib[/** @type {'createGunzip'} */ (factory)]());
     /** @type {Buffer[]} */
     const out = [];
     let n = 0;
@@ -61,12 +62,9 @@ function decodeRaw(buf, factory) {
     });
     z.on('end', () => { result ??= { text: Buffer.concat(out), state: 'decoded' }; });
     z.on('error', () => { result ??= { text: partial(), state: 'unread' }; });
-    z.on('close', () => resolve({ ...(result ?? { text: partial(), state: 'unread' }), produced: out.length > 0 }));
+    z.on('close', () => resolve(result ?? { text: partial(), state: 'unread' }));
     z.end(buf);
   });
-  return run(factory).then((r) => (
-    // raw deflate has no zlib header: when inflate emitted nothing, try it once as raw
-    factory === 'createInflate' && r.state === 'unread' && !r.produced ? run('createInflateRaw') : r));
 }
 
 // One decoder at a time for the whole proxy; the tail never rejects.

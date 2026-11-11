@@ -317,10 +317,6 @@ describe('the card floor reads gzip and deflate bodies (M10)', () => {
     await withProxy({ mode: 'trust' }, async (t) => asksCard(t, gzb.subarray(0, -8), GZ));
   });
 
-  it('a raw deflate body with a card asks in trust mode', { timeout: 20000 }, async () => {
-    await withProxy({ mode: 'trust' }, async (t) => asksCard(t, zlib.deflateRawSync(Buffer.from(`pay ${CARD} now`)), { 'content-encoding': 'deflate' }));
-  });
-
   it('a plain body with a card and a false Content-Encoding: gzip still asks', { timeout: 20000 }, async () => {
     await withProxy({ mode: 'trust' }, async (t) => asksCard(t, Buffer.from(`pay ${CARD} now`), GZ));
   });
@@ -381,6 +377,17 @@ describe('the card floor reads gzip and deflate bodies (M10)', () => {
       const prev = t.askOf(h.id).bodyPreview;
       assert.ok(prev.startsWith('{"note":"hello","card":"'), prev);
       assert.ok(!prev.includes('4242 4242'), prev);
+      t.answer(h.id, { decision: 'deny' });
+      await done;
+    });
+  });
+
+  it('a held plain JSON body with a false Content-Encoding: deflate previews as sent', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'ask' }, async (t) => {
+      const json = '{\n  "to": "x",\n  "amount": 9999\n}';
+      const { done } = t.send('plain', Buffer.from(json), { headers: { 'content-encoding': 'deflate', 'content-type': 'application/json' } });
+      const [h] = await t.parked();
+      assert.equal(t.askOf(h.id).bodyPreview, json);
       t.answer(h.id, { decision: 'deny' });
       await done;
     });
