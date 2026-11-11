@@ -357,7 +357,7 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
 ## What this package does not do
 
 Per-API labels cover only the vendors whose rwxmap folders you list in
-`labels`; every other request is `http.<METHOD>`. The card-in-body floor checks bodies of 64 KB or less (a `gzip` or `deflate` body is checked decoded, up to 64 KB of output);
+`labels`; every other request is `http.<METHOD>`. The card-in-body floor checks bodies of 64 KB or less (a `gzip` or `deflate` body is checked decoded, up to 64 KB of output; `br`, `zstd`, raw deflate sent as `deflate`, and a gzip member followed by extra bytes are checked as sent, so a card inside their compressed bytes is not found);
 larger bodies stream through unchecked for cards. The removed `hold.shouldHold`
 and `hold.match` are gone: pass `gateFor` instead. No Docker, no MCP server, no macOS/Windows —
 Linux only. POC harnesses live in `poc/` in the repo and never ship.

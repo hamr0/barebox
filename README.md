@@ -157,7 +157,7 @@ barebox is a guardrail against mistakes and prompt-injected agents, not a securi
 - Data in a `GET` URL goes out free: reads are `r`.
 - The proxy resolves DNS before the gate decides, so data hidden in a hostname can leak.
 - Model API calls pass with any key, an attacker's included.
-- Bodies over 64 KB and compressed bodies are not scanned for card numbers.
+- Bodies over 64 KB are not scanned for card numbers. `gzip` and `deflate` bodies are decoded for the scan (up to 64 KB of output); `br`, `zstd` and bodies that fail to decode are scanned as sent, so a card inside their compressed bytes is not found.
 - `~/.claude` stays readable: Claude Code's tokens refresh themselves.
 - Writes over local sockets (a Postgres, a Docker daemon) are not on the undo layer.
 
