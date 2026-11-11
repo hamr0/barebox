@@ -144,15 +144,26 @@ describe('sbx --name (CLI)', () => {
     });
 
     it('a second run on a name that is running is refused, naming the sandbox', { timeout: 120000 }, async () => {
-      const first = spawn('node', [CLI, 'run', '--name', 't2', '--', 'sleep', '30'], { cwd: proj, env, stdio: 'ignore' });
+      // The first run must hold the name before anything probes it: the agent
+      // command running means the lock is claimed (the "answer from another
+      // terminal" stderr line prints before the claim, so it proves nothing).
+      const first = spawn('node', [CLI, 'run', '--name', 't2', '--', 'sh', '-c', 'echo T2UP; exec sleep 30'],
+        { cwd: proj, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '', err = '', exited = null;
+      first.stdout.on('data', (d) => { out += d; });
+      first.stderr.on('data', (d) => { err += d; });
+      first.on('exit', (code, sig) => { exited = { code, sig }; });
+      const state = () => `first run exit=${JSON.stringify(exited)} stdout=${JSON.stringify(out)} stderr=${JSON.stringify(err)}`;
       try {
-        let msg = '';
         const t0 = Date.now();
-        while (!/already running/.test(msg) && Date.now() - t0 < 15000) {
-          await new Promise((r) => setTimeout(r, 300));
-          msg = (await sbx(['run', '--name', 't2', '--', 'true'])).stderr;
+        while (!out.includes('T2UP') && !exited && Date.now() - t0 < 30000) {
+          await new Promise((r) => setTimeout(r, 100));
         }
-        assert.match(msg, /sandbox t2 is already running \(pid \d+\)/);
+        assert.ok(out.includes('T2UP'), `first run never started: ${state()}`);
+        const probe = await sbx(['run', '--name', 't2', '--', 'true']);
+        assert.equal(probe.code, 1, `${probe.stderr} | ${state()}`);
+        assert.match(probe.stderr, /sandbox t2 is already running \(pid \d+\)/);
+        assert.equal(exited, null, `first run must still be alive: ${state()}`);
       } finally { first.kill('SIGKILL'); }
     });
   });
