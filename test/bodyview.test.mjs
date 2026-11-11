@@ -1,5 +1,5 @@
 // M10: the body view. Unit tests: decoding, the 64 KB stop, the one-decoder
-// queue and get(path).
+// queue and broken bodies.
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import zlib from 'node:zlib';
@@ -97,61 +97,47 @@ describe('the one-decoder queue', () => {
   });
 });
 
-describe('get(path)', () => {
-  const json = (o, ct = 'application/json') => viewBody(Buffer.from(JSON.stringify(o)), { 'content-type': ct });
-
-  it('walks nested JSON and array indexes', { timeout: 5000 }, async () => {
-    const v = await json({ personalizations: [{ to: [{ email: 'a@b.c' }] }], n: 0, x: null });
-    assert.equal(v.get('personalizations.0.to.0.email'), 'a@b.c');
-    assert.equal(v.get('n'), 0);
-    assert.equal(v.get('x'), null);
-    assert.equal(v.get('personalizations.1'), undefined);
-    assert.equal(v.get('personalizations.length'), undefined);
-    assert.equal(v.get('nope.deeper'), undefined);
-  });
-
-  it('+json with parameters', { timeout: 5000 }, async () => {
-    const v = await json({ a: { b: 1 } }, 'application/vnd.api+json; charset=utf-8');
-    assert.equal(v.get('a.b'), 1);
-  });
-
-  it('reads a decoded gzip JSON body', { timeout: 5000 }, async () => {
-    const v = await viewBody(gz('{"a":{"b":2}}'), { 'content-encoding': 'gzip', 'content-type': 'application/json' });
-    assert.equal(v.get('a.b'), 2);
-  });
-
-  it('form keys as sent, first value', { timeout: 5000 }, async () => {
-    const v = await viewBody(Buffer.from('metadata[x]=1&metadata[x]=2&amount=5'), { 'content-type': 'application/x-www-form-urlencoded' });
-    assert.equal(v.get('metadata[x]'), '1');
-    assert.equal(v.get('amount'), '5');
-    assert.equal(v.get('missing'), undefined);
-  });
-
-  it('truncated, invalid and unread bodies give undefined', { timeout: 10000 }, async () => {
-    const big = { pad: 'a'.repeat(100000), a: 1 };
-    const t = await viewBody(zlib.gzipSync(Buffer.from(JSON.stringify(big))), { 'content-encoding': 'gzip', 'content-type': 'application/json' });
-    assert.equal(t.state, 'truncated');
-    assert.equal(t.get('a'), undefined);
-    const bad = await viewBody(Buffer.from('{"a":'), { 'content-type': 'application/json' });
-    assert.equal(bad.get('a'), undefined);
-    const un = await viewBody(Buffer.from('{"a":1}'), { 'content-type': 'application/json', 'content-encoding': 'br' });
-    assert.equal(un.state, 'unread');
-    assert.equal(un.get('a'), undefined);
-  });
-
-  it('prototype keys and unknown types give undefined, and nothing throws', { timeout: 5000 }, async () => {
-    const v = await json({ a: 1 });
-    for (const k of ['__proto__', 'constructor', 'a.__proto__', 'toString', 'a.constructor', '']) {
-      assert.equal(v.get(k), undefined, k);
+describe('the queue covers the raw-deflate retry', () => {
+  it('20 concurrent raw-deflate bombs never run more than one decoder', { timeout: 20000 }, async () => {
+    const origs = { createInflate: zlib.createInflate, createInflateRaw: zlib.createInflateRaw };
+    const st = { live: 0, peak: 0 };
+    for (const [name, orig] of Object.entries(origs)) {
+      Object.defineProperty(zlib, name, { configurable: true, writable: true, value: (...a) => {
+        const z = orig(...a);
+        st.live++;
+        st.peak = Math.max(st.peak, st.live);
+        z.on('close', () => { st.live--; });
+        return z;
+      } });
     }
-    const f = await viewBody(Buffer.from('a=1'), { 'content-type': 'application/x-www-form-urlencoded' });
-    assert.equal(f.get('__proto__'), undefined);
-    assert.equal(f.get('constructor'), undefined);
-    for (const ct of ['text/plain', 'multipart/form-data; boundary=x', undefined]) {
-      const u = await viewBody(Buffer.from('{"a":1}'), ct ? { 'content-type': ct } : {});
-      assert.equal(u.get('a'), undefined);
+    try {
+      const b = zlib.deflateRawSync(Buffer.alloc(64e6));
+      const views = await Promise.all(Array.from({ length: 20 }, () => viewBody(b, { 'content-encoding': 'deflate' })));
+      assert.ok(views.every((v) => v.state === 'truncated'));
+      assert.equal(st.peak, 1);
+      assert.equal(st.live, 0);
+    } finally {
+      for (const [name, orig] of Object.entries(origs)) Object.defineProperty(zlib, name, { configurable: true, writable: false, value: orig });
     }
-    const bad = await viewBody(Buffer.from('{"a":'), { 'content-type': 'application/json' });
-    assert.doesNotThrow(() => bad.get('a'));
+  });
+});
+
+describe('broken gzip bodies are scanned, not dodged', () => {
+  const h = { 'content-encoding': 'gzip' };
+  const CARD = '4242 4242 4242 4242';
+
+  it('output before an error is kept and the raw bytes follow', { timeout: 5000 }, async () => {
+    const text = `pay ${CARD} now ${'x'.repeat(1000)}` + Array.from({ length: 30000 }, () => Math.random().toString(36)[2]).join('');
+    const body = Buffer.concat([zlib.gzipSync(Buffer.from(text)), Buffer.from('garbage')]);
+    const v = await viewBody(body, h);
+    assert.equal(v.state, 'unread');
+    assert.ok(v.text.includes(CARD), 'the card in the first 1 KB is in text');
+  });
+
+  it('a member followed by garbage with the card at the end stays unread, raw (known gap)', { timeout: 5000 }, async () => {
+    const body = Buffer.concat([zlib.gzipSync(Buffer.from(`pay ${CARD} now ${'x'.repeat(200)}`)), Buffer.from('garbage')]);
+    const v = await viewBody(body, h);
+    assert.equal(v.state, 'unread');
+    assert.ok(v.text.equals(body));
   });
 });

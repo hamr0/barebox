@@ -312,6 +312,15 @@ describe('the card floor reads gzip and deflate bodies (M10)', () => {
     await withProxy({ mode: 'trust' }, async (t) => asksCard(t, zlib.deflateSync(Buffer.from(`pay ${CARD} now`)), { 'content-encoding': 'deflate' }));
   });
 
+  it('a gzip body with a card and its trailer cut asks in trust mode', { timeout: 20000 }, async () => {
+    const gzb = zlib.gzipSync(Buffer.from(`pay ${CARD} now ${'x'.repeat(200)}`));
+    await withProxy({ mode: 'trust' }, async (t) => asksCard(t, gzb.subarray(0, -8), GZ));
+  });
+
+  it('a raw deflate body with a card asks in trust mode', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'trust' }, async (t) => asksCard(t, zlib.deflateRawSync(Buffer.from(`pay ${CARD} now`)), { 'content-encoding': 'deflate' }));
+  });
+
   it('a plain body with a card and a false Content-Encoding: gzip still asks', { timeout: 20000 }, async () => {
     await withProxy({ mode: 'trust' }, async (t) => asksCard(t, Buffer.from(`pay ${CARD} now`), GZ));
   });

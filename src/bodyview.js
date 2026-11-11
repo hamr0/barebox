@@ -1,14 +1,15 @@
 // The body view: the one owner of "what a request body says". It gives the
 // proxy a view of a body that fits the 64 KB working slot, decoded when it is
-// gzip or deflate, plus `get(path)` over JSON and form fields. The card scan
-// and the ask preview read the view; forwarding never does (the upstream keeps
+// gzip or deflate. The card scan and the ask preview read the view; forwarding never does (the upstream keeps
 // the original compressed bytes).
 //
 // Decoding goes through ONE proxy-wide queue (one decoder at a time): compressed
 // request bodies are rare, so the queue costs almost no wait and bounds a burst
 // of bombs to one live decoder (PRD section 9, "M10 decisions"). Output stops at
 // 64 KB with destroy(): zlib's maxOutputLength throws instead of truncating, and
-// without destroy() a bomb keeps inflating.
+// without destroy() a bomb keeps inflating. A body that does not decode
+// is scanned as sent (partial output first); a gzip member followed by garbage
+// is not decoded by Node's zlib, a known gap (PRD section 10).
 import zlib from 'node:zlib';
 
 const CAP = 65536;
@@ -19,9 +20,8 @@ const MAKE = { gzip: 'createGunzip', 'x-gzip': 'createGunzip', deflate: 'createI
  * @typedef {object} BodyView
  * @property {Buffer} text the body as the proxy reads it (decoded when `state` is decoded or truncated)
  * @property {'plain'|'decoded'|'truncated'|'unread'} state plain: sent as is; decoded: gzip/deflate fully
- *   decoded; truncated: decoding stopped at 64 KB of output; unread: not decoded, `text` is the raw bytes
- * @property {(path: string) => unknown} get a JSON value by dotted path (array indexes as numbers) or the
- *   first value of a form key; undefined when absent or the body is not a readable JSON or form body
+ *   decoded; truncated: decoding stopped at 64 KB of output; unread: not decoded or broken, `text` is the
+ *   raw bytes (after any output decoded before the error)
  */
 
 /**
@@ -33,11 +33,13 @@ const MAKE = { gzip: 'createGunzip', 'x-gzip': 'createGunzip', deflate: 'createI
  * @returns {Promise<{ text: Buffer, state: 'decoded'|'truncated'|'unread' }>} decode result
  */
 function decodeRaw(buf, factory) {
-  return new Promise((resolve) => {
-    const z = /** @type {import('node:zlib').Gunzip} */ (zlib[/** @type {'createGunzip'} */ (factory)]());
+  const run = (/** @type {string} */ make) => new Promise((resolve) => {
+    const z = /** @type {import('node:zlib').Gunzip} */ (zlib[/** @type {'createGunzip'} */ (make)]());
     /** @type {Buffer[]} */
     const out = [];
     let n = 0;
+    // nothing decoded: the raw buffer itself; else the partial output, then the raw bytes
+    const raw = () => (out.length ? Buffer.concat([...out, buf]) : buf);
     /** @type {{ text: Buffer, state: 'decoded'|'truncated'|'unread' }|null} */
     let result = null;
     z.on('data', (/** @type {Buffer} */ c) => {
@@ -50,10 +52,13 @@ function decodeRaw(buf, factory) {
       }
     });
     z.on('end', () => { result ??= { text: Buffer.concat(out), state: 'decoded' }; });
-    z.on('error', () => { result ??= { text: buf, state: 'unread' }; });
-    z.on('close', () => resolve(result ?? { text: buf, state: 'unread' }));
+    z.on('error', () => { result ??= { text: raw(), state: 'unread' }; });
+    z.on('close', () => resolve(result ?? { text: raw(), state: 'unread' }));
     z.end(buf);
   });
+  return run(factory).then((r) => (
+    // raw deflate has no zlib header: when inflate emitted nothing, try it once as raw
+    factory === 'createInflate' && r.state === 'unread' && r.text === buf ? run('createInflateRaw') : r));
 }
 
 // One decoder at a time for the whole proxy; the tail never rejects.
@@ -77,42 +82,5 @@ export async function viewBody(buf, headers) {
       ({ text, state } = await p);
     } else state = 'unread';
   }
-  return { text, state, get: fieldGetter(text, state, headers) };
-}
-
-/**
- * @param {Buffer} text body text
- * @param {BodyView['state']} state view state
- * @param {Record<string, string | string[] | undefined>} headers request headers
- * @returns {(path: string) => unknown} lazy field reader; never throws
- */
-function fieldGetter(text, state, headers) {
-  const ct = String(headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
-  const readable = state === 'plain' || state === 'decoded';
-  let tried = false;
-  /** @type {unknown} */
-  let parsed;
-  const load = () => {
-    tried = true;
-    try {
-      if (!readable) return;
-      if (ct === 'application/json' || ct.endsWith('+json')) parsed = JSON.parse(text.toString('utf8'));
-      else if (ct === 'application/x-www-form-urlencoded') parsed = new URLSearchParams(text.toString('utf8'));
-    } catch { parsed = undefined; }
-  };
-  return (path) => {
-    try {
-      if (!tried) load();
-      if (parsed === undefined) return undefined;
-      if (parsed instanceof URLSearchParams) return parsed.get(path) ?? undefined;
-      let cur = /** @type {any} */ (parsed);
-      for (const k of String(path).split('.')) {
-        if (cur === null || typeof cur !== 'object') return undefined;
-        if (Array.isArray(cur) && !/^\d+$/.test(k)) return undefined;
-        if (!Object.hasOwn(cur, k)) return undefined;
-        cur = cur[k];
-      }
-      return cur;
-    } catch { return undefined; }
-  };
+  return { text, state };
 }
