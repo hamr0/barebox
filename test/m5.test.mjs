@@ -15,6 +15,7 @@ import https from 'node:https';
 import net from 'node:net';
 import tls from 'node:tls';
 import { once } from 'node:events';
+import v8 from 'node:v8';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -268,6 +269,32 @@ describe('allowed to the bound host: the real value goes in', () => {
       assert.equal(up.tlsBound.seen[0].headers.authorization, `Bearer ${REAL}`);
       assert.equal(up.tlsBound.seen[0].body, 'm=1');
       await assertNoLeak(t);
+    });
+  });
+
+  it('while held, the real value is nowhere in the proxy heap; the probe can see such a string', { timeout: 60000 }, async () => {
+    // The proxy runs in this process, so a heap snapshot sees what it holds.
+    const snapshot = async () => {
+      const parts = [];
+      for await (const c of v8.getHeapSnapshot()) parts.push(c);
+      return Buffer.concat(parts);
+    };
+    await withProxy({}, async (t) => {
+      const sent = t.sendTls('127.0.0.1', up.tlsBound.port, '/heap', { method: 'POST', body: 'm=1', headers: auth(t.ph) });
+      const [h] = await t.parked();
+      assert.equal(h.rule, 'rwx.ask');
+      const held = await snapshot();
+      // Built after the snapshot, so the needle is not in it. split/join gives a flat string, as swapIn does.
+      const needle = 'Bearer @'.split('@').join(REAL);
+      assert.ok(held.includes(Buffer.from(t.ph)), 'the placeholder is in the heap while held (the probe reads the request)');
+      assert.ok(!held.includes(Buffer.from(needle)), 'the real value is in the heap while the request is held');
+      // Control: the same snapshot sees a flat string like the one swapIn makes.
+      const probe = 'Bearer @'.split('@').join(REAL);
+      assert.ok((await snapshot()).includes(Buffer.from(probe)), 'the probe cannot see a flat string');
+      assert.equal(probe, needle);
+      t.answer(h.id, { decision: 'deny', reason: 'test' });
+      assert.equal((await sent).status, 403);
+      assert.equal(up.tlsBound.seen.length, 0);
     });
   });
 

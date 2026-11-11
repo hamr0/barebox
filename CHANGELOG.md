@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+
+- `sbx run` on a terminal no longer prints a plain `decided` line after an answer the prompt already showed.
+
 ## [0.11.0] - 2026-11-11
 
 ### Added

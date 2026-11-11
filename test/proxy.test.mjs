@@ -369,6 +369,37 @@ describe('negatives', () => {
     assert.ok(kc.key.length > 0 && kc.cert.length > 0);
   });
 
+  it('a CONNECT client that sends nothing after the 200 is closed after clientIdleMs', { timeout: 15000 }, async () => {
+    const rt = mkdtempSync(join(tmpdir(), 'bb-idle-'));
+    const p = createProxy({ port: 0, logFile: join(rt, 'mitm.log'), runtime: rt, clientIdleMs: 300,
+      unsafeTestOnly: { allowLoopback: true } });
+    try {
+      const { port } = await p.ready;
+      const target = `127.0.0.1:${plainUp.port}`;
+      const sock = net.connect(port, '127.0.0.1');
+      sock.on('error', () => {});
+      await once(sock, 'connect');
+      sock.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
+      let head = '';
+      await new Promise((resolve) => {
+        const onData = (c) => { head += c.toString('latin1'); if (head.includes('\r\n\r\n')) { sock.off('data', onData); resolve(); } };
+        sock.on('data', onData);
+      });
+      assert.match(head, /200 Connection established/);
+      const t0 = Date.now();
+      const closed = await Promise.race([
+        once(sock, 'close').then(() => true),
+        new Promise((r) => setTimeout(() => r(false), 3000)),
+      ]);
+      sock.destroy();
+      assert.ok(closed, 'the proxy kept a silent tunnel open past 3 s');
+      assert.ok(Date.now() - t0 < 3000);
+    } finally {
+      await p.close();
+      rmSync(rt, { recursive: true, force: true });
+    }
+  });
+
   // Own proxy + runtime, so the certs dir holds only what these tunnels mint.
   async function withOwnProxy(fn) {
     const rt = mkdtempSync(join(tmpdir(), 'bb-pc-'));

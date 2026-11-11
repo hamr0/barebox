@@ -261,13 +261,15 @@ async function run(args) {
       answer: (id, decision, reason) => writeAnswer(runtimePaths(runtime), id, decision, reason),
     })
     : null;
+  const prompted = new Set(); // holds the prompt showed: their answer is shown there too
   const emitAsk = (h) => {
-    if (prompt?.ask(h)) return;
+    if (prompt?.ask(h)) { prompted.add(h.id); return; }
     const c = clean(h, ['id', 'agent', 'method', 'url', 'rule', 'bodyPreview']);
     if (json) out(JSON.stringify({ ev: 'ask', ...c }));
     else out(`ask ${c.id} ${c.agent} ${c.method} ${c.url} rule=${c.rule}`);
   };
   const emitDecided = (e) => {
+    if (!json && prompted.delete(e.id)) return;
     const c = clean(e, ['id', 'decision', 'reason']);
     if (json) out(JSON.stringify({ ev: 'decided', id: c.id, decision: c.decision, reason: c.reason }));
     else out(`decided ${c.id} ${c.decision}${c.reason ? ` (${c.reason})` : ''}`);

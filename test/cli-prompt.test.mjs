@@ -99,7 +99,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.match(r.out, /✓ allowed/);
       assert.match(r.out, /HTTP:200/);
       assert.ok(!/ask h\d/.test(r.out), 'the question replaces the ask line');
-      assert.match(r.out, /decided h\d+ allow/);
+      assert.ok(!/decided h\d+/.test(r.out), 'the prompt already showed the answer: no plain decided line');
     });
 
     it('on a terminal with NO_COLOR unset the question is colored; with NO_COLOR=1 there is no escape', { timeout: 120000 }, async () => {
@@ -118,6 +118,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.match(r.out, /✗ denied/);
       assert.match(r.out, /HTTP:403/);
       assert.match(r.out, /denied at the terminal/);
+      assert.ok(!/decided h\d+/.test(r.out), 'the prompt already showed the answer: no plain decided line');
     });
 
     it('--json never prompts: the ask is a JSON event, and `sbx approve --name` answers it', { timeout: 60000 }, async () => {

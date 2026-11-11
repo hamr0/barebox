@@ -80,7 +80,7 @@ The mode (`sbx run --mode ...`) picks which letters pass without asking:
 | Blocked | How |
 |---|---|
 | Keys and credentials: `~/.ssh`, `~/.gnupg`, `~/.password-store`, `~/secrets`, keyrings, browser profiles, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.config/gh`, `~/.config/op`, `~/.netrc`, `~/.npmrc`, `~/.pypirc`, `~/.git-credentials`, `~/.cargo/credentials.toml` | masked inside the sandbox: they read as empty |
-| Your environment | cleared; only a short safe list (`TERM`, `LANG`, `LC_*`, `TZ`, `USER`, `SHELL`, ...) and names you list in `env.pass` get in (names like `*_TOKEN`, `*_KEY` are refused) |
+| Your environment | cleared; only a short safe list (`TERM`, `LANG`, `LC_*`, `TZ`, `USER`, `SHELL`, ...) and names you list in `env.pass` get in (names like `*_TOKEN`, `*_KEY` are refused; set a harmless one such as `XKB_KEYMAP` with `env.set`) |
 | Any network but the proxy | the sandbox has no network of its own. `--noproxy`, unset proxy env, a direct IP or a raw socket fail closed; UDP and non-HTTP traffic are denied |
 | Private and local addresses | the proxy checks every resolved IP (IPv6 spellings of IPv4 included) and refuses private ranges and names that don't resolve |
 | Real API keys | the agent holds a per-run placeholder; the proxy swaps in the real key after the gate allows the request, over HTTPS, and only for the key's bound hosts (see below) |
