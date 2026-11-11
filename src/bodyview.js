@@ -1,15 +1,22 @@
 // The body view: the one owner of "what a request body says". It gives the
 // proxy a view of a body that fits the 64 KB working slot, decoded when it is
-// gzip or deflate. The card scan and the ask preview read the view; forwarding never does (the upstream keeps
-// the original compressed bytes).
+// gzip or deflate. The card scan and the ask preview read the view; forwarding
+// never does (the upstream keeps the original compressed bytes).
 //
-// Decoding goes through ONE proxy-wide queue (one decoder at a time): compressed
-// request bodies are rare, so the queue costs almost no wait and bounds a burst
-// of bombs to one live decoder (PRD section 9, "M10 decisions"). Output stops at
-// 64 KB with destroy(): zlib's maxOutputLength throws instead of truncating, and
-// without destroy() a bomb keeps inflating. A body that does not decode
-// is scanned as sent (partial output first); a gzip member followed by garbage
-// is not decoded by Node's zlib, a known gap (PRD section 10).
+// The rule: decoding only adds to what is scanned. The raw bytes as sent are
+// always scanned by the caller; any decoded output (full, truncated, partial
+// before an error, or from the raw-inflate retry) is scanned as well, and the
+// card floor fires if either scan finds a card. No decode outcome can then
+// check a labelled body less than an unlabelled one.
+//
+// Decoding goes through ONE proxy-wide queue (one decoder at a time):
+// compressed request bodies are rare, so the queue costs almost no wait and
+// bounds a burst of bombs to one live decoder (PRD section 9, "M10
+// decisions"). Output stops at 64 KB with destroy(): zlib's maxOutputLength
+// throws instead of truncating, and without destroy() a bomb keeps inflating.
+// A body that does not decode is viewed as sent (partial output first); a gzip
+// member followed by garbage is not decoded by Node's zlib, a known gap (PRD
+// section 10).
 import zlib from 'node:zlib';
 
 const CAP = 65536;
@@ -18,10 +25,11 @@ const MAKE = { gzip: 'createGunzip', 'x-gzip': 'createGunzip', deflate: 'createI
 
 /**
  * @typedef {object} BodyView
- * @property {Buffer} text the body as the proxy reads it (decoded when `state` is decoded or truncated)
+ * @property {Buffer} text the decoded output when the body was decoded, else the body as sent;
+ *   the caller must also scan the raw bytes
  * @property {'plain'|'decoded'|'truncated'|'unread'} state plain: sent as is; decoded: gzip/deflate fully
  *   decoded; truncated: decoding stopped at 64 KB of output; unread: not decoded or broken, `text` is the
- *   raw bytes (after any output decoded before the error)
+ *   partial output decoded before the error, else the body as sent
  */
 
 /**
@@ -30,7 +38,7 @@ const MAKE = { gzip: 'createGunzip', 'x-gzip': 'createGunzip', deflate: 'createI
  *
  * @param {Buffer} buf compressed body
  * @param {string} factory zlib factory name
- * @returns {Promise<{ text: Buffer, state: 'decoded'|'truncated'|'unread' }>} decode result
+ * @returns {Promise<{ text: Buffer, state: 'decoded'|'truncated'|'unread', produced: boolean }>} decode result
  */
 function decodeRaw(buf, factory) {
   const run = (/** @type {string} */ make) => new Promise((resolve) => {
@@ -38,8 +46,8 @@ function decodeRaw(buf, factory) {
     /** @type {Buffer[]} */
     const out = [];
     let n = 0;
-    // nothing decoded: the raw buffer itself; else the partial output, then the raw bytes
-    const raw = () => (out.length ? Buffer.concat([...out, buf]) : buf);
+    // on error: the partial output if any, else the body as sent
+    const partial = () => (out.length ? Buffer.concat(out) : buf);
     /** @type {{ text: Buffer, state: 'decoded'|'truncated'|'unread' }|null} */
     let result = null;
     z.on('data', (/** @type {Buffer} */ c) => {
@@ -52,13 +60,13 @@ function decodeRaw(buf, factory) {
       }
     });
     z.on('end', () => { result ??= { text: Buffer.concat(out), state: 'decoded' }; });
-    z.on('error', () => { result ??= { text: raw(), state: 'unread' }; });
-    z.on('close', () => resolve(result ?? { text: raw(), state: 'unread' }));
+    z.on('error', () => { result ??= { text: partial(), state: 'unread' }; });
+    z.on('close', () => resolve({ ...(result ?? { text: partial(), state: 'unread' }), produced: out.length > 0 }));
     z.end(buf);
   });
   return run(factory).then((r) => (
     // raw deflate has no zlib header: when inflate emitted nothing, try it once as raw
-    factory === 'createInflate' && r.state === 'unread' && r.text === buf ? run('createInflateRaw') : r));
+    factory === 'createInflate' && r.state === 'unread' && !r.produced ? run('createInflateRaw') : r));
 }
 
 // One decoder at a time for the whole proxy; the tail never rejects.

@@ -863,10 +863,12 @@ export function createProxy(opts) {
    * @returns {Promise<boolean>} true when the body looks like a card number
    */
   async function scanBody(ctx) {
-    const view = await viewBody(Buffer.concat(ctx.chunks), ctx.headers);
+    const body = Buffer.concat(ctx.chunks);
+    const view = await viewBody(body, ctx.headers);
     // A copy, never a subarray: a subarray would keep the whole decoded buffer alive.
     if (view.state === 'decoded' || view.state === 'truncated') ctx.decodedHead = Buffer.from(view.text.subarray(0, ASK_BODY_LIMIT));
-    return createCardScanner().push(view.text);
+    // The raw bytes are always scanned; decoded output is scanned as well (one scanner per buffer).
+    return createCardScanner().push(body) || (view.text !== body && createCardScanner().push(view.text));
   }
 
   /**

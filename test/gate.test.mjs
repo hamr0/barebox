@@ -325,6 +325,10 @@ describe('the card floor reads gzip and deflate bodies (M10)', () => {
     await withProxy({ mode: 'trust' }, async (t) => asksCard(t, Buffer.from(`pay ${CARD} now`), GZ));
   });
 
+  it('a plain JSON body with a card and a false Content-Encoding: deflate still asks', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'trust' }, async (t) => asksCard(t, Buffer.from(`{\n  "card": "${CARD}"\n}`), { 'content-encoding': 'deflate' }));
+  });
+
   it('a br-labelled plain body with a card asks (scanned as sent)', { timeout: 20000 }, async () => {
     await withProxy({ mode: 'trust' }, async (t) => asksCard(t, Buffer.from(`pay ${CARD} now`), { 'content-encoding': 'br' }));
   });
