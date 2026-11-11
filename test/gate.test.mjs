@@ -14,6 +14,7 @@ import net from 'node:net';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, renameSync, mkdirSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import zlib from 'node:zlib';
 import { createProxy } from '../src/proxy.js';
 import { run } from '../src/run.js';
 import { gateFor as policyGate, MODES, modelTools, modelList, buildTools, toolFor, emptyMatcher } from '../src/policy.js';
@@ -288,6 +289,95 @@ describe('the floor asks in trust mode', () => {
       const r = await t.send('plain', body).done;
       assert.equal(r.status, 200);
       assert.ok(r.body.equals(body));
+    });
+  });
+});
+
+describe('the card floor reads gzip and deflate bodies (M10)', () => {
+  const GZ = { 'content-encoding': 'gzip' };
+  const model = () => ({ allowLocal: [`127.0.0.1:${up.port}`] });
+  const asksCard = async (t, body, headers) => {
+    const { done } = t.send('plain', body, { headers });
+    const [h] = await t.parked();
+    assert.equal(h.rule, 'flags.cardLike');
+    t.answer(h.id, { decision: 'deny' });
+    assert.equal((await done).status, 403);
+  };
+
+  it('a gzip body with a card asks in trust mode', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'trust' }, async (t) => asksCard(t, zlib.gzipSync(Buffer.from(`pay ${CARD} now`)), GZ));
+  });
+
+  it('a deflate body with a card asks in trust mode', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'trust' }, async (t) => asksCard(t, zlib.deflateSync(Buffer.from(`pay ${CARD} now`)), { 'content-encoding': 'deflate' }));
+  });
+
+  it('a plain body with a card and a false Content-Encoding: gzip still asks', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'trust' }, async (t) => asksCard(t, Buffer.from(`pay ${CARD} now`), GZ));
+  });
+
+  it('a br-labelled plain body with a card asks (scanned as sent)', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'trust' }, async (t) => asksCard(t, Buffer.from(`pay ${CARD} now`), { 'content-encoding': 'br' }));
+  });
+
+  it('a 62 KB bomb is decided normally: a GET (r) in auto reaches the upstream', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'auto' }, async (t) => {
+      const bomb = zlib.gzipSync(Buffer.alloc(64e6));
+      assert.ok(bomb.length < 65536);
+      const before = up.hits.get('/plain') ?? 0;
+      const r = await t.send('plain', bomb, { method: 'GET', headers: GZ }).done;
+      assert.equal(r.status, 200);
+      assert.equal((up.hits.get('/plain') ?? 0), before + 1);
+      assert.equal(t.proxy.pending().length, 0);
+    });
+  });
+
+  it('the upstream gets the identical compressed bytes and content-encoding', { timeout: 20000 }, async () => {
+    const seen = [];
+    const srv = http.createServer((req, res) => {
+      const parts = [];
+      req.on('data', (c) => parts.push(c));
+      req.on('end', () => { seen.push({ enc: req.headers['content-encoding'], body: Buffer.concat(parts) }); res.end('ok'); });
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    try {
+      await withProxy({ mode: 'trust' }, async (t) => {
+        const body = zlib.gzipSync(Buffer.from('{"hello":"world"}'));
+        const r = await new Promise((resolve, reject) => {
+          const req = http.request({ host: '127.0.0.1', port: t.port, method: 'POST',
+            path: `http://127.0.0.1:${srv.address().port}/x`,
+            headers: { host: `127.0.0.1:${srv.address().port}`, 'content-encoding': 'gzip',
+              'content-type': 'application/json', 'content-length': body.length } });
+          req.on('response', (res) => { res.resume(); res.on('end', () => resolve(res.statusCode)); });
+          req.on('error', reject);
+          req.end(body);
+        });
+        assert.equal(r, 200);
+        assert.equal(seen.length, 1);
+        assert.equal(seen[0].enc, 'gzip');
+        assert.ok(seen[0].body.equals(body));
+      });
+    } finally { await new Promise((r) => srv.close(r)); }
+  });
+
+  it('a held gzip JSON body previews decoded, card masked', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'auto' }, async (t) => {
+      const body = zlib.gzipSync(Buffer.from(JSON.stringify({ note: 'hello', card: CARD })));
+      const { done } = t.send('plain', body, { headers: { ...GZ, 'content-type': 'application/json' } });
+      const [h] = await t.parked();
+      const prev = t.askOf(h.id).bodyPreview;
+      assert.ok(prev.startsWith('{"note":"hello","card":"'), prev);
+      assert.ok(!prev.includes('4242 4242'), prev);
+      t.answer(h.id, { decision: 'deny' });
+      await done;
+    });
+  });
+
+  it('a gzip body with a card to a built-in model endpoint is not card-asked', { timeout: 20000 }, async () => {
+    await withProxy({ mode: 'trust', proxyOpts: model() }, async (t) => {
+      const r = await t.send('v1/chat/completions', zlib.gzipSync(Buffer.from(`pay ${CARD} now`)), { headers: GZ }).done;
+      assert.equal(r.status, 200);
+      assert.equal(t.proxy.pending().length, 0);
     });
   });
 });

@@ -152,7 +152,7 @@ optional single space or dash, first digit 2-6, Luhn-valid) and `paymentPath`
 (`/checkout`, `/payment`, `/orders`, `/purchase`); both ask in every mode,
 `trust` included. Nothing is denied because of a card. One exception: a call
 to a model endpoint (see "Labels and model endpoints") is never card-scanned,
-in any mode. Bodies over 64 KB stream through unscanned. The body never enters the gate's action.
+in any mode. `gzip` and `deflate` bodies are decoded for the scan and the ask preview (decoded output capped at 64 KB; the upstream still gets the original bytes); `br` and other encodings are scanned as sent. Bodies over 64 KB stream through unscanned. The body never enters the gate's action.
 
 barebox's hold queue is each gate's `humanChannel`: the ask files, `onAsk`
 and `sbx approve|deny` work as above, and the ask carries the gate's `rule`
@@ -357,7 +357,7 @@ The overlay needs bubblewrap >= 0.11.0 for `--overlay` / `sbx diff|commit|rollba
 ## What this package does not do
 
 Per-API labels cover only the vendors whose rwxmap folders you list in
-`labels`; every other request is `http.<METHOD>`. The card-in-body floor checks bodies of 64 KB or less;
+`labels`; every other request is `http.<METHOD>`. The card-in-body floor checks bodies of 64 KB or less (a `gzip` or `deflate` body is checked decoded, up to 64 KB of output);
 larger bodies stream through unchecked for cards. The removed `hold.shouldHold`
 and `hold.match` are gone: pass `gateFor` instead. No Docker, no MCP server, no macOS/Windows —
 Linux only. POC harnesses live in `poc/` in the repo and never ship.

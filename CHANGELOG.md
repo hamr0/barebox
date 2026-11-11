@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- Card numbers are found in `gzip` and `deflate` request bodies up to 64 KB (decoded output), and the ask preview shows such bodies decoded. `br` and other encodings are not decoded; they are scanned as sent.
+
 ## [0.10.1] - 2026-11-11
 
 ### Changed
