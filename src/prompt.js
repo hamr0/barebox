@@ -111,12 +111,16 @@ export function createTerminalPrompt({ input, output, answer, color = false }) {
     let written = false;
     try {
       written = answer(id, yes ? 'allow' : 'deny', yes ? undefined : 'denied at the terminal') !== false;
-    } catch {
-      // The hold ended (or the runtime went) before this write; the run goes on.
+    } catch (e) {
+      // The write failed (disk full, runtime gone, ...); the run goes on and the
+      // hold stays open. Say so at once: nothing else would, and a hold with no
+      // timeout would wait on a blank line. Never the message: it may hold a path.
+      const code = e && typeof e === 'object' && 'code' in e && typeof e.code === 'string' ? e.code : 'error';
+      say(paint(color, ANSI.red, `✗ not sent (${safe(code)})`));
     }
     // The receipt is instant; the verdict is appended by `decided` once the proxy
     // has read the file (it may still time the hold out first). A lost write
-    // prints nothing now, but its `decided` still words the outcome.
+    // (another answer won) prints nothing now, but its `decided` still words the outcome.
     typed.set(id, written ? yes : null);
     if (written) output.write(`${paint(color, ANSI.dim, '→ sent')} `);
   };

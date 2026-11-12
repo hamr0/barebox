@@ -71,7 +71,7 @@ after the run), and every other command takes `--name docs-bot` instead of
 
 A second terminal can answer at the same time through the file checkpoint
 (`<runtime>/asks` + `<runtime>/answers`); the first answer wins and the
-prompt says `answered elsewhere`:
+prompt prints `✓ answered elsewhere (allowed)` or `✗ answered elsewhere (<reason>)` when the proxy decides. A write that fails prints `✗ not sent (<code>)` and the hold stays open for another terminal or its deadline:
 
 ```bash
 npx sbx pending --name docs-bot

@@ -195,6 +195,20 @@ describe('createTerminalPrompt', () => {
     assert.ok(!out.includes('→ sent'), out);
   });
 
+  it('a lost write then an allow decided elsewhere is "answered elsewhere", never "✓ allowed"', async () => {
+    const input = new PassThrough();
+    const chunks = [];
+    const p = createTerminalPrompt({ input, output: { write: (s) => { chunks.push(s); } }, answer: () => false });
+    p.ask(ask({ id: 'h1' }));
+    input.write('y\n');
+    await tick();
+    p.decided({ id: 'h1', decision: 'allow' });
+    const out = chunks.join('');
+    assert.ok(out.endsWith('✓ answered elsewhere (allowed)\n'), JSON.stringify(out));
+    assert.ok(!out.includes('✓ allowed'), out);
+    assert.ok(!out.includes('→ sent'), out);
+  });
+
   // Must hold 2
   it('a hold decided elsewhere closes the prompt with one line and writes no answer afterwards', async () => {
     const { input, p, answers, out } = setup();
@@ -233,17 +247,33 @@ describe('createTerminalPrompt', () => {
   });
 
   // Must hold 3
-  it('an answer write that fails (hold already gone) does not throw', async () => {
+  it('an answer write that throws prints "✗ not sent (<code>)" and its later decided still words the outcome', async () => {
     const input = new PassThrough();
-    const output = { write: () => {} };
-    const p = createTerminalPrompt({ input, output, answer: () => { throw new Error('ENOENT'); } });
+    const chunks = [];
+    const p = createTerminalPrompt({
+      input, output: { write: (s) => { chunks.push(s); } },
+      answer: () => { const e = new Error('x'); e.code = 'ENOSPC'; throw e; },
+    });
+    const text = () => chunks.join('');
     p.ask(ask({ id: 'h1' }));
+    const asked = text().length;
     input.write('y\n');
     await tick();
-    p.ask(ask({ id: 'h2' }));
+    assert.equal(text().slice(asked), '✗ not sent (ENOSPC)\n');
+    p.decided({ id: 'h1', decision: 'deny', reason: 'hold timeout' });
+    assert.ok(text().endsWith('\n✗ timed out (denied)\n'), JSON.stringify(text()));
+    assert.ok(!text().includes('→ sent'), text());
+  });
+
+  it('an answer write that throws with no string code prints "✗ not sent (error)"', async () => {
+    const input = new PassThrough();
+    const chunks = [];
+    const p = createTerminalPrompt({ input, output: { write: (s) => { chunks.push(s); } }, answer: () => { throw new Error('/secret/path'); } });
+    p.ask(ask({ id: 'h1' }));
+    const asked = chunks.join('').length;
     input.write('n\n');
     await tick();
-    // A throw from the answer writer would surface as an uncaught exception and fail this file.
+    assert.equal(chunks.join('').slice(asked), '✗ not sent (error)\n');
   });
 
   // Must hold 5
