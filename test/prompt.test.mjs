@@ -247,7 +247,7 @@ describe('createTerminalPrompt', () => {
   });
 
   // Must hold 3
-  it('an answer write that throws prints "✗ not sent (<code>)" and its later decided still words the outcome', async () => {
+  it('an answer write that throws prints "✗ not sent (<code>), try again: <question>" and its later decided still words the outcome', async () => {
     const input = new PassThrough();
     const chunks = [];
     const p = createTerminalPrompt({
@@ -259,13 +259,13 @@ describe('createTerminalPrompt', () => {
     const asked = text().length;
     input.write('y\n');
     await tick();
-    assert.equal(text().slice(asked), '✗ not sent (ENOSPC)\n');
+    assert.equal(text().slice(asked), '✗ not sent (ENOSPC), try again: Allow? [y/N] (hold h1)\n');
     p.decided({ id: 'h1', decision: 'deny', reason: 'hold timeout' });
     assert.ok(text().endsWith('\n✗ timed out (denied)\n'), JSON.stringify(text()));
     assert.ok(!text().includes('→ sent'), text());
   });
 
-  it('an answer write that throws with no string code prints "✗ not sent (error)"', async () => {
+  it('an answer write that throws with no string code prints "✗ not sent (error), try again: ..."', async () => {
     const input = new PassThrough();
     const chunks = [];
     const p = createTerminalPrompt({ input, output: { write: (s) => { chunks.push(s); } }, answer: () => { throw new Error('/secret/path'); } });
@@ -273,7 +273,66 @@ describe('createTerminalPrompt', () => {
     const asked = chunks.join('').length;
     input.write('n\n');
     await tick();
-    assert.equal(chunks.join('').slice(asked), '✗ not sent (error)\n');
+    assert.equal(chunks.join('').slice(asked), '✗ not sent (error), try again: Allow? [y/N] (hold h1)\n');
+  });
+
+  it('after a failed write the same question stays open: a retry y writes and prints "→ sent", the writer called twice', async () => {
+    const input = new PassThrough();
+    const chunks = [];
+    const calls = [];
+    let fail = true;
+    const p = createTerminalPrompt({
+      input, output: { write: (s) => { chunks.push(s); } },
+      answer: (...a) => { calls.push(a); if (fail) { const e = new Error('x'); e.code = 'ENOSPC'; throw e; } },
+    });
+    const text = () => chunks.join('');
+    p.ask(ask({ id: 'h1' }));
+    const asked = text().length;
+    input.write('y\n');
+    await tick();
+    assert.equal(text().slice(asked), '✗ not sent (ENOSPC), try again: Allow? [y/N] (hold h1)\n');
+    assert.equal(p.ask(ask({ id: 'h2' })), false, 'the hold is still current');
+    fail = false;
+    input.write('y\n');
+    await tick();
+    assert.ok(text().endsWith('\n→ sent '), JSON.stringify(text()));
+    p.decided({ id: 'h1', decision: 'allow' });
+    assert.ok(text().endsWith('→ sent ✓ allowed\n'), JSON.stringify(text()));
+    assert.deepEqual(calls, [['h1', 'allow', undefined], ['h1', 'allow', undefined]]);
+  });
+
+  it('a second ask while the first hold is "→ sent" (no verdict yet) is refused and prints nothing; after its decided a new ask opens', async () => {
+    const { input, p, out } = setup();
+    p.ask(ask({ id: 'h1' }));
+    input.write('y\n');
+    await tick();
+    const before = out();
+    assert.equal(p.ask(ask({ id: 'h2' })), false);
+    assert.equal(out(), before, 'nothing printed into the open → sent line');
+    p.decided({ id: 'h1', decision: 'allow' });
+    assert.equal(p.ask(ask({ id: 'h2' })), true);
+  });
+
+  it('a line typed while "→ sent" answers nothing', async () => {
+    const { input, p, answers } = setup();
+    p.ask(ask({ id: 'h1' }));
+    input.write('y\n');
+    await tick();
+    input.write('n\ny\n');
+    await tick();
+    assert.deepEqual(answers, [['h1', 'allow', undefined]]);
+  });
+
+  it('a decided for another id prints nothing and leaves the current hold open', async () => {
+    const { input, p, out } = setup();
+    p.ask(ask({ id: 'h1' }));
+    const before = out();
+    p.decided({ id: 'other', decision: 'deny', reason: 'hold timeout' });
+    assert.equal(out(), before);
+    input.write('y\n');
+    await tick();
+    p.decided({ id: 'h1', decision: 'allow' });
+    assert.ok(out().endsWith('→ sent ✓ allowed\n'), JSON.stringify(out()));
   });
 
   // Must hold 5
