@@ -68,18 +68,72 @@ describe('createTerminalPrompt', () => {
 
   it('y / yes in any case approves; Enter alone or anything else denies with the reason', async () => {
     const { input, p, answers, out } = setup();
-    for (const [i, line] of ['y', 'YES', 'Yes ', '', 'n', 'maybe'].entries()) {
+    const lines = ['y', 'YES', 'Yes ', '', 'n', 'maybe'];
+    for (const [i, line] of lines.entries()) {
       p.ask(ask({ id: `h${i}` }));
       input.write(`${line}\n`);
       await tick();
+      assert.ok(out().endsWith('→ sent '), 'the receipt is on screen before the decided');
+      const yes = i < 3;
+      p.decided({ id: `h${i}`, decision: yes ? 'allow' : 'deny', reason: yes ? undefined : 'denied at the terminal' });
+      assert.ok(out().endsWith(yes ? '→ sent ✓ allowed\n' : '→ sent ✗ denied\n'), JSON.stringify(out()));
     }
     assert.deepEqual(answers, [
       ['h0', 'allow', undefined], ['h1', 'allow', undefined], ['h2', 'allow', undefined],
       ['h3', 'deny', 'denied at the terminal'], ['h4', 'deny', 'denied at the terminal'],
       ['h5', 'deny', 'denied at the terminal'],
     ]);
-    assert.equal((out().match(/✓ allowed/g) ?? []).length, 3);
-    assert.equal((out().match(/✗ denied/g) ?? []).length, 3);
+  });
+
+  it('typing y writes "→ sent " at once, with no newline, before any decided', async () => {
+    const { input, p, out } = setup();
+    p.ask(ask({ id: 'h1' }));
+    const before = out();
+    input.write('y\n');
+    await tick();
+    assert.equal(out().slice(before.length), '→ sent ');
+  });
+
+  it('a y typed but decided as a hold timeout prints "→ sent ✗ timed out (denied)", never allowed', async () => {
+    const { input, p, out } = setup();
+    p.ask(ask({ id: 'h1' }));
+    input.write('y\n');
+    await tick();
+    p.decided({ id: 'h1', decision: 'deny', reason: 'hold timeout' });
+    assert.ok(out().endsWith('→ sent ✗ timed out (denied)\n'), JSON.stringify(out()));
+    assert.ok(!out().includes('✓'), out());
+  });
+
+  it('a y typed then decided client gone / proxy closing prints the agent-gone and sandbox-closed lines', async () => {
+    const { input, p, out } = setup();
+    for (const [id, reason, line] of [['h1', 'client gone', '✗ agent gone (denied)'], ['h2', 'proxy closing', '✗ sandbox closed (denied)']]) {
+      p.ask(ask({ id }));
+      input.write('y\n');
+      await tick();
+      p.decided({ id, decision: 'deny', reason });
+      assert.ok(out().endsWith(`→ sent ${line}\n`), JSON.stringify(out()));
+    }
+  });
+
+  it('a n typed but decided allow elsewhere prints "→ sent ✓ answered elsewhere (allowed)", never denied', async () => {
+    const { input, p, out } = setup();
+    p.ask(ask({ id: 'h1' }));
+    input.write('n\n');
+    await tick();
+    p.decided({ id: 'h1', decision: 'allow', reason: 'cli' });
+    assert.ok(out().endsWith('→ sent ✓ answered elsewhere (allowed)\n'), JSON.stringify(out()));
+    assert.ok(!/✗ denied/.test(out()), out());
+  });
+
+  it('a y typed but decided deny elsewhere prints "→ sent ✗ answered elsewhere (<reason>)", "(denied)" with no reason', async () => {
+    const { input, p, out } = setup();
+    for (const [id, reason, tail] of [['h1', 'denied by user', 'denied by user'], ['h2', undefined, 'denied']]) {
+      p.ask(ask({ id }));
+      input.write('y\n');
+      await tick();
+      p.decided({ id, decision: 'deny', reason });
+      assert.ok(out().endsWith(`→ sent ✗ answered elsewhere (${tail})\n`), JSON.stringify(out()));
+    }
   });
 
   it('CRLF is one line', async () => {
@@ -125,16 +179,34 @@ describe('createTerminalPrompt', () => {
     assert.equal((out().match(/Allow\?/g) ?? []).length, 1, 'h2 was never printed as a question');
   });
 
-  it('an answer that lost to an earlier one prints "answered elsewhere", not allowed/denied', async () => {
+  it('a lost write (answer returned false) prints no "→ sent"; its decided prints the elsewhere line', async () => {
     const input = new PassThrough();
     const chunks = [];
     const p = createTerminalPrompt({ input, output: { write: (s) => { chunks.push(s); } }, answer: () => false });
     p.ask(ask({ id: 'h1' }));
     input.write('y\n');
     await tick();
+    const typedAt = chunks.join('');
+    assert.ok(!typedAt.includes('→ sent'), typedAt);
+    assert.ok(!/✓|✗/.test(typedAt), 'nothing is printed at typing time');
+    p.decided({ id: 'h1', decision: 'deny', reason: 'denied by user' });
     const out = chunks.join('');
-    assert.match(out, /answered elsewhere\n$/);
-    assert.ok(!/✓ allowed|✗ denied/.test(out), out);
+    assert.ok(out.endsWith('\n✗ answered elsewhere (denied by user)\n'), JSON.stringify(out));
+    assert.ok(!out.includes('→ sent'), out);
+  });
+
+  it('a lost write then an allow decided elsewhere is "answered elsewhere", never "✓ allowed"', async () => {
+    const input = new PassThrough();
+    const chunks = [];
+    const p = createTerminalPrompt({ input, output: { write: (s) => { chunks.push(s); } }, answer: () => false });
+    p.ask(ask({ id: 'h1' }));
+    input.write('y\n');
+    await tick();
+    p.decided({ id: 'h1', decision: 'allow' });
+    const out = chunks.join('');
+    assert.ok(out.endsWith('✓ answered elsewhere (allowed)\n'), JSON.stringify(out));
+    assert.ok(!out.includes('✓ allowed'), out);
+    assert.ok(!out.includes('→ sent'), out);
   });
 
   // Must hold 2
@@ -142,44 +214,125 @@ describe('createTerminalPrompt', () => {
     const { input, p, answers, out } = setup();
     p.ask(ask({ id: 'h1' }));
     p.decided({ id: 'h1', decision: 'allow', reason: undefined });
-    assert.match(out(), /answered elsewhere: allow\n$/);
+    assert.ok(out().endsWith('\n✓ answered elsewhere (allowed)\n'), JSON.stringify(out()));
     input.write('y\n');
     await tick();
     assert.deepEqual(answers, [], 'a line after the elsewhere-decided event answers nothing');
     assert.equal((out().match(/Allow\?/g) ?? []).length, 1);
     p.ask(ask({ id: 'h2' }));
     p.decided({ id: 'h2', decision: 'deny', reason: 'hold timeout' });
-    assert.match(out(), /timed out: deny\n$/);
+    assert.ok(out().endsWith('\n✗ timed out (denied)\n'), JSON.stringify(out()));
     p.ask(ask({ id: 'h3' }));
     p.decided({ id: 'h3', decision: 'deny', reason: 'client gone' });
-    assert.match(out(), /agent gone: deny\n$/);
+    assert.ok(out().endsWith('\n✗ agent gone (denied)\n'), JSON.stringify(out()));
     p.ask(ask({ id: 'h4' }));
     p.decided({ id: 'h4', decision: 'deny', reason: 'nope' });
-    assert.match(out(), /answered elsewhere: deny \(nope\)\n$/);
+    assert.ok(out().endsWith('\n✗ answered elsewhere (nope)\n'), JSON.stringify(out()));
+    p.ask(ask({ id: 'h5' }));
+    p.decided({ id: 'h5', decision: 'deny', reason: 'proxy closing' });
+    assert.ok(out().endsWith('\n✗ sandbox closed (denied)\n'), JSON.stringify(out()));
   });
 
-  it('a decided event for our own answer prints nothing more', async () => {
+  it('the verdict for our own answer prints once; a repeated decided prints nothing', async () => {
+    const { input, p, out } = setup();
+    p.ask(ask({ id: 'h1' }));
+    input.write('y\n');
+    await tick();
+    p.decided({ id: 'h1', decision: 'allow' });
+    const before = out();
+    assert.ok(before.endsWith('→ sent ✓ allowed\n'), JSON.stringify(before));
+    p.decided({ id: 'h1', decision: 'allow' });
+    p.decided({ id: 'h1', decision: 'deny', reason: 'hold timeout' });
+    assert.equal(out(), before, 'a repeated decided for the same id adds nothing');
+  });
+
+  // Must hold 3
+  it('an answer write that throws prints "✗ not sent (<code>), try again: <question>" and its later decided still words the outcome', async () => {
+    const input = new PassThrough();
+    const chunks = [];
+    const p = createTerminalPrompt({
+      input, output: { write: (s) => { chunks.push(s); } },
+      answer: () => { const e = new Error('x'); e.code = 'ENOSPC'; throw e; },
+    });
+    const text = () => chunks.join('');
+    p.ask(ask({ id: 'h1' }));
+    const asked = text().length;
+    input.write('y\n');
+    await tick();
+    assert.equal(text().slice(asked), '✗ not sent (ENOSPC), try again: Allow? [y/N] (hold h1)\n');
+    p.decided({ id: 'h1', decision: 'deny', reason: 'hold timeout' });
+    assert.ok(text().endsWith('\n✗ timed out (denied)\n'), JSON.stringify(text()));
+    assert.ok(!text().includes('→ sent'), text());
+  });
+
+  it('an answer write that throws with no string code prints "✗ not sent (error), try again: ..."', async () => {
+    const input = new PassThrough();
+    const chunks = [];
+    const p = createTerminalPrompt({ input, output: { write: (s) => { chunks.push(s); } }, answer: () => { throw new Error('/secret/path'); } });
+    p.ask(ask({ id: 'h1' }));
+    const asked = chunks.join('').length;
+    input.write('n\n');
+    await tick();
+    assert.equal(chunks.join('').slice(asked), '✗ not sent (error), try again: Allow? [y/N] (hold h1)\n');
+  });
+
+  it('after a failed write the same question stays open: a retry y writes and prints "→ sent", the writer called twice', async () => {
+    const input = new PassThrough();
+    const chunks = [];
+    const calls = [];
+    let fail = true;
+    const p = createTerminalPrompt({
+      input, output: { write: (s) => { chunks.push(s); } },
+      answer: (...a) => { calls.push(a); if (fail) { const e = new Error('x'); e.code = 'ENOSPC'; throw e; } },
+    });
+    const text = () => chunks.join('');
+    p.ask(ask({ id: 'h1' }));
+    const asked = text().length;
+    input.write('y\n');
+    await tick();
+    assert.equal(text().slice(asked), '✗ not sent (ENOSPC), try again: Allow? [y/N] (hold h1)\n');
+    assert.equal(p.ask(ask({ id: 'h2' })), false, 'the hold is still current');
+    fail = false;
+    input.write('y\n');
+    await tick();
+    assert.ok(text().endsWith('\n→ sent '), JSON.stringify(text()));
+    p.decided({ id: 'h1', decision: 'allow' });
+    assert.ok(text().endsWith('→ sent ✓ allowed\n'), JSON.stringify(text()));
+    assert.deepEqual(calls, [['h1', 'allow', undefined], ['h1', 'allow', undefined]]);
+  });
+
+  it('a second ask while the first hold is "→ sent" (no verdict yet) is refused and prints nothing; after its decided a new ask opens', async () => {
     const { input, p, out } = setup();
     p.ask(ask({ id: 'h1' }));
     input.write('y\n');
     await tick();
     const before = out();
+    assert.equal(p.ask(ask({ id: 'h2' })), false);
+    assert.equal(out(), before, 'nothing printed into the open → sent line');
     p.decided({ id: 'h1', decision: 'allow' });
-    assert.equal(out(), before);
+    assert.equal(p.ask(ask({ id: 'h2' })), true);
   });
 
-  // Must hold 3
-  it('an answer write that fails (hold already gone) does not throw', async () => {
-    const input = new PassThrough();
-    const output = { write: () => {} };
-    const p = createTerminalPrompt({ input, output, answer: () => { throw new Error('ENOENT'); } });
+  it('a line typed while "→ sent" answers nothing', async () => {
+    const { input, p, answers } = setup();
     p.ask(ask({ id: 'h1' }));
     input.write('y\n');
     await tick();
-    p.ask(ask({ id: 'h2' }));
-    input.write('n\n');
+    input.write('n\ny\n');
     await tick();
-    // A throw from the answer writer would surface as an uncaught exception and fail this file.
+    assert.deepEqual(answers, [['h1', 'allow', undefined]]);
+  });
+
+  it('a decided for another id prints nothing and leaves the current hold open', async () => {
+    const { input, p, out } = setup();
+    p.ask(ask({ id: 'h1' }));
+    const before = out();
+    p.decided({ id: 'other', decision: 'deny', reason: 'hold timeout' });
+    assert.equal(out(), before);
+    input.write('y\n');
+    await tick();
+    p.decided({ id: 'h1', decision: 'allow' });
+    assert.ok(out().endsWith('→ sent ✓ allowed\n'), JSON.stringify(out()));
   });
 
   // Must hold 5
@@ -222,21 +375,26 @@ describe('color', () => {
     assert.ok(!raw.includes('\x1b'), 'only the known paint sequences are present');
   });
 
-  it('allowed is bold green, denied bold red; timed out / agent gone red; elsewhere plain', async () => {
+  it('→ sent dim; allowed bold green, denied bold red; timed out / agent gone / sandbox closed red; elsewhere plain', async () => {
     const input = new PassThrough();
     const chunks = [];
     const p = createTerminalPrompt({ input, output: { write: (s) => { chunks.push(s); } }, answer: () => {}, color: true });
     const seen = () => chunks.join('');
+    const S = `${D}→ sent${X} `;
     p.ask(ask({ id: 'h1' })); input.write('y\n'); await tick();
-    assert.ok(seen().includes(`${G}${B}✓ allowed${X}\n`), seen());
+    p.decided({ id: 'h1', decision: 'allow' });
+    assert.ok(seen().includes(`${S}${G}${B}✓ allowed${X}\n`), seen());
     p.ask(ask({ id: 'h2' })); input.write('n\n'); await tick();
-    assert.ok(seen().includes(`${R}${B}✗ denied${X}\n`), seen());
+    p.decided({ id: 'h2', decision: 'deny', reason: 'denied at the terminal' });
+    assert.ok(seen().includes(`${S}${R}${B}✗ denied${X}\n`), seen());
     p.ask(ask({ id: 'h3' })); p.decided({ id: 'h3', decision: 'deny', reason: 'hold timeout' });
-    assert.ok(seen().includes(`${R}timed out: deny${X}\n`), seen());
+    assert.ok(seen().includes(`\n${R}✗ timed out (denied)${X}\n`), seen());
     p.ask(ask({ id: 'h4' })); p.decided({ id: 'h4', decision: 'deny', reason: 'client gone' });
-    assert.ok(seen().includes(`${R}agent gone: deny${X}\n`), seen());
-    p.ask(ask({ id: 'h5' })); p.decided({ id: 'h5', decision: 'allow', reason: 'cli' });
-    assert.ok(seen().includes('\nanswered elsewhere: allow (cli)\n'), seen());
+    assert.ok(seen().includes(`\n${R}✗ agent gone (denied)${X}\n`), seen());
+    p.ask(ask({ id: 'h5' })); p.decided({ id: 'h5', decision: 'deny', reason: 'proxy closing' });
+    assert.ok(seen().includes(`\n${R}✗ sandbox closed (denied)${X}\n`), seen());
+    p.ask(ask({ id: 'h6' })); p.decided({ id: 'h6', decision: 'allow', reason: 'cli' });
+    assert.ok(seen().includes('\n✓ answered elsewhere (allowed)\n'), seen());
   });
 
   it('decided text from the agent is sanitized with color on', () => {

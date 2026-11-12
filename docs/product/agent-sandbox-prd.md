@@ -101,7 +101,7 @@ Signed off by the user (docs/archive/agent-sandbox-prd.md:292).
 | Walls | Our own thin walls on bubblewrap, not srt (docs/archive/agent-sandbox-prd.md:303). |
 | Dropped for v1 | Landlock and custom seccomp. bwrap's isolation is enough for a guardrail. They can return later (docs/archive/agent-sandbox-prd.md:304). |
 | Undo layer (Linux) | bwrap overlay. Lower = real project, read-only. Upper = per-run layer. Commands: diff, commit, rollback (docs/archive/agent-sandbox-prd.md:305). |
-| Approvals | The M2 POC used a second-terminal CLI over a unix socket. Superseded Oct 27 by the file-checkpoint channel; `sbx pending/approve/deny` keeps its commands. Timeout means deny. No web UI (docs/archive/agent-sandbox-prd.md:306). |
+| Approvals | The M2 POC used a second-terminal CLI over a unix socket. Superseded Oct 27 by the file-checkpoint channel; `sbx pending/approve/deny` keeps its commands. Timeout means deny. Nov 12, user: `sbx run` with a terminal waits until answered; without one (cron, CI, `--json`, stdin or stderr redirected) the default is 180 s, then deny; `--hold` or `holdTimeoutSec` sets either. No web UI (docs/archive/agent-sandbox-prd.md:306). |
 | Governance v1 | Single operator, one mode (or one gate) per agent, one audit log (docs/archive/agent-sandbox-prd.md:307). |
 | Secrets v1 | Injected in request headers only, after approval. A placeholder sits inside the sandbox. Body placeholder swap (for example `{{CARD}}`) is not v1 (docs/archive/agent-sandbox-prd.md:308). |
 | Locked paths (M0) | 21 credential stores; see `LOCKED_PATHS` in `src/launcher.js`. `~/.claude` stays readable until M5 (docs/archive/agent-sandbox-prd.md:310). |

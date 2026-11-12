@@ -7,7 +7,7 @@
 // cwd-relative default.
 //
 // Settings (mode, holdTimeoutSec, heldBodyMaxMB, localLlm) come from the one config file, see config.js;
-// a flag beats the file. A bad file is a usage-class error (exit 2).
+// a flag beats the file, the file beats the default (holdTimeoutSec unset: wait with a terminal, 180 s then deny without). A bad file is a usage-class error (exit 2).
 //
 // With a terminal (stdin and stderr TTYs, no --json) `sbx run` asks each hold in place (prompt.js);
 // `--name <n>` names the sandbox (agent name + runtime dir, runtime.js namedRuntime) and every
@@ -43,6 +43,8 @@ import { DEFAULT_POLL_MS } from './holds.js';
 import { diffOverlay, commitOverlay, rollbackOverlay } from './overlay.js';
 import { assertAgentName, createRuntime, namedRuntime, hostNode, runtimePaths, runtimeLive, safe, shellQuote } from './runtime.js';
 
+// Seconds a held request waits when no one is at a terminal and neither --hold nor holdTimeoutSec is set.
+const HOLD_NO_TERMINAL_SEC = 180;
 const USAGE = 'usage: sbx [--help] | run [--mode ask|auto|trust] [--hold <seconds|never>] [--name <n>] [--json] [--overlay] -- <cmd> [...] | pending|diff|rollback [--name <n>] | approve <id> [--name <n>] | deny <id> [reason] [--name <n>] | commit [--name <n>] [--skip-conflicts]  (--name replaces SBX_RUNTIME; --agent stays for diff/commit/rollback)';
 
 /** Hold ids the CLI accepts: `h<n>` only. Anything else is a usage error, never a path. */
@@ -216,7 +218,7 @@ async function run(args) {
     usage();
   }
   if (values.mode !== undefined && !MODES.includes(values.mode)) usage();
-  /** @type {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number, env?: { pass?: string[], set?: Record<string, string> }, secrets?: Record<string, { fromEnv?: string, value?: string, hosts: string[] }> }} */
+  /** @type {{ mode: string, holdTimeoutSec?: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number, env?: { pass?: string[], set?: Record<string, string> }, secrets?: Record<string, { fromEnv?: string, value?: string, hosts: string[] }> }} */
   let cfg;
   try {
     cfg = resolveConfig({ mode: values.mode, hold: values.hold });
@@ -233,9 +235,14 @@ async function run(args) {
     err(e instanceof Error ? e.message : String(e));
     process.exit(2);
   }
-  const timeoutMs = cfg.holdTimeoutSec === 'never' ? 'never' : Number(cfg.holdTimeoutSec) * 1000;
   if (!command.length) usage();
   const json = values.json ?? false;
+  // A person at this terminal (stdin and stderr are TTYs, not --json) answers
+  // holds here; the file channel stays on, so `sbx approve` still works too.
+  const interactive = !json && !!process.stdin.isTTY && !!process.stderr.isTTY;
+  // No --hold and no holdTimeoutSec: wait for the person at a terminal, else deny after 180 s.
+  const hold = cfg.holdTimeoutSec ?? (interactive ? 'never' : HOLD_NO_TERMINAL_SEC);
+  const timeoutMs = hold === 'never' ? 'never' : Number(hold) * 1000;
   const overlay = values.overlay ?? false;
   const name = values.name;
   if (name !== undefined) {
@@ -250,10 +257,8 @@ async function run(args) {
     for (const k of keys) if (c[k] != null) c[k] = safe(c[k]);
     return c;
   };
-  // A person at this terminal (stdin and stderr are TTYs, not --json) answers
-  // holds here; the file channel stays on, so `sbx approve` still works too.
   const errColor = !!process.stderr.isTTY && !process.env.NO_COLOR;
-  const prompt = !json && process.stdin.isTTY && process.stderr.isTTY
+  const prompt = interactive
     ? createTerminalPrompt({
       input: process.stdin,
       output: process.stderr,

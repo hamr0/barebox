@@ -60,7 +60,10 @@ When a request needs a decision (see "Modes and the gate" below), it parks.
 the sandbox name, what it wants to do and why, the URL, a masked body
 preview, then `Allow? [y/N] (hold h3)`. `y` or `yes` allows; anything else, Enter
 included, denies with `denied at the terminal`. A line typed before a question
-appears answers nothing. Name the sandbox with `sbx run --name docs-bot`: the
+appears answers nothing. `→ sent` prints at once when your answer is written, and the
+outcome is appended on the same line when the proxy decides (`✓ allowed`, `✗ denied`,
+`✗ timed out (denied)`, `✗ agent gone (denied)`, `✗ sandbox closed (denied)`, `✓`/`✗ answered
+elsewhere`), so a `y` that arrives after the deadline shows `→ sent ✗ timed out (denied)`. Name the sandbox with `sbx run --name docs-bot`: the
 name is the agent name and picks the runtime dir
 (`$XDG_RUNTIME_DIR/barebox/<name>`, else `<tmpdir>/sbx-<uid>/<name>`, kept
 after the run), and every other command takes `--name docs-bot` instead of
@@ -68,7 +71,7 @@ after the run), and every other command takes `--name docs-bot` instead of
 
 A second terminal can answer at the same time through the file checkpoint
 (`<runtime>/asks` + `<runtime>/answers`); the first answer wins and the
-prompt says `answered elsewhere`:
+prompt prints `✓ answered elsewhere (allowed)` or `✗ answered elsewhere (<reason>)` when the proxy decides. A write that fails prints `✗ not sent (<code>), try again:` with the same question, and the next line typed retries; the hold also stays open for another terminal or its deadline:
 
 ```bash
 npx sbx pending --name docs-bot
@@ -80,7 +83,7 @@ SBX_RUNTIME=/tmp/sbx npx sbx approve h1
 SBX_RUNTIME=/tmp/sbx npx sbx deny h2 "reason here"
 ```
 
-Held requests wait, counting from arrival, until a deadline: the library's default is 120 s (`createHolds`/`createProxy`; `'never'` supported), while `sbx run` waits until answered by default (`holdTimeoutSec` `"never"`; `--hold <seconds|never>` or the config key sets a deadline):
+Held requests wait, counting from arrival, until a deadline: the library's default is 120 s (`createHolds`/`createProxy`; `'never'` supported), while `sbx run` waits until answered when a terminal is attached and denies after 180 s without one (`--hold <seconds|never>` or `holdTimeoutSec` overrides either):
 time spent in line and reading the body counts too, and a request past its
 deadline is denied `hold timeout` whether waiting, sending, or parked. Each
 agent holds at most one request being read or parked; later ones wait in
@@ -90,7 +93,7 @@ need the proxy to be alive: with no live proxy on the runtime `sbx pending`,
 `approve` and `deny` exit 1 and say so, because nothing would read the answer.
 `approve` and `deny` wait briefly to learn what the proxy did: an answer for a hold that already ended exits 1 with `<id> already decided`; if the proxy has not read it yet they print `answer written, the proxy has not read it yet` and still report `approved` / `denied`. `--name` for a sandbox that never ran exits 1 with `no sandbox named <n>` and creates nothing. The terminal question is colored only when stderr is a TTY and `NO_COLOR` is unset.
 
-Unattended runs (cron, CI, no TTY, `--json`): nobody answers on the terminal, and `sbx run` waits forever by default, so a held request would hang the run. Pass `--hold <seconds>` (or set `holdTimeoutSec`) so a hold times out as a deny.
+Unattended runs (cron, CI, `--json`, stdin or stderr not a TTY; redirecting only stdout still counts as a terminal): nobody answers on the terminal, so by default a held request is denied after 180 s instead of hanging the run. Pass `--hold <seconds|never>` (or set `holdTimeoutSec`) to change that, with or without a terminal.
 
 ## One call: `run()` and `sbx run`
 
@@ -124,7 +127,7 @@ Its exit code mirrors the agent's.
 
 `sbx run` reads one optional config file,
 `${XDG_CONFIG_HOME:-$HOME/.config}/barebox/config.json`, with keys `mode`,
-`holdTimeoutSec` (positive integer or `"never"`; default `"never"`, overridden per run by `--hold`), `heldBodyMaxMB`
+`holdTimeoutSec` (positive integer or `"never"`; unset: `"never"` with a terminal, 180 without; overridden per run by `--hold`), `heldBodyMaxMB`
 (positive integer) and `localLlm` (array of `"host:port"`). A flag beats the file, the file beats the default; an
 unknown key, bad value or bad JSON exits 2 naming the file and key. The file
 is hidden inside the sandbox wherever it resolves. The library does not read it.

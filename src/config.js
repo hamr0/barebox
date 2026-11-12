@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { MODES } from './policy.js';
 
-const DEFAULTS = { mode: 'auto', holdTimeoutSec: 'never', localLlm: [], labels: [], tenants: {} };
+const DEFAULTS = { mode: 'auto', localLlm: [], labels: [], tenants: {} };
 
 /** One `host:port` (host without a colon, port 1-65535). @param {unknown} v @returns {boolean} */
 const isHostPort = (v) => {
@@ -97,7 +97,7 @@ export function configPath(env = process.env) {
  * Read the config file over the defaults. No file means defaults.
  *
  * @param {NodeJS.ProcessEnv} [env] environment to read (default `process.env`)
- * @returns {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number, env?: { pass?: string[], set?: Record<string, string> }, secrets?: Record<string, { fromEnv?: string, value?: string, hosts: string[] }> }} effective settings (`heldBodyMaxMB` absent means the library default)
+ * @returns {{ mode: string, holdTimeoutSec?: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number, env?: { pass?: string[], set?: Record<string, string> }, secrets?: Record<string, { fromEnv?: string, value?: string, hosts: string[] }> }} effective settings (`heldBodyMaxMB` absent means the library default)
  * @throws {Error} naming the file (and the key) on invalid JSON, an unknown key or a bad value
  */
 export function loadConfig(env = process.env) {
@@ -139,7 +139,7 @@ export function loadConfig(env = process.env) {
  * @param {string} [flags.mode] `--mode`
  * @param {string} [flags.hold] `--hold` (`"never"` or a positive integer of seconds, as typed)
  * @param {NodeJS.ProcessEnv} [env] environment to read (default `process.env`)
- * @returns {{ mode: string, holdTimeoutSec: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number, env?: { pass?: string[], set?: Record<string, string> }, secrets?: Record<string, { fromEnv?: string, value?: string, hosts: string[] }> }} effective settings (`heldBodyMaxMB` absent means the library default)
+ * @returns {{ mode: string, holdTimeoutSec?: number|string, localLlm: string[], labels: string[], tenants: Record<string, string[]>, heldBodyMaxMB?: number, env?: { pass?: string[], set?: Record<string, string> }, secrets?: Record<string, { fromEnv?: string, value?: string, hosts: string[] }> }} effective settings (`heldBodyMaxMB` absent means the library default)
  * @throws {Error} as {@link loadConfig}
  */
 export function resolveConfig(flags = {}, env = process.env) {

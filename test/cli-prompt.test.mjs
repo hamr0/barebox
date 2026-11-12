@@ -96,7 +96,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.match(r.out, /Data: m=PTYYES/);
       assert.match(r.out, /Allow\? \[y\/N\] \(hold h\d+\)$/m);
       assert.ok(!/means No/.test(r.out), 'the default waits: no countdown');
-      assert.match(r.out, /✓ allowed/);
+      assert.match(r.out, /^→ sent ✓ allowed\r?$/m, 'receipt and verdict on one line');
       assert.match(r.out, /HTTP:200/);
       assert.ok(!/ask h\d/.test(r.out), 'the question replaces the ask line');
       assert.ok(!/decided h\d+/.test(r.out), 'the prompt already showed the answer: no plain decided line');
@@ -106,7 +106,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       const on = await viaPty('y\n', 'PTYCOL', 'pty-col', [], {});
       assert.equal(on.code, 0, on.out + on.err);
       assert.ok(on.out.includes('\x1b[1mpty-col\x1b[22m wants to SEND data to'), on.out);
-      assert.ok(on.out.includes('\x1b[32m\x1b[1m✓ allowed\x1b[0m'), on.out);
+      assert.ok(on.out.includes('\x1b[2m→ sent\x1b[0m \x1b[32m\x1b[1m✓ allowed\x1b[0m'), on.out);
       const off = await viaPty('y\n', 'PTYNOCOL', 'pty-nocol', [], { NO_COLOR: '1' });
       assert.equal(off.code, 0, off.out + off.err);
       assert.ok(!off.out.includes('\x1b'), JSON.stringify(off.out));
@@ -115,7 +115,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
     it('typing n denies it (403, "denied at the terminal")', { timeout: 60000 }, async () => {
       const r = await viaPty('n\n', 'PTYNO', 'pty-no');
       assert.equal(r.code, 0, r.out + r.err);
-      assert.match(r.out, /✗ denied/);
+      assert.match(r.out, /^→ sent ✗ denied\r?$/m, 'receipt and verdict on one line');
       assert.match(r.out, /HTTP:403/);
       assert.match(r.out, /denied at the terminal/);
       assert.ok(!/decided h\d+/.test(r.out), 'the prompt already showed the answer: no plain decided line');
@@ -149,7 +149,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.match(out, /HTTP:200/);
     });
 
-    // Run --json, read the ask file's expiresAt while the hold is open, then deny it.
+    // Run with `flags` (no --json means a terminal run through the pty), read the ask file's expiresAt while the hold is open, then deny it.
     const expiryOf = async (name, flags, xdgJson) => {
       const xdg = join(root, 'xdg');
       const cfg = join(xdg, 'barebox', 'config.json');
@@ -157,7 +157,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       try {
         const ask = join(root, 'tmp', `sbx-${process.getuid()}`, name, 'asks', 'h1.json');
         const env = { PATH: process.env.PATH, HOME: join(root, 'home'), XDG_CONFIG_HOME: xdg, TMPDIR: join(root, 'tmp') };
-        const run = viaPty('', `EXP${name}`, name, ['--json', ...flags]);
+        const run = viaPty('', `EXP${name}`, name, flags);
         const end = Date.now() + 30000;
         while (!existsSync(ask)) {
           if (Date.now() > end) throw new Error('the ask file never appeared');
@@ -180,12 +180,32 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.match(r.out, /HTTP:403/);
     });
 
-    it('no flag and no config key: the hold has no deadline (expiresAt null)', { timeout: 60000 }, async () => {
-      assert.equal(await expiryOf('pty-hnone', []), null);
+    const secsOut = (exp) => (Date.parse(exp) - Date.now()) / 1000;
+
+    it('--json, no flag and no config key: the hold is denied after about 180 s (expiresAt about 180 s out)', { timeout: 60000 }, async () => {
+      const exp = await expiryOf('pty-hnone', ['--json']);
+      assert.ok(exp, 'has a deadline');
+      const left = secsOut(exp);
+      assert.ok(left > 150 && left <= 180, `deadline ${left}s out`);
+    });
+
+    it('a terminal run, no flag and no config key: the hold has no deadline (expiresAt null)', { timeout: 60000 }, async () => {
+      assert.equal(await expiryOf('pty-hterm', []), null);
+    });
+
+    it('--json with holdTimeoutSec "never" in the config: no deadline', { timeout: 60000 }, async () => {
+      assert.equal(await expiryOf('pty-hjnever', ['--json'], '{"holdTimeoutSec":"never"}'), null);
+    });
+
+    it('--json --hold 30: the deadline is about 30 s out', { timeout: 60000 }, async () => {
+      const exp = await expiryOf('pty-hj30', ['--json', '--hold', '30']);
+      assert.ok(exp, 'has a deadline');
+      const left = secsOut(exp);
+      assert.ok(left > 20 && left <= 30, `deadline ${left}s out`);
     });
 
     it('--hold 5 beats a config holdTimeoutSec of 60 (expiresAt about 5 s out)', { timeout: 60000 }, async () => {
-      const exp = await expiryOf('pty-h5', ['--hold', '5'], '{"holdTimeoutSec":60}');
+      const exp = await expiryOf('pty-h5', ['--json', '--hold', '5'], '{"holdTimeoutSec":60}');
       assert.ok(exp, 'has a deadline');
       const left = (Date.parse(exp) - Date.now()) / 1000;
       assert.ok(left < 10, `deadline ${left}s out, not the config 60`);

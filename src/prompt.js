@@ -71,40 +71,67 @@ export function questionLines(ask, now = Date.now(), color = false) {
 }
 
 /**
- * The terminal prompt. One question open at a time. `ask()` opens a question
- * and returns true, or returns false when one is already open (or the prompt
- * is closed) so the caller prints the plain `ask` line instead; `decided()`
- * closes the question when the hold ended some other way, `close()` releases
+ * The terminal prompt. It owns one hold from its question to the proxy's
+ * verdict. `ask()` opens a question and returns true, or returns false when a
+ * hold is still current (asking or awaiting its verdict) or the prompt is
+ * closed, so the caller prints the plain `ask` line instead; `decided()`
+ * ends the current hold with its outcome line, `close()` releases
  * `input`.
  *
  * @param {{ input: import('node:stream').Readable, output: { write: (s: string) => unknown }, color?: boolean, answer: (id: string, decision: 'allow'|'deny', reason?: string) => boolean|void }} opts streams and the answer writer
  * @returns {{ ask: (ask: AskRecord) => boolean, decided: (e: { id: string, decision: string, reason?: string }) => void, close: () => void }} the prompt
  */
 export function createTerminalPrompt({ input, output, answer, color = false }) {
-  /** @type {AskRecord|null} */
-  let open = null;
+  /** The one hold this prompt owns, from its question to the proxy's verdict. `typedYes`: true/false once our answer was written, null when another answer won, undefined while still asking.
+   * @type {{ ask: AskRecord, state: 'asking'|'sent', typedYes?: boolean|null }|null} */
+  let current = null;
   let buf = '';
   let closed = false;
   const say = (/** @type {string} */ s) => { output.write(`${s}\n`); };
 
+  // The one place that words an outcome. `typedYes` is true/false when our
+  // typed answer was written (✓/✗ allowed/denied only when the proxy's verdict
+  // matches it), undefined/null when nothing of ours was sent.
+  const outcome = (/** @type {{ decision: string, reason?: string }} */ e, /** @type {boolean|null|undefined} */ typedYes) => {
+    const why = safe(e.reason);
+    return typedYes === true && e.decision === 'allow' ? paint(color, ANSI.green + ANSI.bold, '✓ allowed')
+      : typedYes === false && e.decision === 'deny' && why === 'denied at the terminal' ? paint(color, ANSI.red + ANSI.bold, '✗ denied')
+        : why === 'hold timeout' ? paint(color, ANSI.red, '✗ timed out (denied)')
+          : why === 'client gone' ? paint(color, ANSI.red, '✗ agent gone (denied)')
+            : why === 'proxy closing' ? paint(color, ANSI.red, '✗ sandbox closed (denied)')
+              : e.decision === 'allow' ? '✓ answered elsewhere (allowed)'
+                : `✗ answered elsewhere (${why || 'denied'})`;
+  };
+
   const onLine = (/** @type {string} */ line) => {
-    if (!open) return; // unreachable at runtime (onData checks); narrows the type for tsc
-    const { id } = open;
-    open = null; // closed before the write: one answer per question
+    const hold = current;
+    if (!hold || hold.state !== 'asking') return; // unreachable at runtime (onData checks); narrows the type for tsc
     const yes = YES.has(line.trim().toLowerCase());
+    let written = false;
     try {
-      const written = answer(id, yes ? 'allow' : 'deny', yes ? undefined : 'denied at the terminal') !== false;
-      say(!written ? 'answered elsewhere'
-        : yes ? paint(color, ANSI.green + ANSI.bold, '✓ allowed') : paint(color, ANSI.red + ANSI.bold, '✗ denied'));
-    } catch {
-      // The hold ended (or the runtime went) before this write; the run goes on.
+      written = answer(hold.ask.id, yes ? 'allow' : 'deny', yes ? undefined : 'denied at the terminal') !== false;
+    } catch (e) {
+      // The write failed (disk full, runtime gone, ...); the run goes on and the
+      // hold stays open and asking: the next line retries. Say so at once:
+      // nothing else would, and a hold with no timeout would wait on a blank
+      // line. Never the message: it may hold a path.
+      const code = e && typeof e === 'object' && 'code' in e && typeof e.code === 'string' ? e.code : 'error';
+      const question = questionLines(hold.ask, Date.now(), color).at(-1)?.trimStart();
+      say(`${paint(color, ANSI.red, `✗ not sent (${safe(code)}), try again:`)} ${question}`);
+      return;
     }
+    // The receipt is instant; the verdict is appended by `decided` once the proxy
+    // has read the file (it may still time the hold out first). A lost write
+    // (another answer won) prints nothing now, but its `decided` still words the outcome.
+    hold.state = 'sent';
+    hold.typedYes = written ? yes : null;
+    if (written) output.write(`${paint(color, ANSI.dim, '→ sent')} `);
   };
 
   const onData = (/** @type {string|Buffer} */ chunk) => {
-    if (!open) return;
+    if (current?.state !== 'asking') return;
     buf += String(chunk);
-    for (let m = EOL.exec(buf); m && open; m = EOL.exec(buf)) {
+    for (let m = EOL.exec(buf); m && current?.state === 'asking'; m = EOL.exec(buf)) {
       const line = buf.slice(0, m.index);
       buf = buf.slice(m.index + m[0].length);
       onLine(line);
@@ -116,23 +143,21 @@ export function createTerminalPrompt({ input, output, answer, color = false }) {
 
   return {
     ask(ask) {
-      if (closed || open) return false;
-      open = ask;
+      if (closed || current) return false;
+      current = { ask, state: 'asking' };
       buf = ''; // a half-typed line from before the question is stale
-      for (const l of questionLines(open, Date.now(), color)) say(l);
+      for (const l of questionLines(ask, Date.now(), color)) say(l);
       return true;
     },
     decided(e) {
-      if (open?.id !== e.id) return;
-      open = null; // closed before anything else: no answer can follow
-      const why = safe(e.reason);
-      say(why === 'hold timeout' ? paint(color, ANSI.red, `timed out: ${safe(e.decision)}`)
-        : why === 'client gone' || why === 'proxy closing' ? paint(color, ANSI.red, `agent gone: ${safe(e.decision)}`)
-          : `answered elsewhere: ${safe(e.decision)}${why ? ` (${why})` : ''}`);
+      if (current?.ask.id !== e.id) return;
+      const typedYes = current.typedYes;
+      current = null; // closed before anything else: no answer can follow
+      say(outcome(e, typedYes));
     },
     close() {
       closed = true;
-      open = null;
+      current = null;
       input.removeListener('data', onData);
       input.pause();
     },
