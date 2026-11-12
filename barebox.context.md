@@ -93,7 +93,7 @@ need the proxy to be alive: with no live proxy on the runtime `sbx pending`,
 `approve` and `deny` exit 1 and say so, because nothing would read the answer.
 `approve` and `deny` wait briefly to learn what the proxy did: an answer for a hold that already ended exits 1 with `<id> already decided`; if the proxy has not read it yet they print `answer written, the proxy has not read it yet` and still report `approved` / `denied`. `--name` for a sandbox that never ran exits 1 with `no sandbox named <n>` and creates nothing. The terminal question is colored only when stderr is a TTY and `NO_COLOR` is unset.
 
-Unattended runs (cron, CI, no TTY, `--json`, redirected output): nobody answers on the terminal, so by default a held request is denied after 180 s instead of hanging the run. Pass `--hold <seconds|never>` (or set `holdTimeoutSec`) to change that, with or without a terminal.
+Unattended runs (cron, CI, `--json`, stdin or stderr not a TTY; redirecting only stdout still counts as a terminal): nobody answers on the terminal, so by default a held request is denied after 180 s instead of hanging the run. Pass `--hold <seconds|never>` (or set `holdTimeoutSec`) to change that, with or without a terminal.
 
 ## One call: `run()` and `sbx run`
 

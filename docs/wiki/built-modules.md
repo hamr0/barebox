@@ -224,7 +224,7 @@ Measured with `npm run bench:agents` on the HTTPS worst case, production trust p
 - `sbx run` asks in its own terminal, in plain words (`<name> wants to SEND data to <host>`, why, URL, masked data, `Allow? [y/N]`), when stdin and stderr are terminals and `--json` is off. A key typed before a question opens never answers it. A second terminal (`sbx approve` or `sbx deny`) still works, and the first answer wins (docs/archive/agent-sandbox-prd.md:675-675).
 - `sbx run --name <n>` sets the agent name and a fixed runtime dir (`$XDG_RUNTIME_DIR/barebox/<n>`, else `<tmpdir>/sbx-<uid>/<n>`). Other commands take `--name` instead of `SBX_RUNTIME` (docs/archive/agent-sandbox-prd.md:676-676).
 - Colors (user, Nov 3): basic ANSI colors when stderr is a TTY and `NO_COLOR` is unset. `--json` and piped output stay plain (docs/archive/agent-sandbox-prd.md:684-684).
-- Hold wait (user, Nov 3): the default is now to wait until answered (`holdTimeoutSec` default `"never"`). `sbx run --hold <seconds|never>` overrides it per run. The backlog stays bounded at 1 held, 16 waiting, and the 17th gets 429. The library's default stays 120 s (docs/archive/agent-sandbox-prd.md:685-685).
+- Hold wait (user, Nov 3; superseded Nov 12: `sbx run` waits only with a terminal, else denies after 180 s): the default is now to wait until answered (`holdTimeoutSec` default `"never"`). `sbx run --hold <seconds|never>` overrides it per run. The backlog stays bounded at 1 held, 16 waiting, and the 17th gets 429. The library's default stays 120 s (docs/archive/agent-sandbox-prd.md:685-685).
 
 ### Demo B
 

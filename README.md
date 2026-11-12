@@ -100,7 +100,7 @@ y
 → sent ✓ allowed
 ```
 
-Name the sandbox (`--name docs-bot`) and a second terminal can answer too: `sbx pending --name docs-bot`, `sbx approve h1 --name docs-bot`. A hold waits until you answer at a terminal; without one (cron, CI, `--json`, output redirected) it is denied after 3 minutes. `--hold <seconds|never>` or `holdTimeoutSec` changes either, and a timeout is a deny. One held request per agent at a time; up to 16 more wait in line.
+Name the sandbox (`--name docs-bot`) and a second terminal can answer too: `sbx pending --name docs-bot`, `sbx approve h1 --name docs-bot`. A hold waits until you answer at a terminal; without one (cron, CI, `--json`, stdin or stderr redirected) it is denied after 3 minutes. `--hold <seconds|never>` or `holdTimeoutSec` changes either, and a timeout is a deny. One held request per agent at a time; up to 16 more wait in line.
 
 Demo A's end-of-run summary (from the recorded take):
 
