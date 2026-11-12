@@ -85,19 +85,22 @@ export function createTerminalPrompt({ input, output, answer, color = false }) {
   let open = null;
   let buf = '';
   let closed = false;
-  /** @type {Map<string, boolean>} id -> typed yes, until the proxy decides that hold */
+  /** @type {Map<string, boolean|null>} id -> typed yes (true/false) once `→ sent` printed; null when our write was lost; until the proxy decides that hold */
   const typed = new Map();
   const say = (/** @type {string} */ s) => { output.write(`${s}\n`); };
 
-  // The one place that words an outcome. `typedYes` is undefined when nothing
-  // was typed for this hold; ✓/✗ only when the proxy's verdict matches it.
-  const outcome = (/** @type {{ decision: string, reason?: string }} */ e, /** @type {boolean|undefined} */ typedYes) => {
+  // The one place that words an outcome. `typedYes` is true/false when our
+  // typed answer was written (✓/✗ allowed/denied only when the proxy's verdict
+  // matches it), undefined/null when nothing of ours was sent.
+  const outcome = (/** @type {{ decision: string, reason?: string }} */ e, /** @type {boolean|null|undefined} */ typedYes) => {
     const why = safe(e.reason);
     return typedYes === true && e.decision === 'allow' ? paint(color, ANSI.green + ANSI.bold, '✓ allowed')
       : typedYes === false && e.decision === 'deny' && why === 'denied at the terminal' ? paint(color, ANSI.red + ANSI.bold, '✗ denied')
-        : why === 'hold timeout' ? paint(color, ANSI.red, `timed out: ${safe(e.decision)}`)
-          : why === 'client gone' || why === 'proxy closing' ? paint(color, ANSI.red, `agent gone: ${safe(e.decision)}`)
-            : `answered elsewhere: ${safe(e.decision)}${why ? ` (${why})` : ''}`;
+        : why === 'hold timeout' ? paint(color, ANSI.red, '✗ timed out (denied)')
+          : why === 'client gone' ? paint(color, ANSI.red, '✗ agent gone (denied)')
+            : why === 'proxy closing' ? paint(color, ANSI.red, '✗ sandbox closed (denied)')
+              : e.decision === 'allow' ? '✓ answered elsewhere (allowed)'
+                : `✗ answered elsewhere (${why || 'denied'})`;
   };
 
   const onLine = (/** @type {string} */ line) => {
@@ -105,15 +108,17 @@ export function createTerminalPrompt({ input, output, answer, color = false }) {
     const { id } = open;
     open = null; // closed before the write: one answer per question
     const yes = YES.has(line.trim().toLowerCase());
+    let written = false;
     try {
-      const written = answer(id, yes ? 'allow' : 'deny', yes ? undefined : 'denied at the terminal') !== false;
-      // Nothing is printed for a written answer: the proxy may still time the hold
-      // out before it reads the file, so the outcome line waits for `decided`.
-      if (written) typed.set(id, yes);
-      else say('answered elsewhere');
+      written = answer(id, yes ? 'allow' : 'deny', yes ? undefined : 'denied at the terminal') !== false;
     } catch {
       // The hold ended (or the runtime went) before this write; the run goes on.
     }
+    // The receipt is instant; the verdict is appended by `decided` once the proxy
+    // has read the file (it may still time the hold out first). A lost write
+    // prints nothing now, but its `decided` still words the outcome.
+    typed.set(id, written ? yes : null);
+    if (written) output.write(`${paint(color, ANSI.dim, '→ sent')} `);
   };
 
   const onData = (/** @type {string|Buffer} */ chunk) => {

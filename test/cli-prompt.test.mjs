@@ -96,7 +96,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.match(r.out, /Data: m=PTYYES/);
       assert.match(r.out, /Allow\? \[y\/N\] \(hold h\d+\)$/m);
       assert.ok(!/means No/.test(r.out), 'the default waits: no countdown');
-      assert.match(r.out, /✓ allowed/);
+      assert.match(r.out, /^→ sent ✓ allowed\r?$/m, 'receipt and verdict on one line');
       assert.match(r.out, /HTTP:200/);
       assert.ok(!/ask h\d/.test(r.out), 'the question replaces the ask line');
       assert.ok(!/decided h\d+/.test(r.out), 'the prompt already showed the answer: no plain decided line');
@@ -106,7 +106,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       const on = await viaPty('y\n', 'PTYCOL', 'pty-col', [], {});
       assert.equal(on.code, 0, on.out + on.err);
       assert.ok(on.out.includes('\x1b[1mpty-col\x1b[22m wants to SEND data to'), on.out);
-      assert.ok(on.out.includes('\x1b[32m\x1b[1m✓ allowed\x1b[0m'), on.out);
+      assert.ok(on.out.includes('\x1b[2m→ sent\x1b[0m \x1b[32m\x1b[1m✓ allowed\x1b[0m'), on.out);
       const off = await viaPty('y\n', 'PTYNOCOL', 'pty-nocol', [], { NO_COLOR: '1' });
       assert.equal(off.code, 0, off.out + off.err);
       assert.ok(!off.out.includes('\x1b'), JSON.stringify(off.out));
@@ -115,7 +115,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
     it('typing n denies it (403, "denied at the terminal")', { timeout: 60000 }, async () => {
       const r = await viaPty('n\n', 'PTYNO', 'pty-no');
       assert.equal(r.code, 0, r.out + r.err);
-      assert.match(r.out, /✗ denied/);
+      assert.match(r.out, /^→ sent ✗ denied\r?$/m, 'receipt and verdict on one line');
       assert.match(r.out, /HTTP:403/);
       assert.match(r.out, /denied at the terminal/);
       assert.ok(!/decided h\d+/.test(r.out), 'the prompt already showed the answer: no plain decided line');

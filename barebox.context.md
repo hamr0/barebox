@@ -60,9 +60,10 @@ When a request needs a decision (see "Modes and the gate" below), it parks.
 the sandbox name, what it wants to do and why, the URL, a masked body
 preview, then `Allow? [y/N] (hold h3)`. `y` or `yes` allows; anything else, Enter
 included, denies with `denied at the terminal`. A line typed before a question
-appears answers nothing. The outcome line (`✓ allowed`, `✗ denied`, `timed out`,
-`answered elsewhere`) is printed when the proxy decides, so a `y` that arrives
-after the deadline shows `timed out: deny`. Name the sandbox with `sbx run --name docs-bot`: the
+appears answers nothing. `→ sent` prints at once when your answer is written, and the
+outcome is appended on the same line when the proxy decides (`✓ allowed`, `✗ denied`,
+`✗ timed out (denied)`, `✗ agent gone (denied)`, `✗ sandbox closed (denied)`, `✓`/`✗ answered
+elsewhere`), so a `y` that arrives after the deadline shows `→ sent ✗ timed out (denied)`. Name the sandbox with `sbx run --name docs-bot`: the
 name is the agent name and picks the runtime dir
 (`$XDG_RUNTIME_DIR/barebox/<name>`, else `<tmpdir>/sbx-<uid>/<name>`, kept
 after the run), and every other command takes `--name docs-bot` instead of

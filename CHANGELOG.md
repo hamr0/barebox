@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
-- `sbx run` on a terminal prints the outcome of a held request once, when the proxy decides it: a `y` typed just before the `--hold` deadline now shows `timed out: deny` instead of `✓ allowed`, and no plain `decided` line repeats it.
+- `sbx run` on a terminal answers at once with `→ sent` and appends the outcome when the proxy decides (`✓ allowed`, `✗ denied`, `✗ timed out (denied)`, ...): a `y` typed just before the `--hold` deadline shows `✗ timed out (denied)`, never `✓ allowed`, and no plain `decided` line repeats it.
 
 ## [0.11.0] - 2026-11-11
 

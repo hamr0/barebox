@@ -97,7 +97,7 @@ A held request asks in the terminal where you ran `sbx run` (`y` allows, anythin
    Data: {"amount":35000,"currency":"usd"}
    Allow? [y/N] (hold h1)
 y
-✓ allowed
+→ sent ✓ allowed
 ```
 
 Name the sandbox (`--name docs-bot`) and a second terminal can answer too: `sbx pending --name docs-bot`, `sbx approve h1 --name docs-bot`. A hold waits until you answer; for unattended runs (cron, CI) pass `--hold <seconds>`, and a timeout is a deny. One held request per agent at a time; up to 16 more wait in line.
