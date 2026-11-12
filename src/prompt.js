@@ -85,7 +85,20 @@ export function createTerminalPrompt({ input, output, answer, color = false }) {
   let open = null;
   let buf = '';
   let closed = false;
+  /** @type {Map<string, boolean>} id -> typed yes, until the proxy decides that hold */
+  const typed = new Map();
   const say = (/** @type {string} */ s) => { output.write(`${s}\n`); };
+
+  // The one place that words an outcome. `typedYes` is undefined when nothing
+  // was typed for this hold; ✓/✗ only when the proxy's verdict matches it.
+  const outcome = (/** @type {{ decision: string, reason?: string }} */ e, /** @type {boolean|undefined} */ typedYes) => {
+    const why = safe(e.reason);
+    return typedYes === true && e.decision === 'allow' ? paint(color, ANSI.green + ANSI.bold, '✓ allowed')
+      : typedYes === false && e.decision === 'deny' && why === 'denied at the terminal' ? paint(color, ANSI.red + ANSI.bold, '✗ denied')
+        : why === 'hold timeout' ? paint(color, ANSI.red, `timed out: ${safe(e.decision)}`)
+          : why === 'client gone' || why === 'proxy closing' ? paint(color, ANSI.red, `agent gone: ${safe(e.decision)}`)
+            : `answered elsewhere: ${safe(e.decision)}${why ? ` (${why})` : ''}`;
+  };
 
   const onLine = (/** @type {string} */ line) => {
     if (!open) return; // unreachable at runtime (onData checks); narrows the type for tsc
@@ -94,8 +107,10 @@ export function createTerminalPrompt({ input, output, answer, color = false }) {
     const yes = YES.has(line.trim().toLowerCase());
     try {
       const written = answer(id, yes ? 'allow' : 'deny', yes ? undefined : 'denied at the terminal') !== false;
-      say(!written ? 'answered elsewhere'
-        : yes ? paint(color, ANSI.green + ANSI.bold, '✓ allowed') : paint(color, ANSI.red + ANSI.bold, '✗ denied'));
+      // Nothing is printed for a written answer: the proxy may still time the hold
+      // out before it reads the file, so the outcome line waits for `decided`.
+      if (written) typed.set(id, yes);
+      else say('answered elsewhere');
     } catch {
       // The hold ended (or the runtime went) before this write; the run goes on.
     }
@@ -123,16 +138,18 @@ export function createTerminalPrompt({ input, output, answer, color = false }) {
       return true;
     },
     decided(e) {
-      if (open?.id !== e.id) return;
-      open = null; // closed before anything else: no answer can follow
-      const why = safe(e.reason);
-      say(why === 'hold timeout' ? paint(color, ANSI.red, `timed out: ${safe(e.decision)}`)
-        : why === 'client gone' || why === 'proxy closing' ? paint(color, ANSI.red, `agent gone: ${safe(e.decision)}`)
-          : `answered elsewhere: ${safe(e.decision)}${why ? ` (${why})` : ''}`);
+      if (open?.id === e.id) {
+        open = null; // closed before anything else: no answer can follow
+        say(outcome(e, undefined));
+      } else if (typed.has(e.id)) {
+        say(outcome(e, typed.get(e.id)));
+        typed.delete(e.id);
+      }
     },
     close() {
       closed = true;
       open = null;
+      typed.clear();
       input.removeListener('data', onData);
       input.pause();
     },

@@ -78,8 +78,32 @@ describe('createTerminalPrompt', () => {
       ['h3', 'deny', 'denied at the terminal'], ['h4', 'deny', 'denied at the terminal'],
       ['h5', 'deny', 'denied at the terminal'],
     ]);
+    assert.ok(!/✓|✗/.test(out()), 'typing alone prints no verdict');
+    for (const [i, decision] of ['allow', 'allow', 'allow', 'deny', 'deny', 'deny'].entries()) {
+      p.decided({ id: `h${i}`, decision, reason: decision === 'deny' ? 'denied at the terminal' : undefined });
+    }
     assert.equal((out().match(/✓ allowed/g) ?? []).length, 3);
     assert.equal((out().match(/✗ denied/g) ?? []).length, 3);
+  });
+
+  it('a y typed but decided as a hold timeout prints "timed out: deny", never allowed', async () => {
+    const { input, p, out } = setup();
+    p.ask(ask({ id: 'h1' }));
+    input.write('y\n');
+    await tick();
+    p.decided({ id: 'h1', decision: 'deny', reason: 'hold timeout' });
+    assert.match(out(), /timed out: deny\n$/);
+    assert.ok(!/✓ allowed/.test(out()), out());
+  });
+
+  it('a n typed but decided allow elsewhere prints "answered elsewhere: allow", never denied', async () => {
+    const { input, p, out } = setup();
+    p.ask(ask({ id: 'h1' }));
+    input.write('n\n');
+    await tick();
+    p.decided({ id: 'h1', decision: 'allow', reason: 'cli' });
+    assert.match(out(), /answered elsewhere: allow \(cli\)\n$/);
+    assert.ok(!/✗ denied/.test(out()), out());
   });
 
   it('CRLF is one line', async () => {
@@ -158,12 +182,14 @@ describe('createTerminalPrompt', () => {
     assert.match(out(), /answered elsewhere: deny \(nope\)\n$/);
   });
 
-  it('a decided event for our own answer prints nothing more', async () => {
+  it('the verdict for our own answer prints once; a repeated decided prints nothing', async () => {
     const { input, p, out } = setup();
     p.ask(ask({ id: 'h1' }));
     input.write('y\n');
     await tick();
+    p.decided({ id: 'h1', decision: 'allow' });
     const before = out();
+    assert.match(before, /✓ allowed\n$/);
     p.decided({ id: 'h1', decision: 'allow' });
     assert.equal(out(), before);
   });
@@ -228,8 +254,10 @@ describe('color', () => {
     const p = createTerminalPrompt({ input, output: { write: (s) => { chunks.push(s); } }, answer: () => {}, color: true });
     const seen = () => chunks.join('');
     p.ask(ask({ id: 'h1' })); input.write('y\n'); await tick();
+    p.decided({ id: 'h1', decision: 'allow' });
     assert.ok(seen().includes(`${G}${B}✓ allowed${X}\n`), seen());
     p.ask(ask({ id: 'h2' })); input.write('n\n'); await tick();
+    p.decided({ id: 'h2', decision: 'deny', reason: 'denied at the terminal' });
     assert.ok(seen().includes(`${R}${B}✗ denied${X}\n`), seen());
     p.ask(ask({ id: 'h3' })); p.decided({ id: 'h3', decision: 'deny', reason: 'hold timeout' });
     assert.ok(seen().includes(`${R}timed out: deny${X}\n`), seen());
