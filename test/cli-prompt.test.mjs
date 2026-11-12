@@ -149,7 +149,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.match(out, /HTTP:200/);
     });
 
-    // Run --json, read the ask file's expiresAt while the hold is open, then deny it.
+    // Run with `flags` (no --json means a terminal run through the pty), read the ask file's expiresAt while the hold is open, then deny it.
     const expiryOf = async (name, flags, xdgJson) => {
       const xdg = join(root, 'xdg');
       const cfg = join(xdg, 'barebox', 'config.json');
@@ -157,7 +157,7 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       try {
         const ask = join(root, 'tmp', `sbx-${process.getuid()}`, name, 'asks', 'h1.json');
         const env = { PATH: process.env.PATH, HOME: join(root, 'home'), XDG_CONFIG_HOME: xdg, TMPDIR: join(root, 'tmp') };
-        const run = viaPty('', `EXP${name}`, name, ['--json', ...flags]);
+        const run = viaPty('', `EXP${name}`, name, flags);
         const end = Date.now() + 30000;
         while (!existsSync(ask)) {
           if (Date.now() > end) throw new Error('the ask file never appeared');
@@ -180,12 +180,32 @@ describe(`sbx run asks in the same terminal (needs bwrap+unix+socat+curl+python3
       assert.match(r.out, /HTTP:403/);
     });
 
-    it('no flag and no config key: the hold has no deadline (expiresAt null)', { timeout: 60000 }, async () => {
-      assert.equal(await expiryOf('pty-hnone', []), null);
+    const secsOut = (exp) => (Date.parse(exp) - Date.now()) / 1000;
+
+    it('--json, no flag and no config key: the hold is denied after about 180 s (expiresAt about 180 s out)', { timeout: 60000 }, async () => {
+      const exp = await expiryOf('pty-hnone', ['--json']);
+      assert.ok(exp, 'has a deadline');
+      const left = secsOut(exp);
+      assert.ok(left > 150 && left <= 180, `deadline ${left}s out`);
+    });
+
+    it('a terminal run, no flag and no config key: the hold has no deadline (expiresAt null)', { timeout: 60000 }, async () => {
+      assert.equal(await expiryOf('pty-hterm', []), null);
+    });
+
+    it('--json with holdTimeoutSec "never" in the config: no deadline', { timeout: 60000 }, async () => {
+      assert.equal(await expiryOf('pty-hjnever', ['--json'], '{"holdTimeoutSec":"never"}'), null);
+    });
+
+    it('--json --hold 30: the deadline is about 30 s out', { timeout: 60000 }, async () => {
+      const exp = await expiryOf('pty-hj30', ['--json', '--hold', '30']);
+      assert.ok(exp, 'has a deadline');
+      const left = secsOut(exp);
+      assert.ok(left > 20 && left <= 30, `deadline ${left}s out`);
     });
 
     it('--hold 5 beats a config holdTimeoutSec of 60 (expiresAt about 5 s out)', { timeout: 60000 }, async () => {
-      const exp = await expiryOf('pty-h5', ['--hold', '5'], '{"holdTimeoutSec":60}');
+      const exp = await expiryOf('pty-h5', ['--json', '--hold', '5'], '{"holdTimeoutSec":60}');
       assert.ok(exp, 'has a deadline');
       const left = (Date.parse(exp) - Date.now()) / 1000;
       assert.ok(left < 10, `deadline ${left}s out, not the config 60`);

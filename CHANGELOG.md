@@ -9,6 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - `sbx run` on a terminal answers at once with `→ sent` and appends the outcome when the proxy decides (`✓ allowed`, `✗ denied`, `✗ timed out (denied)`, ...): a `y` typed just before the `--hold` deadline shows `✗ timed out (denied)`, never `✓ allowed`, and no plain `decided` line repeats it. An answer that cannot be written prints `✗ not sent (<code>)` instead of nothing.
+- After `✗ not sent` the same question stays open for a retry; a second hold never prints into an open `→ sent` line.
+- `sbx run` without a terminal (cron, CI, `--json`, redirected output) now denies a held request after 3 minutes instead of waiting forever; with a terminal it still waits. `--hold` or `holdTimeoutSec` sets either.
 
 ## [0.11.0] - 2026-11-11
 

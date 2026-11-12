@@ -35,7 +35,8 @@ describe('config file', () => {
 
   it('no file means the defaults', () => {
     const { XDG_CONFIG_HOME } = xdg();
-    assert.deepEqual(loadConfig({ XDG_CONFIG_HOME }), { mode: 'auto', holdTimeoutSec: 'never', localLlm: [], labels: [], tenants: {} });
+    assert.deepEqual(loadConfig({ XDG_CONFIG_HOME }), { mode: 'auto', localLlm: [], labels: [], tenants: {} });
+    assert.ok(!('holdTimeoutSec' in loadConfig({ XDG_CONFIG_HOME })), 'unset means automatic: the CLI picks by terminal');
   });
 
   it('the file\'s mode and holdTimeoutSec are used', () => {
