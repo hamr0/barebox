@@ -17,9 +17,11 @@
   <img src="https://img.shields.io/badge/platform-Linux-2a4f8c" alt="platform: Linux">
 </p>
 
-![Demo A: a real agent books a trip inside barebox. Reads and model calls go out free, a payment waits for a yes and only then gets the real key, a no never leaves the machine](assets/demo-a.gif)
+<img src="assets/demo.gif" width="800" alt="A scripted agent books a trip inside barebox: the search goes out free, a payment asks and gets the real key only after a yes, an email is allowed, a second payment is denied and never leaves, an unanswered upload is denied after 8 s, then the report of what barebox decided">
 
-Demo A, a live unedited run: Meta's muse model books a trip. 31 requests, 23 went out with no question, 8 stopped for a person (3 allowed, 5 denied); the real payment key reached the server once, after a yes. Full captioned take: [assets/demo-a.webm](assets/demo-a.webm).
+A scripted agent, real barebox (v0.12.0), one unedited take: a free search, a payment allowed (the real key goes in only after the yes), an email allowed, an unexpected second payment denied (403, nothing left), an upload nobody answered denied after 8 s, then the report from barebox's audit log. Record and render it yourself (needs ffmpeg): `bash examples/demo-gif/record.sh && node examples/demo-gif/render.mjs examples/demo-gif/take examples/demo-gif/captions.json assets/demo.gif`.
+
+With a real model: Meta's muse books a trip, a live unedited run (Nov 3). 31 requests, 23 went out with no question, 8 stopped for a person (3 allowed, 5 denied); the real payment key reached the server once, after a yes. Captioned take: [assets/demo-a.webm](assets/demo-a.webm).
 
 **Replay it** (Linux, from a clone; needs network, httpbin.org stands in for the real services):
 
