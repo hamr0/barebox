@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- New README demo GIF (`assets/demo.gif`): one unedited take of a scripted agent in a real `sbx run --mode auto --hold 8`, showing a free search, a payment allowed (real key swapped in only after the yes), an email allowed, a second payment denied, an unanswered upload denied after 8 s, and the end-of-run report. `examples/demo-gif/record.sh` records a take and fails unless the audit shows exactly those outcomes; `render.mjs` turns it into the GIF with ffmpeg (no new dependency).
+
+### Removed
+
+- `assets/demo-a.gif` (the Nov 3 live take stays as `assets/demo-a.webm`, linked from the README).
+
 ## [0.12.0] - 2026-11-12
 
 ### Changed

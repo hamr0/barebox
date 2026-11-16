@@ -8,3 +8,4 @@ poc/m0/idle-*.log
 .litectx/
 .idea/
 docs/.docs-builder/
+examples/demo-gif/take/

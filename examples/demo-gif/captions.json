@@ -1,0 +1,12 @@
+[
+  { "when": "$ sbx run", "text": "A scripted agent books a trip inside barebox: auto mode, real proxy, 8 s hold." },
+  { "when": "agent: search flights", "text": "Reading is free: the search goes out with no question." },
+  { "when": "(hold h1)", "text": "A payment always stops for a person, in every mode." },
+  { "when": "httpbin got: Bearer", "text": "After the yes, the real key goes in. The agent only ever had a placeholder." },
+  { "when": "(hold h2)", "text": "Sending data barebox can't undo: it asks first. Yes." },
+  { "when": "(hold h3)", "text": "A second payment nobody expected..." },
+  { "when": "✗ denied", "text": "No: a 403, and nothing left the machine." },
+  { "when": "(hold h4)", "text": "Nobody answers this one.", "realtime": true },
+  { "when": "timed out", "text": "No answer in 8 s means No. Unattended runs deny after 180 s." },
+  { "when": "what barebox decided", "text": "The report: every request and what barebox decided, from its audit log." }
+]
