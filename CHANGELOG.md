@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Docs
+
+- README: the suite section is now a short map of the bare suite (Hands / Rails / Apps) plus what this pairs well with, linking the full list on github.com/hamr0.
+
 ### Added
 
 - New README demo GIF (`assets/demo.gif`): one unedited take of a scripted agent in a real `sbx run --mode auto --hold 8`, showing a free search, a payment allowed (real key swapped in only after the yes), an email allowed, a second payment denied, an unanswered upload denied after 8 s, and the end-of-run report. `examples/demo-gif/record.sh` records a take and fails unless the audit shows exactly those outcomes; `render.mjs` turns it into the GIF with ffmpeg (no new dependency).
